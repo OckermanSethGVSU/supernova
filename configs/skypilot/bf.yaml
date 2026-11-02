@@ -73,5 +73,5 @@ setup: |
   curl -LsSf https://astral.sh/uv/install.sh | sh
   export PATH="$HOME/.local/bin:$PATH"
   if ! command -v cargo >/dev/null; then curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y; . "$HOME/.cargo/env"; fi
-  UV_TOOL_BIN_DIR="$HOME/.local/bin" uv tool install --python 3.12 --with 'nova-textscan @ git+https://github.com/qdrant-labs/supernova@master#subdirectory=crates/nova-textscan' --with 'rust_fetch @ git+https://github.com/qdrant-labs/supernova@master#subdirectory=python/nova-bf/rust_io' 'nova-bf[compute] @ git+https://github.com/qdrant-labs/supernova@master#subdirectory=python/nova-bf'
+  UV_TOOL_BIN_DIR="$HOME/.local/bin" uv tool install --python 3.12 --with 'nova-textscan @ git+https://github.com/OckermanSethGVSU/supernova@master#subdirectory=crates/nova-textscan' --with 'rust_fetch @ git+https://github.com/OckermanSethGVSU/supernova@master#subdirectory=python/nova-bf/rust_io' 'nova-bf[compute] @ git+https://github.com/OckermanSethGVSU/supernova@master#subdirectory=python/nova-bf'
   $SUDO ln -sf "$HOME/.local/bin/nova-bf" /usr/local/bin/nova-bf

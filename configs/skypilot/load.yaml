@@ -22,5 +22,5 @@ resources:
 # setup: |
 #   command -v cargo >/dev/null || curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 #   source "$HOME/.cargo/env"
-#   cargo install --git https://github.com/qdrant-labs/supernova@my-branch nova-load
+#   cargo install --git https://github.com/OckermanSethGVSU/supernova@my-branch nova-load
 #   sudo install -m 0755 "$HOME/.cargo/bin/nova-load" /usr/local/bin/nova-load
