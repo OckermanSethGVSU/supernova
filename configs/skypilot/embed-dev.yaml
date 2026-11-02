@@ -54,7 +54,7 @@ setup: |
   uv pip install --python .venv -e .                          # the `nova` dispatcher (repo root)
   uv pip install --python .venv -e 'python/nova-embed[embed]'  # embed tool: torch, sentence-transformers, ...
   # --- fresh-clone alternative (instead of workdir + the two installs above):
-  # git clone https://github.com/qdrant-labs/supernova.git ~/supernova && cd ~/supernova
+  # git clone https://github.com/OckermanSethGVSU/supernova.git ~/supernova && cd ~/supernova
   # uv venv --python 3.11 .venv
   # uv pip install --python .venv -e . -e 'python/nova-embed[embed]'
 
