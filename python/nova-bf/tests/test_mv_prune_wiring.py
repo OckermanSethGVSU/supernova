@@ -394,3 +394,234 @@ def test_the_probe_ignores_rows_the_member_does_not_own():
     assert st.gate_open(), (
         "a member owning 2 of 10 rows could not engage despite pruning all "
         "of its own pairs")
+
+
+# --- the prune's statistics in the run manifest ----------------------------
+#
+# `params.kernels.multivector_prune` copies the same host-side counters
+# `_log_mv_prune_summary` logs. These pin that the manifest and the log agree,
+# that the block exists only for a run with a multivector search, and (via a
+# CPU stand-in for the float16 pass) that pruned pairs and the audit reach it.
+
+
+def _mv_manifest_cfg(tmp_path, cdir, qpath, prune, tag, *, k=3, extra=""):
+    out = tmp_path / f"out_{tag}"
+    out.mkdir(exist_ok=True)
+    cfg = tmp_path / f"cfg_{tag}.yaml"
+    cfg.write_text(f"""
+corpus:
+  path: {cdir}
+  multivector_column: multivector_embedding
+  id_column: id
+queries:
+  path: {qpath}
+  multivector_column: multivector_embedding
+  id_column: qid
+output:
+  path: {out}
+params:
+  io_workers: 1
+  multivector_prune: {prune}
+  multivector_min_prune_rate: 0.0
+{extra}
+searches:
+  - name: mv
+    k: {k}
+    metric: dot
+    vector_type: multivector
+""")
+    return load_config(str(cfg)), out
+
+
+def _manifest(out):
+    import json
+
+    return json.loads(next(out.rglob("*manifest*.json")).read_text())
+
+
+def _summary_line(caplog):
+    import re
+
+    for r in caplog.records:
+        m = re.match(r"mv-prune calls=(\d+) declined=(\d+) pruned=([0-9.]+) "
+                     r"\((\d+)/(\d+) pairs\)", r.getMessage())
+        if m:
+            return m
+    return None
+
+
+def test_the_prune_statistics_reach_the_manifest_on_cpu(
+        tmp_path, many_docs, caplog, monkeypatch):
+    """On CPU the prune declines every call (no fused float16 kernel); the
+    manifest must say so with the same numbers the log line reports."""
+    import logging
+
+    monkeypatch.delenv("NOVA_BF_MV_PRUNE_AUDIT", raising=False)
+    monkeypatch.delenv("NOVA_BF_PRUNE_TIMING", raising=False)
+    cdir, qpath = many_docs
+    cfg, out = _mv_manifest_cfg(tmp_path, cdir, qpath, "fp16", "mf_cpu", k=2)
+    with caplog.at_level(logging.INFO, logger="nova_bf"):
+        run_compute(cfg)
+    mv = _manifest(out)["params"]["kernels"]["multivector_prune"]
+
+    line = _summary_line(caplog)
+    assert line is not None, "the summary log line is gone"
+    assert (mv["calls"], mv["declined"], mv["pruned"], mv["pairs"]) == tuple(
+        int(line.group(i)) for i in (1, 2, 4, 5))
+    assert mv["calls"] == cm._MV_PRUNE["calls"] > 0
+    assert mv["declined"] == mv["calls"] and mv["launches"] == 0
+    assert mv["pairs"] == mv["pruned"] == 0 and mv["pruned_fraction"] is None
+    assert mv["policy"] == "fp16" and mv["permitted"] is True
+    assert mv["uncertified"] is None, mv
+    assert mv["gate"] == mv_fp16.gate_stats()
+    assert mv["timing_syncs"] is False and "seconds" not in mv
+    assert mv["audit"] == {"enabled": False}
+
+
+def test_off_records_the_block_as_not_permitted(tmp_path, corpus_and_queries):
+    cdir, qpath = corpus_and_queries
+    cfg, out = _mv_manifest_cfg(tmp_path, cdir, qpath, "off", "mf_off")
+    run_compute(cfg)
+    mv = _manifest(out)["params"]["kernels"]["multivector_prune"]
+    assert mv["policy"] == "off" and mv["permitted"] is False
+    assert mv["calls"] == mv["launches"] == mv["pairs"] == 0
+    assert mv["uncertified"] is None and mv["audit"] == {"enabled": False}
+
+
+def test_a_certification_refusal_is_named(tmp_path, many_docs, monkeypatch):
+    monkeypatch.setattr(mv_fp16, "certify", lambda dim, device: "test refusal")
+    cdir, qpath = many_docs
+    cfg, out = _mv_manifest_cfg(tmp_path, cdir, qpath, "fp16", "mf_cert", k=2)
+    run_compute(cfg)
+    mv = _manifest(out)["params"]["kernels"]["multivector_prune"]
+    assert mv["uncertified"] == "dim=8 on cpu: test refusal", mv
+    assert mv["declined"] == mv["calls"] > 0
+
+
+def test_a_run_without_a_multivector_search_has_no_block(tmp_path):
+    rng = np.random.default_rng(2)
+    cdir = tmp_path / "dense"
+    cdir.mkdir()
+    pq.write_table(pa.table({
+        "id": pa.array([f"d{i}" for i in range(6)]),
+        "embedding": pa.array(list(rng.standard_normal((6, DIM))),
+                              type=pa.list_(pa.float32(), DIM)),
+    }), cdir / "c.parquet")
+    qpath = tmp_path / "q.parquet"
+    pq.write_table(pa.table({
+        "qid": pa.array(["q0", "q1"]),
+        "embedding": pa.array(list(rng.standard_normal((2, DIM))),
+                              type=pa.list_(pa.float32(), DIM)),
+    }), qpath)
+    out = tmp_path / "out"
+    out.mkdir()
+    cfg = tmp_path / "cfg.yaml"
+    cfg.write_text(f"""
+corpus:
+  path: {cdir}
+  dense_column: embedding
+  id_column: id
+queries:
+  path: {qpath}
+  dense_column: embedding
+  id_column: qid
+output:
+  path: {out}
+params:
+  io_workers: 1
+searches:
+  - name: d
+    k: 2
+    metric: dot
+    vector_type: dense
+""")
+    run_compute(load_config(str(cfg)))
+    kernels = _manifest(out)["params"]["kernels"]
+    assert "multivector_prune" not in kernels, kernels.keys()
+
+
+def _cpu_exact_prune(self, q_flat, c_flat, q_offsets, doc_offsets, thresholds):
+    """CPU stand-in for `Fp16State.score`: the bound IS the exact MaxSim, so
+    every prune is correct and the audit must grade it clean. Exercises the
+    counting, the audit hook and the manifest without the float16 kernels."""
+    import torch
+
+    q_off = mv_fp16._as_offsets(q_offsets, c_flat.device).cpu().tolist()
+    d_off = mv_fp16._as_offsets(doc_offsets, c_flat.device).cpu().tolist()
+    sim = q_flat @ c_flat.T
+    exact = torch.full((len(q_off) - 1, len(d_off) - 1), float("-inf"))
+    for i in range(len(q_off) - 1):
+        for j in range(len(d_off) - 1):
+            if d_off[j + 1] > d_off[j]:
+                blk = sim[q_off[i]:q_off[i + 1], d_off[j]:d_off[j + 1]]
+                exact[i, j] = blk.max(dim=1).values.sum()
+    upper = exact.clone()
+    dead = mv_fp16.prune_mask(upper, thresholds)
+    scores = torch.where(dead, torch.full_like(exact, float("-inf")), exact)
+    return scores, dead, (upper if mv_fp16._audit_should_grade() else None)
+
+
+@pytest.fixture
+def many_docs(tmp_path):
+    """Several files of documents, so later slices prune against thresholds
+    the earlier ones set."""
+    rng = np.random.default_rng(11)
+    cdir = tmp_path / "corpus_many"
+    cdir.mkdir()
+    for f in range(4):
+        docs = [rng.standard_normal((int(n), DIM))
+                for n in rng.integers(1, 5, size=12)]
+        pq.write_table(
+            pa.table({"id": pa.array([f"f{f}d{i}" for i in range(len(docs))]),
+                      "multivector_embedding": _mv_array(docs)}),
+            cdir / f"c{f}.parquet")
+    queries = [rng.standard_normal((n, DIM)) for n in (2, 3, 1, 4)]
+    qpath = tmp_path / "q_many.parquet"
+    pq.write_table(
+        pa.table({"qid": pa.array([f"q{i}" for i in range(len(queries))]),
+                  "multivector_embedding": _mv_array(queries)}),
+        qpath)
+    return cdir, qpath
+
+
+def test_pruned_pairs_and_the_audit_reach_the_manifest(
+        tmp_path, many_docs, caplog, monkeypatch):
+    import logging
+
+    cdir, qpath = many_docs
+    monkeypatch.setattr(mv_fp16.Fp16State, "score", _cpu_exact_prune)
+    monkeypatch.setenv("NOVA_BF_MV_PRUNE_AUDIT", "1")
+    monkeypatch.setenv("NOVA_BF_PRUNE_TIMING", "1")
+    mv_fp16.reset_audit()
+    try:
+        cfg, out = _mv_manifest_cfg(tmp_path, cdir, qpath, "fp16", "mf_audit",
+                                    k=2)
+        with caplog.at_level(logging.INFO, logger="nova_bf"):
+            run_compute(cfg)
+        mv = _manifest(out)["params"]["kernels"]["multivector_prune"]
+
+        line = _summary_line(caplog)
+        assert line is not None
+        assert (mv["calls"], mv["declined"], mv["pruned"], mv["pairs"]) == tuple(
+            int(line.group(i)) for i in (1, 2, 4, 5))
+        assert mv["pruned"] > 0, "nothing pruned, so this proves nothing"
+        assert mv["launches"] == mv["calls"] - mv["declined"] > 0
+        assert mv["pruned_fraction"] == round(mv["pruned"] / mv["pairs"], 6)
+        assert f"{mv['pruned_fraction']:.4f}" == line.group(3)
+        assert mv["uncertified"] is None and mv["disabled_by_audit"] is None
+        assert mv["timing_syncs"] is True
+        assert mv["seconds"] == round(cm._MV_PRUNE["sec"], 3)
+
+        audit = mv["audit"]
+        assert audit["enabled"] is True and audit["rate"] == 1
+        assert {k: v for k, v in audit.items()
+                if k not in ("enabled", "rate")} == mv_fp16.audit_stats()
+        assert audit["graded_slices"] == audit["offered"] > 0
+        assert audit["correct_prune"] > 0
+        assert audit["false_prune"] == audit["bound_violations"] == 0
+        assert audit["score_mismatch"] == 0 and audit["disabled"] is None
+        assert any(r.getMessage().startswith(
+            f"mv-prune AUDIT slices={audit['graded_slices']}/{audit['offered']}")
+            for r in caplog.records)
+    finally:
+        mv_fp16.reset_audit()

@@ -4721,6 +4721,47 @@ def _log_mv_prune_summary() -> None:
     if a["false_prune"] or a["bound_violations"] or a["score_mismatch"]:
         logger.error("mv-prune AUDIT FAILED: %s", a["disabled"])
 
+
+def _mv_prune_usage(policy: str, mv_prune) -> dict:
+    """The multivector prune's run statistics, for `kernels.multivector_prune`.
+    """
+    calls, declined = _MV_PRUNE["calls"], _MV_PRUNE["declined"]
+    pairs, pruned = _MV_PRUNE["pairs"], _MV_PRUNE["pruned"]
+    failed = mv_prune._failed if mv_prune is not None else {}
+    timing = bool(os.environ.get("NOVA_BF_PRUNE_TIMING"))
+    # The audit can only grade a prune that exists (policy `fp16`).
+    rate = mv_fp16.audit_rate() if mv_prune is not None else 0
+    usage = {
+        "policy": policy,
+        "permitted": policy == "fp16" and not os.environ.get("NOVA_BF_NO_PRUNE"),
+        # Slice-member passes that actually pruned (gate open, not declined).
+        "launches": calls - declined,
+        # Certification refusals by (dim, device); `None` when none refused.
+        # Other declines (e.g. no fused kernel off CUDA) are only in `declined`.
+        "uncertified": (
+            "; ".join(f"dim={d} on {dev}: {r}" for (d, dev), r in failed.items())
+            or None
+        ),
+        # A failed audit disables the prune for the rest of the PROCESS, so
+        # this may name a failure from an earlier run in the same process.
+        "disabled_by_audit": mv_fp16.audit_disabled(),
+        "calls": calls,
+        "declined": declined,
+        # (owned query, document) pairs the pass scored, and those it pruned.
+        "pairs": pairs,
+        "pruned": pruned,
+        "pruned_fraction": round(pruned / pairs, 6) if pairs else None,
+        "gate": mv_fp16.gate_stats(),
+        "timing_syncs": timing,
+    }
+    if timing:
+        usage["seconds"] = round(_MV_PRUNE["sec"], 3)
+    usage["audit"] = (
+        {"enabled": True, "rate": rate, **mv_fp16.audit_stats()}
+        if rate else {"enabled": False}
+    )
+    return usage
+
 def _process_batch_group(
     batch, member_idxs: list[int], specs: list[SearchSpec], spec_Q, spec_q_norms,
     spec_top_key, spec_top_enc, spec_thr,
@@ -8525,6 +8566,11 @@ def run_compute(
             two_pass_policy=cfg.params.two_pass,
         ),
     })
+    # Only a run with a multivector search gets the block, like
+    # `sparse_branches` above; per rank, not carried by `merge`.
+    if "multivector" in vts_needed:
+        doc["params"]["kernels"]["multivector_prune"] = _mv_prune_usage(
+            cfg.params.multivector_prune, mv_prune)
     doc.update({
         "started_at": started_at.isoformat(),
         "sharding": {
