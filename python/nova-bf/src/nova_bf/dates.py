@@ -29,12 +29,14 @@ Supported per-field `format`s:
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pyarrow as pa
 import pyarrow.compute as pc
 
 DEFAULT_FORMAT = "rfc3339"
+_EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
+_ONE_US = timedelta(microseconds=1)
 _EPOCH_MULT = {"epoch_s": 1_000_000, "epoch_ms": 1_000, "epoch_us": 1}
 
 
@@ -79,7 +81,12 @@ def parse_scalar_epoch_us(value, fmt: str = DEFAULT_FORMAT) -> int:
         dt = datetime.strptime(s, fmt)
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
-    return int(dt.timestamp() * 1_000_000)
+    # Integer arithmetic, NOT `int(dt.timestamp() * 1_000_000)`: `timestamp()`
+    # is a float of seconds, and scaling it to µs rounds the wrong way for
+    # ~1% of sub-second literals (2005-04-18T02:42:41.147961Z came out as
+    # ...147960). The corpus column is converted exactly by Arrow, so a bound
+    # one µs off silently flips `gte`/`lte` at exactly a stored instant.
+    return (dt - _EPOCH) // _ONE_US
 
 
 def to_epoch_us_array(col, fmt: str = DEFAULT_FORMAT) -> pa.Array:
