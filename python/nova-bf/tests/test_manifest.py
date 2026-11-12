@@ -899,3 +899,63 @@ def test_kernel_usage_counters_actually_MOVE_in_a_real_run(tmp_path):
 
 
 # --- 15: never invent a run fingerprint ------------------------------------
+
+
+def _fake_twopass_stats(monkeypatch, **overrides):
+    """`twopass.stats()` from a freshly reset run, with the given counters set,
+    so `kernel_usage` can be checked against numbers chosen by hand."""
+    from nova_bf import twopass
+
+    twopass.reset()
+    fake = twopass.stats()
+    fake.update(overrides)
+    monkeypatch.setattr(twopass, "stats", lambda: dict(fake))
+
+
+def test_twopass_fractions_are_computed_from_the_right_counters(monkeypatch):
+    # Distinct numerators, so a swapped or mis-divided field cannot pass.
+    _fake_twopass_stats(
+        monkeypatch, rows_full=1000, rows_live=125, rows_padded=400,
+        tile_pairs_full=80, tile_pairs_live=20,
+        slices_fused=3, slices_unfused=2, slices_twopass=4,
+        slices_discarded=1, gemms=3)
+    tp = run_manifest.kernel_usage(0)["twopass"]
+    assert tp["live_fraction"] == 0.125
+    assert tp["padded_fraction"] == 0.4
+    assert tp["tile_live_fraction"] == 0.25
+    assert tp["launches"] == 3 and "gemms" not in tp
+    assert tp["counters_consistent"] is True
+
+
+def test_twopass_fractions_are_none_without_two_pass_work(monkeypatch):
+    _fake_twopass_stats(monkeypatch)
+    tp = run_manifest.kernel_usage(0)["twopass"]
+    assert tp["live_fraction"] is None and tp["padded_fraction"] is None
+    assert tp["tile_live_fraction"] is None
+    assert tp["counters_consistent"] is True
+
+
+@pytest.mark.parametrize("side", ["ran", "booked"])
+def test_unbalanced_twopass_counters_are_flagged(monkeypatch, caplog, side):
+    """`counters_consistent` must be able to read False: one extra pass-one run
+    that was never booked, or one booking with no pass-one run behind it, is
+    flagged in the manifest and warned about -- not raised (a manifest must
+    never fail a run)."""
+    import logging
+
+    counts = dict(slices_fused=3, slices_unfused=2, slices_twopass=4,
+                  slices_discarded=1)
+    if side == "ran":
+        counts["slices_unfused"] += 1
+    else:
+        counts["slices_twopass"] += 1
+    _fake_twopass_stats(monkeypatch, **counts)
+    with caplog.at_level(logging.WARNING, logger="nova_bf"):
+        tp = run_manifest.kernel_usage(0)["twopass"]
+    assert tp["counters_consistent"] is False, tp
+    msgs = [r.getMessage() for r in caplog.records
+            if "two-pass counters are inconsistent" in r.getMessage()]
+    assert len(msgs) == 1, [r.getMessage() for r in caplog.records]
+    ran = counts["slices_fused"] + counts["slices_unfused"]
+    booked = counts["slices_twopass"] + counts["slices_discarded"]
+    assert f"{ran} pass-one runs" in msgs[0] and f"{booked} booked" in msgs[0]

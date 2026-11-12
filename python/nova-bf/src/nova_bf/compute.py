@@ -1362,7 +1362,11 @@ _SPARSE_SWAP_MAX_DENSE_BYTES = int(
 )
 
 
-# How many times a prune THRESHOLD was actually applied, for the manifest.
+# How many times a prune THRESHOLD was actually applied, for the manifest:
+# once per (slice, search) -- each member of a batch group counts on its own,
+# so two searches over 14 slices give 28. A threshold that is still the
+# all-sentinel warm-up value counts too: "applied" means passed to the packer,
+# not that it removed anything.
 # `NOVA_BF_NO_PRUNE` records what was permitted; this records what happened.
 # Unlike the two Triton kernels, prune cannot decline at runtime -- but it can
 # be permitted and never applied (no search reaches the pre-top-K path), and the
@@ -4581,54 +4585,65 @@ def _mv_pruned_scores(sl, Q, metric, mv_state, thr_packed, qsel, tally=None):
 
     _MV_PRUNE["calls"] += 1
 
-    # Pass one must use the same normalized representation as cosine scoring.
-    c_flat = (
-        torch.nn.functional.normalize(sl.flat, dim=1)
-        if metric == "cosine" else sl.flat
-    )
-    q_flat = Q.flat_normalized if metric == "cosine" else Q.flat
-
-    thr_all = _mv_full_threshold(Q, thr_packed, qsel)
-    if thr_all is None:
-        _MV_PRUNE["declined"] += 1
-        return None
-
+    # `NOVA_BF_PRUNE_TIMING` times the WHOLE prune path for this call: the
+    # cosine normalisation, the threshold build, the scoring (including the
+    # lazy certification and query fp16 copy on first use) and the counting,
+    # declined calls included -- everything the prune adds over unpruned
+    # scoring. Only the audit's exact re-score is left out: it is a
+    # verification knob, not a cost of pruning. The syncs make device work
+    # land inside the interval, which is why this is opt-in.
     timing = bool(os.environ.get("NOVA_BF_PRUNE_TIMING"))
-    dev = c_flat.device
+    dev = sl.flat.device
     if timing and dev.type == "cuda":
         torch.cuda.synchronize(dev)
     t0 = time.perf_counter() if timing else 0.0
+    try:
+        # Pass one must use the same normalized representation as cosine scoring.
+        c_flat = (
+            torch.nn.functional.normalize(sl.flat, dim=1)
+            if metric == "cosine" else sl.flat
+        )
+        q_flat = Q.flat_normalized if metric == "cosine" else Q.flat
 
-    res = mv_state.score(q_flat, c_flat, Q.offsets, sl.doc_offsets, thr_all)
+        thr_all = _mv_full_threshold(Q, thr_packed, qsel)
+        if thr_all is None:
+            _MV_PRUNE["declined"] += 1
+            return None
 
-    if timing:
-        if dev.type == "cuda":
-            torch.cuda.synchronize(dev)
-        _MV_PRUNE["sec"] += time.perf_counter() - t0
+        res = mv_state.score(q_flat, c_flat, Q.offsets, sl.doc_offsets, thr_all)
+        if res is None:
+            _MV_PRUNE["declined"] += 1
+            return None
 
-    if res is None:
-        _MV_PRUNE["declined"] += 1
-        return None
+        scores, dead, upper = res
 
-    scores, dead, upper = res
+        # Count only rows this member owns, in BOTH counts: `pairs` covers
+        # owned rows only, so `pruned` must too. Unowned (-inf) and NaN
+        # thresholds can never mark a pair dead, but a +inf one marks its whole
+        # row dead, and counting that row in `pruned` but not `pairs` would
+        # push `pruned_fraction` past 1.
+        owned = torch.isfinite(thr_all)
+        n_pruned, n_owned = torch.stack(
+            [(dead & owned[:, None]).sum(dtype=torch.int64),
+             owned.sum(dtype=torch.int64)]
+        ).tolist()
+        n_pruned, n_owned = int(n_pruned), int(n_owned)
+        n_pairs = n_owned * int(dead.shape[1])
 
-    # Count only rows this member owns.
-    owned = torch.isfinite(thr_all)
-    n_pruned, n_owned = torch.stack(
-        [dead.sum(dtype=torch.int64), owned.sum(dtype=torch.int64)]
-    ).tolist()
-    n_pruned, n_owned = int(n_pruned), int(n_owned)
-    n_pairs = n_owned * int(dead.shape[1])
+        _MV_PRUNE["pairs"] += n_pairs
+        _MV_PRUNE["pruned"] += n_pruned
 
-    _MV_PRUNE["pairs"] += n_pairs
-    _MV_PRUNE["pruned"] += n_pruned
-
-    # Aggregate across members when the caller provides a slice-level tally.
-    if tally is None:
-        mv_state.note_pruned(n_pruned, n_pairs)
-    else:
-        tally[0] += n_pruned
-        tally[1] += n_pairs
+        # Aggregate across members when the caller provides a slice-level tally.
+        if tally is None:
+            mv_state.note_pruned(n_pruned, n_pairs)
+        else:
+            tally[0] += n_pruned
+            tally[1] += n_pairs
+    finally:
+        if timing:
+            if dev.type == "cuda":
+                torch.cuda.synchronize(dev)
+            _MV_PRUNE["sec"] += time.perf_counter() - t0
 
     # `upper` is produced only for audit-selected slices.
     if upper is not None:
@@ -4666,8 +4681,10 @@ def _mv_audit_slice(sl, Q, metric, dead, thr_all, upper, scores) -> None:
     finally:
         del exact
 
-# Process-wide tally of what the prune did. NOTHING READS THIS in production —
-# it exists for tests and for benchmark harnesses, which reset it themselves
+# Process-wide tally of what the prune did. `run_compute` resets it at the start
+# of every run; the end-of-run summary log (`_log_mv_prune_summary`) and the
+# manifest's `kernels.multivector_prune` block (`_mv_prune_usage`) both read
+# it, as do tests and benchmark harnesses.
 _MV_PRUNE = {"pairs": 0, "pruned": 0, "calls": 0, "declined": 0, "sec": 0.0}
 
 
@@ -4686,7 +4703,8 @@ def _log_mv_prune_summary() -> None:
     if g["closed"]:
         total = g["closed"] + g["open"]
         logger.info(
-            "mv-prune gate: off for %d of %d slices (%.1f%%), engaged %d "
+            "mv-prune gate: off for %d of %d (slice, search) passes (%.1f%%), "
+            "engaged %d "
             "time(s), disengaged %d — lower "
             "params.multivector_min_prune_rate if the achieved rate was "
             "profitable",
@@ -4722,7 +4740,7 @@ def _log_mv_prune_summary() -> None:
         logger.error("mv-prune AUDIT FAILED: %s", a["disabled"])
 
 
-def _mv_prune_usage(policy: str, mv_prune) -> dict:
+def _mv_prune_usage(policy: str, mv_prune, inherited_disable=None) -> dict:
     """The multivector prune's run statistics, for `kernels.multivector_prune`.
     """
     calls, declined = _MV_PRUNE["calls"], _MV_PRUNE["declined"]
@@ -4742,9 +4760,13 @@ def _mv_prune_usage(policy: str, mv_prune) -> dict:
             "; ".join(f"dim={d} on {dev}: {r}" for (d, dev), r in failed.items())
             or None
         ),
-        # A failed audit disables the prune for the rest of the PROCESS, so
-        # this may name a failure from an earlier run in the same process.
-        "disabled_by_audit": mv_fp16.audit_disabled(),
+        # A failed audit disables the prune for the rest of the PROCESS. This
+        # run's own failure and one inherited from an earlier run in the same
+        # process are reported apart: an inherited one leaves this run's audit
+        # counters at zero while every call declines, and reading it as this
+        # run's failure would blame data the audit never graded.
+        "disabled_by_audit": mv_fp16.audit_stats()["disabled"],
+        "disabled_by_earlier_audit": inherited_disable,
         "calls": calls,
         "declined": declined,
         # (owned query, document) pairs the pass scored, and those it pruned.
@@ -7717,7 +7739,10 @@ def run_compute(
         # bounded by the end-to-end `window` semaphore, not by `fq` alone.
         pending: dict[int, tuple] = {}
 
-        # Reset the process-wide prune tallies FIRST, and unconditionally
+        # Reset the process-wide prune tallies FIRST, and unconditionally.
+        # A disable left by an earlier run's failed audit survives the reset
+        # (by design); remember it so the manifest can say it was inherited.
+        mv_inherited_disable = mv_fp16.audit_disabled()
         _MV_PRUNE.update({k: (0.0 if isinstance(v, float) else 0)
                           for k, v in _MV_PRUNE.items()})
         mv_fp16.reset_gate_stats()
@@ -8570,7 +8595,7 @@ def run_compute(
     # `sparse_branches` above; per rank, not carried by `merge`.
     if "multivector" in vts_needed:
         doc["params"]["kernels"]["multivector_prune"] = _mv_prune_usage(
-            cfg.params.multivector_prune, mv_prune)
+            cfg.params.multivector_prune, mv_prune, mv_inherited_disable)
     doc.update({
         "started_at": started_at.isoformat(),
         "sharding": {

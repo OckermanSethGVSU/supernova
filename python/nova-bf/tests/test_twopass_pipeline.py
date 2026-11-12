@@ -2299,3 +2299,25 @@ def test_the_decision_audit_takes_no_scale_arguments():
     # `tile_live` / `tile_width` are tiles mode's grading inputs, both read.
     assert params == ["Q", "Cb", "metric", "live", "thr", "q_norms",
                       "tile_live", "tile_width"], params
+
+
+@pytest.mark.slice_only
+def test_manifest_fractions_are_the_runs_own_ratios(ds, tmp_path):
+    """`live_fraction` / `padded_fraction` in the manifest are VALUES, not just
+    keys: each must be its own numerator over `rows_full`, on a run where the
+    two numerators differ, so swapping `rows_live` and `rows_padded` (or
+    dividing by the wrong total) fails here."""
+    out = tmp_path / "frac"
+    out.mkdir()
+    run_compute(_cfg(ds, out), num_jobs=1, job_rank=0)
+    doc = json.loads(next(out.rglob("_bf_manifest_*/rank000.json")).read_text())
+    tp = doc["params"]["kernels"]["twopass"]
+    assert tp["launches"] > 0, tp
+    assert 0 < tp["rows_live"] < tp["rows_padded"] < tp["rows_full"], (
+        "no slice was padded above its live count, so the two fractions "
+        f"cannot be told apart: {tp}")
+    assert tp["live_fraction"] == round(tp["rows_live"] / tp["rows_full"], 6)
+    assert tp["padded_fraction"] == round(
+        tp["rows_padded"] / tp["rows_full"], 6)
+    assert tp["live_fraction"] < tp["padded_fraction"] < 1.0, tp
+    assert tp["counters_consistent"] is True, tp

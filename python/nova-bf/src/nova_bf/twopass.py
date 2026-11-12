@@ -1873,7 +1873,11 @@ _STATS = {
     # Certifications that could not obtain a usable verdict and must be retried.
     "certify_inconclusive": 0,
 
-    "gemms": 0,                       # narrowed exact GEMMs launched
+    # Two-pass slices that still had live work after pass one: one per slice
+    # (not per GEMM call), slice-mode AND tiles-mode alike -- a tiles slice's
+    # pass two is tile re-scoring, counted in `tiles_kernel`/`tiles_reference`.
+    # All-pruned slices are in `slices_twopass` but not here.
+    "gemms": 0,
 
     # Slices where pass one ran but padding removed any exact-GEMM savings.
     "slices_discarded": 0,

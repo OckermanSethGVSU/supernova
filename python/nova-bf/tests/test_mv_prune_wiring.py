@@ -625,3 +625,68 @@ def test_pruned_pairs_and_the_audit_reach_the_manifest(
             for r in caplog.records)
     finally:
         mv_fp16.reset_audit()
+
+
+def test_an_audit_disable_from_an_earlier_run_is_reported_as_inherited(
+        tmp_path, many_docs):
+    """A failed audit keeps the prune off for the rest of the PROCESS. The next
+    run's manifest must say the disable was inherited, not claim its own audit
+    failed while its audit counters read zero."""
+    cdir, qpath = many_docs
+    mv_fp16.reset_audit()
+    mv_fp16._AUDIT_DISABLED = "earlier run's failure"
+    try:
+        cfg, out = _mv_manifest_cfg(tmp_path, cdir, qpath, "fp16", "mf_inh",
+                                    k=2)
+        run_compute(cfg)
+        mv = _manifest(out)["params"]["kernels"]["multivector_prune"]
+        assert mv["disabled_by_audit"] is None, mv
+        assert mv["disabled_by_earlier_audit"] == "earlier run's failure", mv
+        assert mv["declined"] == mv["calls"] > 0 and mv["launches"] == 0
+    finally:
+        mv_fp16.reset_audit()
+
+
+def test_pruned_counts_only_owned_rows_even_with_an_infinite_threshold(
+        tmp_path, many_docs, monkeypatch):
+    """A +inf threshold marks its whole row dead but the row is not owned
+    (`isfinite`), so it is outside `pairs`; counting it in `pruned` would push
+    `pruned_fraction` past 1. Checked against an independent per-call count."""
+    import torch
+
+    cdir, qpath = many_docs
+    real_thr = cm._mv_full_threshold
+
+    def thr_with_inf(*a, **kw):
+        thr = real_thr(*a, **kw)
+        if thr is None:
+            return None
+        thr = thr.clone()
+        thr[0] = float("inf")
+        return thr
+
+    seen = {"pairs": 0, "pruned": 0, "inf_dead": 0}
+
+    def counting_score(self, q_flat, c_flat, q_offsets, doc_offsets, thr):
+        res = _cpu_exact_prune(self, q_flat, c_flat, q_offsets, doc_offsets, thr)
+        _, dead, _ = res
+        owned = torch.isfinite(thr)
+        seen["pairs"] += int(owned.sum()) * int(dead.shape[1])
+        seen["pruned"] += int((dead & owned[:, None]).sum())
+        seen["inf_dead"] += int(dead[~owned].sum())
+        return res
+
+    monkeypatch.setattr(cm, "_mv_full_threshold", thr_with_inf)
+    monkeypatch.setattr(mv_fp16.Fp16State, "score", counting_score)
+    mv_fp16.reset_audit()
+    try:
+        cfg, out = _mv_manifest_cfg(tmp_path, cdir, qpath, "fp16", "mf_inf",
+                                    k=2)
+        run_compute(cfg)
+        mv = _manifest(out)["params"]["kernels"]["multivector_prune"]
+    finally:
+        mv_fp16.reset_audit()
+    assert seen["inf_dead"] > 0, "no +inf row was ever dead; proves nothing"
+    assert (mv["pairs"], mv["pruned"]) == (seen["pairs"], seen["pruned"]), (
+        mv, seen)
+    assert mv["pruned"] <= mv["pairs"]

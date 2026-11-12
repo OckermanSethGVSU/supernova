@@ -177,7 +177,8 @@ def kernel_usage(
     prune = {
         "permitted": not os.environ.get("NOVA_BF_NO_PRUNE"),
         # Prune has no kernel and cannot decline at runtime; this counts the
-        # slices where a threshold was actually applied.
+        # (slice, search) pairs where a threshold was applied -- per search,
+        # so it equals the sum of `by_search[*].slices`, not the slice count.
         "launches": prune_launches,
         "unavailable": None,
     }
@@ -209,7 +210,10 @@ def kernel_usage(
     tp = twopass.stats()
     # `rows_live / rows_full` is what the two-pass actually skipped; the gap
     # between it and `rows_padded / rows_full` is what the GEMM-height padding
-    # cost to keep cuBLAS on one kernel (see docs/brute-force/two-pass-bound.md).
+    # cost to keep cuBLAS on one kernel (see
+    # docs/brute-force/claude_only/two-pass-bound.md). Tiles-mode slices are
+    # not padded (they book `rows_padded = rows_live`), so in a tiles run
+    # `padded_fraction` reflects only the slice-mode slices' padding.
     tp["live_fraction"] = (
         round(tp["rows_live"] / tp["rows_full"], 6) if tp["rows_full"] else None
     )
@@ -217,7 +221,11 @@ def kernel_usage(
         round(tp["rows_padded"] / tp["rows_full"], 6) if tp["rows_full"] else None
     )
     # Tiles mode (`rescore == "tiles"`): the (query, tile) pairs re-scored out
-    # of those its slices spanned -- the fraction its engage gate reads.
+    # of those spanned by the slices that were actually tile-rescored
+    # (including all-pruned ones). NOT the engage gate's input: slices that
+    # bailed past the tile crossover, fell back to slice mode (kernel
+    # declined, no pass one) or ran out of memory are excluded here but feed
+    # the gate's hint, so this reads lower than what the gate saw.
     tp["tile_live_fraction"] = (
         round(tp["tile_pairs_live"] / tp["tile_pairs_full"], 6)
         if tp["tile_pairs_full"] else None
@@ -245,7 +253,10 @@ def kernel_usage(
     tp["permitted"] = (
         two_pass_policy == "auto" and not os.environ.get("NOVA_BF_NO_TWOPASS")
     )
-    # `launches` is the number of slices actually scored in two passes. 
+    # `launches`: two-pass slices that still had a pass two to run (one per
+    # slice, slice- or tiles-mode). All-pruned slices are in `slices_twopass`
+    # but not here, so `slices_twopass - launches` is the slices pass one
+    # pruned completely.
     tp["launches"] = tp.pop("gemms", 0)
 
 
