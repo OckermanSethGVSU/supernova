@@ -35,7 +35,7 @@ shell you use `nova` from.
 | `make load` | `nova load` | Rust | Installs to `~/.cargo/bin`. |
 | `make storm` | `nova storm` | Rust | Installs to `~/.cargo/bin`. |
 | `make inspect` | `nova inspect` | Rust | Dev tool: vector count and parquet schema. |
-| `make bf` | `nova bf` | Python + Rust | Pulls torch and builds `nova-textscan` and `rust_fetch` (the native reader behind `NOVA_BF_NATIVE_DENSE` / `NOVA_BF_NATIVE_FETCH`). |
+| `make bf` | `nova bf` | Python + Rust | Pulls torch and builds `nova-textscan` and `rust_fetch` (the Rust corpus reader nova-bf uses by default; see `rust_fetch_dense` / `rust_fetch_columns`). |
 | `make sweep` | `nova sweep` | Python | Runs on the controller; needs `nova load` and `nova storm` on `PATH`. |
 | `make dist` | `nova dist` | Python | Runs on the controller; pulls SkyPilot. |
 

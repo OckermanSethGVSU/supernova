@@ -76,6 +76,8 @@ Conditions are not nested, each uses one filter type, and null values never matc
   range: {gte: 1, lt: 10}
 ```
 
+Bounds are read as 64-bit floats, so a bound above 2^53 may be rounded. On an integer field the column values are compared exactly at any size, as Qdrant does on an indexed integer field. A static `match` on an integer field is exact at any size, including `uint64` values of 2^63 and above. A static `match` value must fit its field: numbers for integer and float fields, strings for string fields, `true`/`false` for boolean fields. Anything else, such as `match: "5"` on an integer field, stops the run at start with an error naming the search.
+
 Declare date fields under `corpus.date_fields`. Date bounds use RFC 3339 unless configured otherwise:
 
 ```yaml
@@ -124,7 +126,11 @@ should:
     match_from_query: tenant_id
 ```
 
-Use separate conditions for literal and query-derived range bounds. Declare per-query dates in `queries.date_fields`. GPU execution supports `match_from_query` and `range_from_query`; `match_text_from_query` runs on CPU and may be expensive because it constructs a query-by-row mask for each file.
+Use separate conditions for literal and query-derived range bounds. Declare per-query dates in `queries.date_fields`.
+
+`match_from_query` needs the corpus field and the query column to hold the same kind of value: integers (any signed width up to `int64`; cast `uint64` columns to `int64`), strings, or booleans, with a list of them allowed on the query side. Other pairs, such as an integer against a float or a string against a number, stop the run at start with an error naming the search; use `range_from_query` for numbers, or cast one column. Date fields must be declared on both sides or neither. `range_from_query` compares as 64-bit floats, so it is exact for integers up to 2^53 (dates and ordinary counts); for larger integer ids use `match_from_query` or a static `range`.
+
+All per-query filters are combined on the GPU, batch by batch. Text conditions are tokenized on the CPU once per file into one row of bits per distinct phrase, and the GPU combines those rows per query. If a file has so many distinct phrases that this table would exceed both the full query-by-row mask and `params.combo_parts_max_bytes` (default 2 GiB; applied per text part, and a filter whose `should` mixes text and per-query structured conditions has two), the phrases are combined on the CPU instead for that file (slower, same results) and a warning names the filter.
 
 ## Running
 
