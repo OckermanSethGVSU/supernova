@@ -34,6 +34,9 @@ params:
   # id (lower corpus.id_column, survives re-sharding the corpus).
   tiebreak: ordinal
   two_pass: auto                        # exact pruning; `off` = plain fp32 scoring
+  # Per-query text filters: per-file budget for each distinct-phrase table the
+  # GPU combines; above it phrases are combined on the CPU (slower, a warning).
+  combo_parts_max_bytes: 2147483648
 
 searches:                               # all searches share one corpus scan
   - name: dense                         # optional; goes into the output filename
