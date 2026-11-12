@@ -5694,8 +5694,13 @@ def _plan_mask_device(plan, rows, true_rows, leaf_gpu: dict, query_gpu: dict, de
         for cond in plan.struct_should:
             x = _gpu_cond_mask(cond, leaf_gpu, rows, query_gpu)
             any_ = x if any_ is None else (any_ | x)
-        if any_ is None:        # only empty members: matches nothing
-            return None
+        if any_ is None:
+            # Unreachable: `should_applies` requires a per-query structured
+            # should member or (with no text part) static should rows, and each
+            # sets `any_` above. Fail loudly rather than return "no rows" if a
+            # change to `FilterPlan.should_applies` ever breaks that.
+            raise RuntimeError(
+                "per-query filter plan has should_applies but no should member")
         and_(any_)
     for cond in plan.struct_not:
         and_(~_gpu_cond_mask(cond, leaf_gpu, rows, query_gpu))
