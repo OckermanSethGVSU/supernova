@@ -2,17 +2,25 @@
 
 `nova_textscan` performs tokenization, lowercasing, vocabulary lookup, and
 row-mask construction in Rust with the GIL released. This module prepares the
-Arrow-derived Unicode tables and buffers required by that scanner and decides
-whether the native path is safe to use.
+per-codepoint tables and buffers required by that scanner and decides whether
+the native path is safe to use.
 
-Token boundaries and lowercase mappings are derived from the installed Arrow
-build rather than hardcoded. Hashes are used only to locate vocabulary
-candidates; matches are confirmed against the full lowered token.
+Token boundaries come from the measured Qdrant word-character table
+(`tokenizer_tables.qdrant_word_chars.WORD_CHAR_RANGES`, the same ranges `TOKEN_SPLIT_PATTERN`
+spells out for the Arrow path). Lowercasing is Rust `str::to_lowercase` per
+token, as Qdrant does it (`nova_bf.tokenize`): the one-codepoint map is
+derived from the installed Arrow build's `utf8_lower` rather than hardcoded,
+the scanner adds the `İ` -> `i` U+0307 expansion and Final_Sigma within the
+token, and the Case_Ignorable / Cased flags Final_Sigma needs come from
+`tokenizer_tables.rust_case_props` (the same tables `tokenize.qdrant_lower_token` uses).
+Hashes are used only to locate vocabulary candidates; matches are confirmed
+against the full lowered token.
 
-If the extension is unavailable, table derivation is unsupported, the
-vocabulary cannot be represented, or the native self-check disagrees with the
-Arrow implementation, the native path is disabled and callers fall back to
-Arrow.
+If the extension is unavailable or too old (its `features()` must list every
+entry of `REQUIRED_FEATURES`; an older build is refused with one warning, not
+used with older lowercasing), table derivation is unsupported, the vocabulary
+cannot be represented, or the native self-check disagrees with the Arrow
+implementation, the native path is disabled and callers fall back to Arrow.
 
 Set `NOVA_BF_NO_NATIVE_TOKENIZER` to disable the native path explicitly.
 """
@@ -27,7 +35,9 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.compute as pc
 
-from nova_bf.tokenize import TOKEN_SPLIT_PATTERN
+from nova_bf.tokenizer_tables.qdrant_word_chars import WORD_CHAR_RANGES
+from nova_bf.tokenizer_tables.rust_case_props import CASE_IGNORABLE_RANGES, CASED_RANGES
+from nova_bf.tokenize import TOKEN_SPLIT_PATTERN, lower_tokens
 
 logger = logging.getLogger(__name__)
 
@@ -35,41 +45,39 @@ __all__ = ["available", "prepare", "scan_into", "unavailable_reason"]
 
 N_CODEPOINTS = 0x110000
 
+# Lowercasing rules the extension must implement (`nova_textscan.features()`).
+REQUIRED_FEATURES = ("dotted_capital_i_expands", "final_sigma_in_token")
+# `case` table bits, as in crates/nova-textscan/src/tokenizer.rs.
+CASE_IGNORABLE, CASED = 1, 2
+
 def _alnum_cp_table() -> np.ndarray:
-    """Derive Arrow's `\\p{L}\\p{N}` classification for every Unicode codepoint."""
-    all_codepoints = "".join(
-        chr(c) for c in range(N_CODEPOINTS) if not (0xD800 <= c < 0xE000)
-    )
-    tokens = pc.split_pattern_regex(
-        pa.array([all_codepoints], type=pa.large_string()),
-        pattern=TOKEN_SPLIT_PATTERN,
-    )
-
-    flat = pc.list_flatten(tokens)
-    if isinstance(flat, pa.ChunkedArray):
-        flat = flat.combine_chunks()
-        flat = flat.chunk(0) if flat.num_chunks else pa.array([], type=pa.large_string())
-
-    offsets = np.frombuffer(flat.buffers()[1], dtype=np.int64)[
-        flat.offset : flat.offset + len(flat) + 1
-    ]
-    values = flat.buffers()[2]
-    token_bytes = (
-        np.frombuffer(values, dtype=np.uint8)[int(offsets[0]) : int(offsets[-1])]
-        if values is not None and len(flat)
-        else np.empty(0, dtype=np.uint8)
-    )
-
+    """Word-character flag per codepoint, from the measured Qdrant table — the
+    same `WORD_CHAR_RANGES` `TOKEN_SPLIT_PATTERN` is built from, so the native
+    and Arrow paths split identically (not derived from Arrow's RE2)."""
     alnum = np.zeros(N_CODEPOINTS, dtype=np.uint8)
-    if token_bytes.size:
-        # Recover the codepoints Arrow retained inside tokens.
-        seen = np.frombuffer(
-            token_bytes.tobytes().decode("utf-8").encode("utf-32-le"),
-            dtype=np.uint32,
-        )
-        alnum[seen] = 1
-
+    for lo, hi in WORD_CHAR_RANGES:
+        alnum[lo:hi + 1] = 1
     return alnum
+
+def _case_cp_table() -> np.ndarray:
+    """`CASE_IGNORABLE` / `CASED` bits per codepoint for Final_Sigma."""
+    case = np.zeros(N_CODEPOINTS, dtype=np.uint8)
+    for lo, hi in CASE_IGNORABLE_RANGES:
+        case[lo:hi + 1] |= CASE_IGNORABLE
+    for lo, hi in CASED_RANGES:
+        case[lo:hi + 1] |= CASED
+    return case
+
+
+def _missing_features(ns) -> list[str] | None:
+    """Required lowercasing rules `ns` lacks (`None` = all present)."""
+    try:
+        have = set(ns.features())
+    except Exception:
+        have = set()
+    missing = [f for f in REQUIRED_FEATURES if f not in have]
+    return missing or None
+
 
 try:
     import nova_textscan as _ns
@@ -144,6 +152,15 @@ def _derive():
         _TABLES_REASON = f"nova_textscan not importable ({_IMPORT_ERROR})"
         return None
 
+    missing = _missing_features(_ns)
+    if missing:
+        ver = getattr(_ns, "version", lambda: "?")()
+        _TABLES_REASON = (f"nova_textscan {ver} is too old: it lacks {missing}; "
+                          f"rebuild it (crates/nova-textscan/build_native.sh)")
+        logger.warning("native tokenizer disabled: %s. The Arrow pipeline computes "
+                       "the same masks, more slowly.", _TABLES_REASON)
+        return None
+
     try:
         alnum_cp = np.ascontiguousarray(_alnum_cp_table(), dtype=np.uint8)
         if alnum_cp.shape != (N_CODEPOINTS,):
@@ -176,7 +193,7 @@ def _derive():
                 "result", moved,
             )
 
-        _TABLES = _ns.ScanTables(alnum_cp, lower_cp)
+        _TABLES = _ns.ScanTables(alnum_cp, lower_cp, _case_cp_table())
 
     except Exception as exc:
         _TABLES_REASON = f"{type(exc).__name__}: {exc}"
@@ -185,8 +202,9 @@ def _derive():
 
     return _TABLES
 
-# Fixed self-check covering case folding, separators, combining marks,
-# non-ASCII letters/scripts, digits, special lowercase mappings, nulls,
+# Fixed self-check covering case folding, separators, combining marks (split
+# and kept), circled letters, non-ASCII letters/scripts, digits, special
+# lowercase mappings (İ expansion, Final_Sigma in and out of context), nulls,
 # empty strings, and token-length distinctions.
 _SELFCHECK_ROWS = [
     "Hello, WORLD! hello",
@@ -199,12 +217,19 @@ _SELFCHECK_ROWS = [
     "",
     None,
     "ǅungla ǄUNGLA",
+    "हिन्दी ⓐⓑⓒ مَرْحَبًا",
+    "ΟΔΟΣ ΣΑ Σ ΑΣΣ ΑΣ1 Α\u02b0Σ \u02b0Σ ΑΣ\u0345 ΑΣ\u02b0Β ΑΣ'Β",
+    "iİ İ ⒶΣ",
 ]
 
 _SELFCHECK_VOCAB = [
     "hello", "world", "leading", "trailing", "snake", "case", "camelcase",
     "he", "llo", "café", "café", "istanbul", "100k", "текст", "мир",
     "42", "aaaaaaaa", "aaaaaaaaa", "ǆungla", "i", "ı",
+    "हिन", "दी", "ह", "ⓐⓑⓒ", "مَرْحَبًا", "م",
+    "οδος", "οδοσ", "σα", "ςα", "σ", "ς", "ασς", "ασσ", "ας1", "ασ1",
+    "α\u02b0ς", "\u02b0σ", "\u02b0ς", "ας\u0345", "ασ\u02b0β", "ας", "β",
+    "i\u0307stanbul", "ii\u0307", "ii", "i\u0307", "ⓐς", "ⓐσ",
 ]
 
 def _probe() -> str | None:
@@ -258,7 +283,7 @@ def _self_check() -> str | None:
 def arrow_grid(arr, vocab) -> np.ndarray:
     """Return the reference Arrow `(n_tokens, n_rows)` match grid."""
     toks = pc.split_pattern_regex(arr, pattern=TOKEN_SPLIT_PATTERN)
-    lowered = pc.utf8_lower(pc.list_flatten(toks))
+    lowered = lower_tokens(pc.list_flatten(toks))
     parent = pc.list_parent_indices(toks)
     codes = pc.index_in(lowered, value_set=pa.array(vocab, type=pa.large_string()))
     valid = pc.is_valid(codes)

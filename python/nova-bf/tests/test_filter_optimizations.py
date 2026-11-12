@@ -125,13 +125,15 @@ def test_query_and_corpus_tokenize_identically_on_divergent_codepoints():
     Arrow's utf8_lower/RE2 classes disagree (Turkish İ's case mapping, Greek
     word-final Σ→σ vs ς) — the failure class an earlier draft had, where a
     Python-tokenized query token could never equal any Arrow-tokenized
-    corpus token and silently matched nothing."""
+    corpus token and silently matched nothing. Word-final Σ lowers to ς
+    (Qdrant's per-token Rust lowercasing), so the σ spelling matches nothing."""
     rows = ["İstanbul kebap", "ΟΔΥΣΣΕΥΣ ΗΡΩΑΣ", "plain row"]
     t = pa.table({"text": pa.array(rows)})
     for phrase, expect in [
         ("İstanbul", [True, False, False]),   # identical word must match itself
         ("ΟΔΥΣΣΕΥΣ", [False, True, False]),   # uppercase final-sigma word
-        ("οδυσσευσ", [False, True, False]),   # arrow-lowercased spelling (σ)
+        ("οδυσσευς", [False, True, False]),   # Qdrant's lowercase (final ς)
+        ("οδυσσευσ", [False, False, False]),  # simple-lowercase spelling: no match
     ]:
         f = Filter(must=[FilterCondition(field="text", match_text=phrase)])
         assert _ev(f, t).tolist() == expect, phrase

@@ -1,25 +1,44 @@
 //! Allocation-free tokenizer used by the native `match_text` scan.
 //!
-//! Text is split into maximal runs of `\p{L}\p{N}` codepoints and each token
-//! is then lowercased. Token classification and lowercase mappings come from
-//! tables derived by Python from the installed Arrow build, so this module does
-//! not carry its own Unicode semantics.
+//! Text is split into maximal runs of word characters and each token is then
+//! lowercased the way Rust's `str::to_lowercase` lowercases it (what Qdrant's
+//! `word` tokenizer does per token). The word-character set, the per-codepoint
+//! lowercase map and the Case_Ignorable / Cased flags all come from tables
+//! Python passes in (measured against Qdrant / derived from rustc), so this
+//! module does not carry its own Unicode tables.
 //!
 //! Token boundaries are determined from the original codepoints before
-//! lowercasing. The native path is enabled only when Arrow's lowercase mapping
-//! can be represented one codepoint at a time.
+//! lowercasing. On top of the one-codepoint table, two rules of
+//! `str::to_lowercase` are applied here, both within the token only:
+//!
+//! * `İ` U+0130 lowercases to `i` U+0307 (the one multi-codepoint lowercase
+//!   mapping; the lowered token grows by two bytes);
+//! * `Σ` U+03A3 lowercases to `ς` U+03C2 when Final_Sigma holds, else `σ`
+//!   (`final_sigma`, same logic as alloc's `map_uppercase_sigma`).
 //!
 //! Malformed UTF-8 is treated conservatively as a separator and always advances
 //! by at least one byte, keeping the walk total and in bounds.
 
 
-/// Arrow-derived Unicode tables plus ASCII fast-path representations.
+/// `case` table bits.
+pub const CASE_IGNORABLE: u8 = 1;
+/// Cased and not Case_Ignorable (the only Cased chars Final_Sigma consults).
+pub const CASED: u8 = 2;
+
+const CAPITAL_SIGMA: u32 = 0x03A3;
+const DOTTED_CAPITAL_I: u32 = 0x0130;
+
+/// Per-codepoint Unicode tables plus ASCII fast-path representations.
 pub struct Tables<'a> {
-    /// `\p{L}\p{N}` membership for every Unicode codepoint.
+    /// Word-character membership for every Unicode codepoint.
     pub alnum: &'a [u8],
 
-    /// Arrow's one-codepoint lowercase mapping.
+    /// One-codepoint lowercase mapping; U+0130 and U+03A3 hold `SPECIAL`
+    /// (handled by `special_lower`). `ScanTables` installs the marks.
     pub lower: &'a [u32],
+
+    /// `CASE_IGNORABLE` / `CASED` bits for every Unicode codepoint.
+    pub case: &'a [u8],
 
     /// ASCII alphanumeric membership as a bitmap over all byte values.
     pub ascii_alnum: [u64; 4],
@@ -28,9 +47,10 @@ pub struct Tables<'a> {
     pub ascii_lower: [u8; 128],
 }
 impl<'a> Tables<'a> {
-    pub fn new(alnum: &'a [u8], lower: &'a [u32]) -> Self {
+    pub fn new(alnum: &'a [u8], lower: &'a [u32], case: &'a [u8]) -> Self {
         assert_eq!(alnum.len(), 0x11_0000);
         assert_eq!(lower.len(), 0x11_0000);
+        assert_eq!(case.len(), 0x11_0000);
 
         let mut ascii_alnum = [0u64; 4];
         let mut ascii_lower = [0u8; 128];
@@ -47,6 +67,7 @@ impl<'a> Tables<'a> {
         Self {
             alnum,
             lower,
+            case,
             ascii_alnum,
             ascii_lower,
         }
@@ -73,6 +94,88 @@ impl<'a> Tables<'a> {
     pub fn lower_cp(&self, cp: u32) -> u32 {
         debug_assert!((cp as usize) < self.lower.len());
         unsafe { *self.lower.get_unchecked(cp as usize) }
+    }
+
+    #[inline(always)]
+    fn case_bits(&self, cp: u32) -> u8 {
+        debug_assert!((cp as usize) < self.case.len());
+        unsafe { *self.case.get_unchecked(cp as usize) }
+    }
+}
+
+/// `lower` entry marking a codepoint `special_lower` handles (U+0130, U+03A3);
+/// not a scalar value, so no real mapping collides with it.
+pub const SPECIAL: u32 = u32::MAX;
+
+/// Final_Sigma for the `Σ` at `tok[at..at + 2]`, within the token `tok`.
+///
+/// Mirrors alloc's `map_uppercase_sigma`: word-final iff the chars before it
+/// (nearest first) are Case_Ignorable* then a Cased char, and the chars after
+/// it are NOT Case_Ignorable* then a Cased char. "After" ends at the first
+/// non-word char (or malformed byte, a separator), which is where the token
+/// ends; `tok` may extend past the token (`walk_row` passes the row tail).
+#[cold]
+#[inline(never)]
+fn final_sigma(tok: &[u8], start: usize, at: usize, t: &Tables) -> bool {
+    // Before: [start, at) is the token so far, all valid word chars.
+    let mut j = at;
+    let before = loop {
+        if j == start {
+            break false;
+        }
+        j -= 1;
+        while tok[j] & 0xC0 == 0x80 {
+            j -= 1;
+        }
+        let (cp, _) = decode(tok, j);
+        let bits = t.case_bits(cp);
+        if bits & CASE_IGNORABLE == 0 {
+            break bits & CASED != 0;
+        }
+    };
+    if !before {
+        return false;
+    }
+    let mut k = at + 2;
+    while k < tok.len() {
+        let (cp, len) = decode(tok, k);
+        if !t.is_alnum(cp) {
+            return true; // token ends
+        }
+        let bits = t.case_bits(cp);
+        if bits & CASE_IGNORABLE == 0 {
+            return bits & CASED == 0;
+        }
+        k += len;
+    }
+    true
+}
+
+/// UTF-8 of the lowercase of special codepoint `cp` at `tok[at..]`; the
+/// token started at `tok[start]`. Returns the byte count written to `buf`.
+#[cold]
+#[inline(never)]
+fn special_lower(tok: &[u8], start: usize, at: usize, cp: u32, t: &Tables, buf: &mut [u8; 4]) -> usize {
+    if cp == DOTTED_CAPITAL_I {
+        // U+0069 U+0307
+        buf[0] = b'i';
+        buf[1] = 0xCC;
+        buf[2] = 0x87;
+        3
+    } else {
+        debug_assert_eq!(cp, CAPITAL_SIGMA);
+        encode(if final_sigma(tok, start, at, t) { 0x03C2 } else { 0x03C3 }, buf)
+    }
+}
+
+/// UTF-8 of the lowercase of `cp` at `tok[at..]` (token started at `start`).
+#[inline(always)]
+fn lower_at(tok: &[u8], start: usize, at: usize, cp: u32, t: &Tables, buf: &mut [u8; 4]) -> usize {
+    let l = t.lower_cp(cp);
+    if l == SPECIAL {
+        special_lower(tok, start, at, cp, t, buf)
+    } else {
+        encode(l, buf)
     }
 }
 /// Decode one UTF-8 codepoint at `b[i]`.
@@ -224,8 +327,18 @@ pub fn token_eq(tok: &[u8], needle: &[u8], t: &Tables) -> bool {
     let mut j = 0;
     let mut buf = [0u8; 4];
     while i < tok.len() {
+        let b = tok[i];
+        if b < 0x80 {
+            // ASCII: one byte in, one byte out, never special.
+            if j >= needle.len() || needle[j] != t.ascii_low(b) {
+                return false;
+            }
+            i += 1;
+            j += 1;
+            continue;
+        }
         let (cp, len) = decode(tok, i);
-        let n = encode(t.lower_cp(cp), &mut buf);
+        let n = lower_at(tok, 0, i, cp, t, &mut buf);
         if j + n > needle.len() || needle[j..j + n] != buf[..n] {
             return false;
         }
@@ -288,7 +401,7 @@ pub fn walk_row<F: FnMut(usize, usize, u64, usize)>(
             }
 
             let mut buf = [0u8; 4];
-            let m = encode(t.lower_cp(cp), &mut buf);
+            let m = lower_at(row, start, i, cp, t, &mut buf);
             for &x in &buf[..m] {
                 hs.push(x);
             }
@@ -310,7 +423,7 @@ pub fn lower_into(tok: &[u8], t: &Tables, out: &mut Vec<u8>) {
     let mut buf = [0u8; 4];
     while i < tok.len() {
         let (cp, len) = decode(tok, i);
-        let n = encode(t.lower_cp(cp), &mut buf);
+        let n = lower_at(tok, 0, i, cp, t, &mut buf);
         out.extend_from_slice(&buf[..n]);
         i += len;
     }

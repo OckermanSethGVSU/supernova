@@ -1,19 +1,22 @@
 //! Native `match_text` corpus scanning.
 //!
-//! `scan_into` reproduces the Arrow tokenization/lowercasing pipeline in one
+//! `scan_into` reproduces nova-bf's tokenization/lowercasing pipeline (Qdrant's
+//! `word` tokenizer: split, then Rust `str::to_lowercase` per token) in one
 //! compiled pass over the string value buffer, writing matches directly into
 //! the caller's `(n_tokens, n_rows)` grid while the GIL is released.
 //!
-//! Token boundaries and lowercase mappings come from tables derived by Python
-//! from the installed Arrow build, so the native path follows Arrow's behavior
-//! rather than hardcoding Unicode rules.
+//! Token boundaries, the one-codepoint lowercase map and the Case_Ignorable /
+//! Cased flags come from tables built by Python; the two context/expansion
+//! rules of `to_lowercase` (U+0130 and Final_Sigma) are in `tokenizer`.
 //!
 //! Vocabulary hashes are used only to locate candidates. Every candidate is
 //! compared against the full lowered token by `tokenizer::token_eq`, so hash
 //! collisions cannot change the result.
 //!
-//! If the required Arrow behavior cannot be represented or verified, Python
+//! If the required behavior cannot be represented or verified, Python
 //! refuses the native path and falls back to the Arrow implementation.
+//! Python also refuses an extension whose `features()` lacks a rule it needs,
+//! so an older build is never used with newer semantics.
 
 use numpy::{PyReadonlyArray1, PyReadwriteArray2, PyUntypedArrayMethods};
 use pyo3::exceptions::PyValueError;
@@ -31,22 +34,44 @@ const N_CODEPOINTS: usize = 0x11_0000;
 pub struct ScanTables {
     alnum: Vec<u8>,
     lower: Vec<u32>,
+    case: Vec<u8>,
 }
 #[pymethods]
 impl ScanTables {
     #[new]
-    fn new(alnum: PyReadonlyArray1<u8>, lower: PyReadonlyArray1<u32>) -> PyResult<Self> {
-        if alnum.len() != N_CODEPOINTS || lower.len() != N_CODEPOINTS {
+    fn new(
+        alnum: PyReadonlyArray1<u8>,
+        lower: PyReadonlyArray1<u32>,
+        case: PyReadonlyArray1<u8>,
+    ) -> PyResult<Self> {
+        if alnum.len() != N_CODEPOINTS || lower.len() != N_CODEPOINTS || case.len() != N_CODEPOINTS {
             return Err(PyValueError::new_err(format!(
-                "tables must have {N_CODEPOINTS} entries, got {} and {}",
+                "tables must have {N_CODEPOINTS} entries, got {}, {} and {}",
                 alnum.len(),
-                lower.len()
+                lower.len(),
+                case.len()
+            )));
+        }
+        let mut lower = lower.as_slice()?.to_vec();
+        // Surrogate inputs never decode, so their (identity) entries are unused;
+        // every entry a valid scalar value can reach must be one too.
+        if let Some(cp) = lower.iter().enumerate().position(|(i, &c)| {
+            !(0xD800..0xE000).contains(&i) && (c > 0x10FFFF || (0xD800..0xE000).contains(&c))
+        }) {
+            return Err(PyValueError::new_err(format!(
+                "lower[U+{cp:04X}] is not a Unicode scalar value"
             )));
         }
 
+        // The two codepoints whose lowercase the one-codepoint table cannot
+        // express; `tokenizer::special_lower` handles them.
+        lower[0x0130] = tokenizer::SPECIAL;
+        lower[0x03A3] = tokenizer::SPECIAL;
+
         Ok(Self {
             alnum: alnum.as_slice()?.to_vec(),
-            lower: lower.as_slice()?.to_vec(),
+            lower,
+            case: case.as_slice()?.to_vec(),
         })
     }
 }
@@ -54,7 +79,7 @@ impl ScanTables {
 impl ScanTables {
     /// Borrow the owned tables for tokenization.
     fn view(&self) -> Tables<'_> {
-        Tables::new(&self.alnum, &self.lower)
+        Tables::new(&self.alnum, &self.lower, &self.case)
     }
 }
 /// Query vocabulary with a bit filter in front of an open-addressed hash table.
@@ -289,6 +314,13 @@ fn version() -> &'static str {
     env!("CARGO_PKG_VERSION")
 }
 
+/// Lowercasing rules this build implements beyond the one-codepoint table.
+/// `nativetok` refuses a build that lacks one it needs.
+#[pyfunction]
+fn features() -> Vec<&'static str> {
+    vec!["dotted_capital_i_expands", "final_sigma_in_token"]
+}
+
 /// Expose the scanner hash for testing.
 #[pyfunction]
 fn hash_of(b: &[u8]) -> u64 {
@@ -302,6 +334,7 @@ fn nova_textscan(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(scan_into, m)?)?;
     m.add_function(wrap_pyfunction!(tokens_of, m)?)?;
     m.add_function(wrap_pyfunction!(version, m)?)?;
+    m.add_function(wrap_pyfunction!(features, m)?)?;
     m.add_function(wrap_pyfunction!(hash_of, m)?)?;
     Ok(())
 }

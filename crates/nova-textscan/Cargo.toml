@@ -1,6 +1,6 @@
 [package]
 name = "nova-textscan"
-version = "0.0.12"
+version = "0.0.13"
 edition = "2021"
 
 # A Python extension module, not a Rust library anybody links: `cdylib` only.

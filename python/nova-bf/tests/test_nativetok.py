@@ -1,7 +1,7 @@
 """Equivalence tests for `nova_bf.nativetok` / the `nova_textscan` crate.
 
 ONE oracle: the exact
-`_token_row_masks._arrow_scan` body (`split_pattern_regex` -> `utf8_lower` ->
+`_token_row_masks._arrow_scan` body (`split_pattern_regex` -> `lower_tokens` ->
 `list_parent_indices` -> `index_in` -> boolean scatter). The native scan is
 only ever allowed to be a performance change, so the whole
 `(n_tokens, n_rows)` grid has to come out identical — `np.array_equal`, never
@@ -83,8 +83,9 @@ def test_a_nonascii_vocabulary_token_is_served_natively():
 
 
 def test_a_combining_mark_splits_a_word_and_an_accent_does_not():
-    # U+0301 is a Mark: neither \p{L} nor \p{N}, so Arrow yields `he` and
-    # `llo`. `é` as one codepoint is a letter, so `café` stays whole.
+    # U+0301 is a Mark that is not Alphabetic, so it is not a word character
+    # (Qdrant splits on it too) and both paths yield `he` and `llo`.
+    # `é` as one codepoint is a letter, so `café` stays whole.
     _check(["héllo", "café"], ["he", "llo", "hello", "café", "caf"])
 
 

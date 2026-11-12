@@ -92,6 +92,8 @@ filter:
 
 `match_text` requires every word, in any order. It uses lowercase word tokenization without stemming or stopword removal.
 
+Words are split where Qdrant's `word` tokenizer splits them: a word is a run of the characters Qdrant 1.18.2 keeps inside a token (Unicode alphabetic and numeric characters, measured on every codepoint), so combining vowel signs and circled letters stay inside a word while punctuation, underscores, emoji, and marks such as the Devanagari virama separate words. Each word is then lowercased on its own, exactly as Qdrant does (Rust's full Unicode lowercasing): `İ` becomes `i` followed by a combining dot above, so `istanbul` does not match `İstanbul` (but `İstanbul` and `İSTANBUL` match each other), and a capital `Σ` at the end of a word becomes `ς` (`ΟΔΟΣ` matches `οδος`, not `οδοσ`). "End of a word" is judged within the word: `ΑΣ'Β` gives `ας` and `β`. No differences from Qdrant 1.18.2's `word` tokenizer with `lowercase: true` are known; other Qdrant versions may bundle newer Unicode data.
+
 ```yaml
 - field: text
   match_text: chronic fatigue syndrome

@@ -26,7 +26,7 @@ import pyarrow.compute as pc
 
 from nova_bf import nativetok
 from nova_bf.config import Filter, FilterCondition
-from nova_bf.tokenize import TOKEN_SPLIT_PATTERN, tokenize, tokenize_many
+from nova_bf.tokenize import TOKEN_SPLIT_PATTERN, lower_tokens, tokenize, tokenize_many
 
 logger = logging.getLogger("nova_bf.filters")
 
@@ -1309,9 +1309,13 @@ def _token_row_masks(
     if pa.types.is_string(col.type):
         col = pc.cast(col, pa.large_string())
     # If available, the native scanner consumes Arrow's buffers directly in
-    # one Rust call per batch.  It derives its Unicode tables from this Arrow
-    # build and self-checks against the pipeline below; a missing extension or
-    # any failed check leaves the established Arrow path untouched.
+    # one Rust call per batch.  Its token boundaries come from the measured
+    # Qdrant word-character table (`tokenizer_tables.qdrant_word_chars`, the same ranges the
+    # Arrow split pattern spells out) and its Final_Sigma case flags from
+    # `tokenizer_tables.rust_case_props`; only the one-codepoint lowercase map is derived from
+    # this Arrow build's `utf8_lower` (see `nativetok`). It self-checks against
+    # the pipeline below; a missing extension or any failed check leaves the
+    # established Arrow path untouched.
     native = nativetok.prepare(ordered)
     value_set = pa.array(ordered, type=pa.large_string()) if native is None else None
 
@@ -1331,7 +1335,7 @@ def _token_row_masks(
             nativetok.scan_into(chunk, native, sub_grid)
         else:
             toks = pc.split_pattern_regex(chunk, pattern=TOKEN_SPLIT_PATTERN)
-            lowered = pc.utf8_lower(pc.list_flatten(toks))
+            lowered = lower_tokens(pc.list_flatten(toks))
             parent = pc.list_parent_indices(toks)
             codes = pc.index_in(lowered, value_set=value_set)
             valid = pc.is_valid(codes)

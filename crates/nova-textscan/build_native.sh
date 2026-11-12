@@ -28,4 +28,4 @@ TARGET="$(cargo metadata --format-version 1 --no-deps \
 SO="$TARGET/release-textscan/libnova_textscan.so"
 [ -f "$SO" ] || { echo "built, but $SO is missing" >&2; exit 1; }
 cp -f "$SO" "$DEST/nova_textscan.abi3.so"
-"$PY" -c "import nova_textscan; print('nova_textscan', nova_textscan.version(), 'installed in $DEST')"
+PYTHONPATH="$DEST${PYTHONPATH:+:$PYTHONPATH}" "$PY" -c "import nova_textscan; print('nova_textscan', nova_textscan.version(), 'installed in $DEST')"
