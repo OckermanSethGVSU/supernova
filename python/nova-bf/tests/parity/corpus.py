@@ -57,6 +57,52 @@ TITLE_WORDS = (
     "graph", "payload", "filter", "sparse", "dense", "token", "cluster",
 )
 
+# ---- the EDGE payload: columns added for the edge-of-the-filter-language
+# suites (test_parity_dates / _regimes / _filter_paths). Drawn from their OWN
+# rng (`SEED + 1`) after nothing else, so adding them left every value of the
+# original columns — and every result the older suites pin — unchanged.
+#
+#   event_at   µs-precision RFC-3339 datetime, nullable, ~half before 1970.
+#              Rows in EVENT_AT_PINS hold instants where float-seconds
+#              arithmetic is off by one µs, so a bound placed exactly there
+#              discriminates exact from almost-exact date handling.
+#   score_i    int64, nullable, 0..30 (lots of duplicates: equality matters)
+#   flag       bool, nullable
+#   weight     float64, nullable
+#   note       nullable multi-token text with case/punctuation variety, plus
+#              rows that are "" and punctuation-only (no tokens at all)
+#   lang_dict  DICTIONARY-encoded string column with nulls
+EDGE_SEED = SEED + 1
+NOTE_WORDS = ("alpha", "beta", "gamma", "delta", "omega")
+NOTE_SEPS = (" ", "-", ", ", "_", ".", "; ")
+# Bound instants. `int(datetime.timestamp() * 1e6)` gets A and C one µs LOW
+# and B one µs HIGH — the bug once in `dates.parse_scalar_epoch_us`.
+EVENT_A = "2005-04-18T02:42:41.147961Z"
+EVENT_A_OFFSET = "2005-04-18T08:12:41.147961+05:30"   # the same instant as A
+EVENT_B = "1961-06-16T09:02:42.182308Z"
+EVENT_C = "1970-02-19T17:23:49.839604Z"
+EVENT_M1 = "1969-12-31T23:59:59.999999Z"              # -1 µs
+EVENT_ZERO = "1970-01-01T00:00:00Z"
+EVENT_AT_PINS = {17: EVENT_A, 200: EVENT_A, 201: EVENT_A_OFFSET, 40: EVENT_B,
+                 250: EVENT_B, 120: EVENT_C, 77: EVENT_M1, 78: EVENT_ZERO}
+
+# Per-query edge columns, cycled by query index. Each list deliberately holds a
+# null, a value no corpus row has (a DEAD query for a `must`), and — for the
+# list/phrase columns — an empty list / empty or token-less phrase.
+Q_SCORE = (3, 7, None, 12, 0, 30, 15, 99)
+Q_SCORES = ([1, 2, 3], [], None, [4, None, 6], [30], [99], [0, 10, 20], [7])
+Q_FLAG = (True, False, None, True, False, True, False, True)
+Q_NOTE_PHRASE = ("alpha", "beta gamma", None, "", "!!!", "ALPHA-Beta", "delta", "zzz")
+Q_LANG_N = ("eng", None, "fra", "xxx", "deu", "spa", "eng", None)
+Q_LANGS_N = (["eng", "fra"], [], None, ["deu", None], ["xxx"], ["spa"], ["eng"],
+             ["fra", "deu", "spa"])
+Q_EVENT_AT = (EVENT_A, EVENT_B, EVENT_C, EVENT_M1, EVENT_A_OFFSET, None,
+              "1990-06-15T12:00:00.5Z", EVENT_B)
+Q_WEIGHT_LO = (0.1, 0.5, None, 0.9, 0.0, 0.25, 0.75, 1.5)
+Q_SCORE_LO = (2.5, 10.0, None, 0.5, 29.5, -1.0, 15.5, 31.0)
+# every list empty or null: a MatchAny whose vocabulary is EMPTY for all queries
+Q_NOLIST = ([], None)
+
 
 @dataclass
 class Dataset:
@@ -135,7 +181,7 @@ def _sparse_array(rows) -> pa.Array:
     )
 
 
-def build(tmp_path, n_queries: int = N_QUERIES) -> Dataset:
+def build(tmp_path, n_queries: int = N_QUERIES, qid=str) -> Dataset:
     """Generate the corpus and queries and return the expected truth.
 
     `n_queries` changes only the query side; the corpus is generated first, so
@@ -143,8 +189,14 @@ def build(tmp_path, n_queries: int = N_QUERIES) -> Dataset:
 
     Variable query counts exercise `PackedRowMask` height validation and make
     per-query row-union narrowing observable in the test fixture.
+
+    `qid(query_index) -> str` names each query. The default (`str`) makes the
+    id equal the row index, which every older fixture relies on — and which is
+    exactly what lets a bug that writes the POSITION instead of the id go
+    unseen; `ds_qids` passes one that does not.
     """
     rng = np.random.default_rng(SEED)
+    edge_rng = np.random.default_rng(EDGE_SEED)
     corpus_dir = tmp_path / "corpus"
     corpus_dir.mkdir(parents=True, exist_ok=True)
 
@@ -191,6 +243,8 @@ def build(tmp_path, n_queries: int = N_QUERIES) -> Dataset:
                 "published_at": _rfc3339(2013, int(rng.integers(0, 1095))),
             })
 
+            payloads[-1].update(_edge_payload(edge_rng, g))
+
             docs.append(naive.Doc(
                 row=g,
                 payload={k: v for k, v in payloads[-1].items() if k != "id"},
@@ -213,19 +267,26 @@ def build(tmp_path, n_queries: int = N_QUERIES) -> Dataset:
             "rating": pa.array([p["rating"] for p in payloads], type=pa.float64()),
             "title": pa.array([p["title"] for p in payloads]),
             "published_at": pa.array([p["published_at"] for p in payloads]),
+            "event_at": pa.array([p["event_at"] for p in payloads], type=pa.string()),
+            "score_i": pa.array([p["score_i"] for p in payloads], type=pa.int64()),
+            "flag": pa.array([p["flag"] for p in payloads], type=pa.bool_()),
+            "weight": pa.array([p["weight"] for p in payloads], type=pa.float64()),
+            "note": pa.array([p["note"] for p in payloads], type=pa.string()),
+            "lang_dict": pa.array([p["lang_dict"] for p in payloads],
+                                  type=pa.string()).dictionary_encode(),
         })
         pq.write_table(table, str(corpus_dir / f"part-{fi:03d}.parquet"))
         row += n
 
-    queries = _build_queries(rng, tmp_path, n_queries)
+    queries = _build_queries(rng, tmp_path, n_queries, qid=qid)
     return Dataset(
         tmp=str(tmp_path),
         corpus_dir=str(corpus_dir),
         queries_path=str(tmp_path / "queries.parquet"),
         docs=docs,
         queries=queries,
-        date_fields={"published_at": "rfc3339"},
-        query_date_fields={"q_after": "rfc3339"},
+        date_fields={"published_at": "rfc3339", "event_at": "rfc3339"},
+        query_date_fields={"q_after": "rfc3339", "q_event_at": "rfc3339"},
     )
 
 
@@ -236,7 +297,61 @@ def _rfc3339(base_year: int, day_offset: int) -> str:
     return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def _build_queries(rng, tmp_path, n_queries: int = N_QUERIES) -> list[dict]:
+def _edge_payload(rng, g: int) -> dict:
+    """The EDGE columns of corpus row `g` (see EDGE_SEED). Every draw happens
+    unconditionally, so the null pattern never shifts the rng stream."""
+    from datetime import datetime, timedelta, timezone
+
+    lo = -15 * 365 * 86400 * 10**6            # ~1955
+    hi = 40 * 365 * 86400 * 10**6             # ~2010
+    us = int(rng.integers(lo, hi))
+    score = int(rng.integers(0, 31))
+    flag = bool(rng.random() < 0.5)
+    weight = float(rng.random())
+    n_words = int(rng.integers(1, 5))
+    words = [NOTE_WORDS[int(i)] for i in rng.choice(len(NOTE_WORDS), size=n_words)]
+    seps = [NOTE_SEPS[int(i)] for i in rng.integers(0, len(NOTE_SEPS), size=n_words)]
+    case = int(rng.integers(0, 3))
+    lang = LANGUAGES[int(rng.integers(0, len(LANGUAGES)))]
+
+    dt = datetime(1970, 1, 1, tzinfo=timezone.utc) + timedelta(microseconds=us)
+    event = EVENT_AT_PINS.get(g, dt.strftime("%Y-%m-%dT%H:%M:%S.%fZ"))
+    if g % 13 == 5 and g not in EVENT_AT_PINS:
+        event = None
+    note = "".join(w.upper() if case == 1 else w.title() if case == 2 else w
+                   for w in (x for pair in zip(words, seps) for x in pair)).rstrip(" ,;.-_")
+    if g % 12 == 7:
+        note = None
+    elif g % 12 == 2:
+        note = ""
+    elif g % 12 == 9:
+        note = "!!! ---"
+    return {
+        "event_at": event,
+        "score_i": None if g % 9 == 4 else score,
+        "flag": None if g % 10 == 3 else flag,
+        "weight": None if g % 8 == 1 else weight,
+        "note": note,
+        "lang_dict": None if g % 11 == 6 else lang,
+    }
+
+
+EDGE_QUERY_COLUMNS = {
+    # name -> (values cycled by query index, arrow type)
+    "q_score": (Q_SCORE, pa.int64()),
+    "q_scores": (Q_SCORES, pa.list_(pa.int64())),
+    "q_flag": (Q_FLAG, pa.bool_()),
+    "q_note_phrase": (Q_NOTE_PHRASE, pa.string()),
+    "q_lang_n": (Q_LANG_N, pa.string()),
+    "q_langs_n": (Q_LANGS_N, pa.list_(pa.string())),
+    "q_event_at": (Q_EVENT_AT, pa.string()),
+    "q_weight_lo": (Q_WEIGHT_LO, pa.float64()),
+    "q_score_lo": (Q_SCORE_LO, pa.float64()),
+    "q_nolist": (Q_NOLIST, pa.list_(pa.string())),
+}
+
+
+def _build_queries(rng, tmp_path, n_queries: int = N_QUERIES, qid=str) -> list[dict]:
     """Queries carry all three modalities plus the columns the per-query
     filter conditions read (`q_*`). The per-query columns are chosen so that
     no two queries get the same corpus subset — a per-query filter that was
@@ -248,7 +363,7 @@ def _build_queries(rng, tmp_path, n_queries: int = N_QUERIES) -> list[dict]:
         idx, val = _sparse_row(rng, duplicate=False, oov=False)
         mv = rng.standard_normal((int(rng.integers(2, 6)), MV_DIM)).astype(np.float32)
         rows.append({
-            "qid": str(qi),
+            "qid": qid(qi),
             "dense": dense,
             "sparse": (idx, val),
             "multivector": mv,
@@ -268,6 +383,7 @@ def _build_queries(rng, tmp_path, n_queries: int = N_QUERIES) -> list[dict]:
             # union / filter union) collapse onto each other.
             "query_set": "even" if qi % 2 == 0 else "odd",
             "query_third": f"g{qi % 3}",
+            **{c: vals[qi % len(vals)] for c, (vals, _) in EDGE_QUERY_COLUMNS.items()},
         })
 
     pq.write_table(pa.table({
@@ -285,6 +401,8 @@ def _build_queries(rng, tmp_path, n_queries: int = N_QUERIES) -> list[dict]:
         "q_after": pa.array([r["q_after"] for r in rows]),
         "query_set": pa.array([r["query_set"] for r in rows]),
         "query_third": pa.array([r["query_third"] for r in rows]),
+        **{c: pa.array([r[c] for r in rows], type=t)
+           for c, (_, t) in EDGE_QUERY_COLUMNS.items()},
     }), str(tmp_path / "queries.parquet"))
 
     # The oracles want the query vectors in plain-Python form, and the
@@ -301,6 +419,7 @@ def _build_queries(rng, tmp_path, n_queries: int = N_QUERIES) -> list[dict]:
                 k: r[k] for k in (
                     "q_language", "q_languages", "q_min_views", "q_max_views",
                     "q_phrase", "q_after", "query_set", "query_third",
+                    *EDGE_QUERY_COLUMNS,
                 )
             },
         })

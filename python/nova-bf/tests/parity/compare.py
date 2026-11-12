@@ -30,10 +30,27 @@ of how they ranked them.
 
 from __future__ import annotations
 
-# Per-metric absolute tolerance, scaled by |score| at the comparison site.
-# Euclidean is loosest because nova-bf derives it from a shared Gram expansion
-# (‖q‖² − 2q·c + ‖c‖²), which cancels catastrophically near zero distance.
-TOL = {"dot": 2e-4, "cosine": 2e-5, "euclidean": 2e-3}
+import os
+
+# THE score tolerance of the harness — every boundary-aware comparison reads it
+# from here. Applied as `tol * (1 + |score|)`: relative for large scores, so
+# euclidean (scores are -distance, ~-11 in the shared corpus) gets a
+# distance-scaled allowance, and absolute near zero.
+#
+# Measured worst `|nova-bf - naive| / (1 + |naive|)` on CPU (fp32 matmul vs a
+# float64 Python loop, matrix-style shared-Gram run, dense_batch_size=37):
+#   dot 3.8e-7, cosine 1.1e-7, euclidean 1.2e-7 (the Gram expansion
+#   ‖q‖² − 2q·c + ‖c‖² included).
+# 1e-5 is ~25x the worst of those, and still ~10x BELOW the error of scoring
+# fp16-rounded inputs (≈1e-4 relative), which the old 2e-3 euclidean allowance
+# let through unnoticed (mutant `eucl_fp16_inputs_shared`).
+#
+# GPU (cuBLAS fp32, TF32 off) reduces in a different order and must still pass
+# at this tolerance; if a run needs more, set NOVA_BF_PARITY_SCORE_RTOL to the
+# measured error and record it, rather than widening this default. (TF32 tests
+# pass their own explicit, TF32-sized tolerance.)
+SCORE_RTOL = float(os.environ.get("NOVA_BF_PARITY_SCORE_RTOL", "") or 1e-5)
+TOL = {"dot": SCORE_RTOL, "cosine": SCORE_RTOL, "euclidean": SCORE_RTOL}
 
 
 def scores_are_reproducible(device: str, vector_type: str,
@@ -71,15 +88,53 @@ def as_dict(hits) -> dict[int, float]:
     return {int(i): float(s) for i, s in hits}
 
 
-def assert_scores_agree(a, b, *, metric: str, label: str, tol: float | None = None):
+def assert_well_formed(hits, *, label: str, side: str = "result"):
+    """A top-K list on its own: ids unique, scores non-increasing.
+
+    Both are properties the boundary-aware comparison CANNOT see — it reads the
+    lists through `as_dict`, which collapses a duplicated id to one entry and
+    forgets the order — so a result with the same hit twice, or written
+    worst-first, passed it. Scores are compared exactly (no tolerance): every
+    engine sorts by its OWN scores, so its own list is never out of order."""
+    ids = [int(i) for i, _ in hits]
+    dup = sorted({i for i in ids if ids.count(i) > 1})
+    assert not dup, f"{label}: {side} returns id(s) {dup} more than once"
+    scores = [float(s) for _, s in hits]
+    for r in range(len(scores) - 1):
+        assert scores[r] >= scores[r + 1], (
+            f"{label}: {side} is not best-first at rank {r}: "
+            f"{scores[r]!r} then {scores[r + 1]!r} (ids {ids[r]}, {ids[r + 1]})")
+
+
+def assert_scores_agree(a, b, *, metric: str, label: str, tol: float | None = None,
+                        allow_empty: bool = False, check_len: bool = True):
     """The full boundary-aware comparison — see this module's docstring.
 
-    `a` and `b` are `[(id, score), …]` lists (or anything `as_dict` accepts)
-    from the two engines being compared; neither is privileged.
+    `a` and `b` are `[(id, score), …]` lists from the two engines being
+    compared; neither is privileged. On top of the boundary rule this asserts:
+
+      * each side is well-formed (`assert_well_formed`: unique ids, best-first);
+      * both sides return the SAME NUMBER of hits (`check_len`). An exact
+        top-K is `min(k, eligible)` long whatever the float noise, so a length
+        difference is always an eligibility disagreement — and the boundary
+        rule alone accepted a short list whose missing tail sat at the cutoff;
+      * both returning nothing is a failure unless `allow_empty` — the default
+        keeps the vacuity guard (a filter that matched nothing on both sides
+        tests nothing), while dead-query tests opt in, since there an empty
+        list on both sides IS the answer.
     """
     tol = TOL[metric] if tol is None else tol
+    a, b = list(a), list(b)
+    assert_well_formed(a, label=label, side="left")
+    assert_well_formed(b, label=label, side="right")
+    if check_len:
+        assert len(a) == len(b), (
+            f"{label}: left returned {len(a)} hits, right {len(b)} — an exact "
+            f"top-K has one length, so the two disagree on what was eligible")
     da, db = as_dict(a), as_dict(b)
-    assert da or db, f"{label}: both sides returned nothing"
+    if not da and not db:
+        assert allow_empty, f"{label}: both sides returned nothing"
+        return
     assert da, f"{label}: left side returned nothing while right returned {len(db)}"
     assert db, f"{label}: right side returned nothing while left returned {len(da)}"
 
@@ -108,7 +163,11 @@ def assert_same_membership(a, b, *, label: str):
     artefact: the same run on two devices, or a filter's ELIGIBLE set checked
     against the naive predicate over the whole corpus.
     """
+    a, b = list(a), list(b)
     ia, ib = {int(i) for i, _ in a}, {int(i) for i, _ in b}
+    assert len(ia) == len(a) and len(ib) == len(b), (
+        f"{label}: a side repeats an id (left {len(a)} hits / {len(ia)} distinct, "
+        f"right {len(b)} / {len(ib)})")
     assert ia == ib, (
         f"{label}: id sets differ — only left: {sorted(ia - ib)}, "
         f"only right: {sorted(ib - ia)}")

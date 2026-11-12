@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+
 import pytest
 
 
@@ -10,6 +12,30 @@ def pytest_configure(config):
         "markers",
         "slice_only: a two-pass test of slice-mode-only machinery (padded "
         "GEMM heights, shape verification); skipped in the tiles-mode run")
+    _check_expected_src()
+
+
+def _check_expected_src():
+    """Mutation testing runs the suite against a mutated COPY of nova_bf. The
+    repo's `pythonpath = ["src"]` puts the real one first unless the caller
+    overrides it, and a mutant run that silently imported the real source
+    would report "mutant survived" for every mutation. So the caller names
+    the copy it means (`NOVA_BF_PARITY_EXPECT_SRC`), and a mismatch is a hard
+    error, not a skip.
+
+    Compared as PATHS, not string prefixes: `startswith("/x/src")` also
+    accepted `/x/src_orig/nova_bf/__init__.py` -- the pristine copy a mutation
+    driver keeps right next to the mutant."""
+    expect = os.environ.get("NOVA_BF_PARITY_EXPECT_SRC")
+    if not expect:
+        return
+    import nova_bf
+
+    got = os.path.realpath(nova_bf.__file__)
+    root = os.path.realpath(expect)
+    if os.path.commonpath([got, root]) != root:
+        raise pytest.UsageError(
+            f"NOVA_BF_PARITY_EXPECT_SRC={expect} but nova_bf was imported from {got}")
 
 _MERGE_ENV = (
     "NOVA_BF_MERGE_FORCE", "NOVA_BF_MERGE_WINDOW",

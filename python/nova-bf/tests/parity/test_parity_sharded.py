@@ -13,7 +13,11 @@ what decides which of two equal-scoring candidates from DIFFERENT ranks
 survives the reduce.
 
 Also covered here: the guards that stop a merge from silently producing a
-plausible wrong answer out of partials that never belonged together.
+plausible wrong answer out of partials that never belonged together (each
+asserted by its error type and the message naming what is wrong), and the
+stride-partitioning contract itself (rank r of W scores exactly the files
+i % W == r), which no merged comparison can see. Exact ties split across
+ranks are in `test_parity_layouts.py::test_exact_ties_survive_a_sharded_merge`.
 """
 
 from __future__ import annotations
@@ -156,34 +160,57 @@ def test_both_tiebreak_rules_survive_the_reduce(tiebreak, ds, oracle, device):
                 label=f"[{device}] tiebreak={tiebreak} {name} q{qi}")
 
 
-def test_merge_refuses_a_run_that_is_missing_a_rank(ds, device):
-    """A rank that dies before writing leaves its partial absent. The remaining
-    partials merge perfectly cleanly — they are individually valid, they just
-    cover less of the corpus than the run claimed — so the result is a wrong
-    top-K with nothing anomalous about it.
-
-    This is the failure mode a parity suite can never catch by comparison,
-    because a corpus subset's exact top-K is a perfectly self-consistent
-    answer. It has to be refused at the boundary instead, and that refusal is
-    what is asserted here.
-    """
-    cfg = build_config(ds, _specs(), out_tag=f"missing_{device or 'auto'}")
+def _computed(ds, device, tag, num_jobs=3, params=None):
+    cfg = build_config(ds, _specs(), out_tag=f"{tag}_{device or 'auto'}", params=params)
     with pinned_device(device):
-        for rank in range(3):
-            run_compute(cfg, num_jobs=3, job_rank=rank)
+        for rank in range(num_jobs):
+            run_compute(cfg, num_jobs=num_jobs, job_rank=rank)
+    return cfg
 
+
+def _pdir(cfg, name):
+    return Path(cfg.output.path) / partial_dir(
+        cfg, next(s for s in cfg.searches if s.name == name))
+
+
+def test_merge_refuses_a_search_that_lost_one_partial(ds, device):
+    """A rank that died partway through writing its per-search outputs leaves
+    ONE search a partial short. The remaining partials merge perfectly cleanly
+    — they are individually valid, they just cover less of the corpus than the
+    run claimed — so the result is a wrong top-K with nothing anomalous about
+    it. Not detectable by comparison (a corpus subset's exact top-K is a
+    self-consistent answer); it has to be refused, and by the guard that
+    names the short search and its count."""
+    cfg = _computed(ds, device, "missing_one")
     victim = SHARDED[0][0]
-    pdir = Path(cfg.output.path) / partial_dir(
-        cfg, next(s for s in cfg.searches if s.name == victim))
-    ranks = sorted(pdir.glob("rank*.parquet"))
-    assert len(ranks) == 3, [p.name for p in ranks]
-    ranks[1].unlink()   # rank 1 "died"
-
-    with pytest.raises(Exception) as exc:
+    ranks = sorted(_pdir(cfg, victim).glob("rank*.parquet"))
+    assert [p.name for p in ranks] == ["rank000.parquet", "rank001.parquet",
+                                       "rank002.parquet"]
+    ranks[1].unlink()   # rank 1 "died" after writing the other searches
+    with pytest.raises(RuntimeError, match="mismatched partial counts") as exc:
         run_merge(cfg)
-    assert "rank" in str(exc.value).lower(), (
-        f"merge failed, but not with a message identifying the missing rank: "
-        f"{exc.value}")
+    assert f"'{victim}': 2" in str(exc.value), str(exc.value)
+    for other, *_ in SHARDED[1:]:
+        assert f"'{other}': 3" in str(exc.value), str(exc.value)
+
+
+@pytest.mark.parametrize("exchange", [True, False], ids=["exchange", "no_exchange"])
+@pytest.mark.parametrize("victim", [1, 2])
+def test_merge_refuses_a_run_that_is_missing_a_rank(victim, exchange, ds, device):
+    """The same rank absent from EVERY search. Rank 2 is the hard case: with
+    the last rank gone the survivors still look like a complete 2-rank run,
+    so only the declared `num_jobs` the partials carry can tell. With the
+    threshold exchange on, the present ranks also pruned against bounds the
+    missing one published, so the refusal is a different (unwaivable) guard;
+    both must name the missing rank."""
+    cfg = _computed(ds, device, f"missing_all{victim}_{exchange}",
+                    params={"threshold_exchange": exchange})
+    for s in cfg.searches:
+        (Path(cfg.output.path) / partial_dir(cfg, s) / f"rank{victim:03d}.parquet").unlink()
+    want = (rf"rank\(s\) \[{victim}\] are missing" if exchange
+            else rf"the run declared 3 ranks .* missing \[{victim}\]")
+    with pytest.raises(RuntimeError, match=want):
+        run_merge(cfg)
 
 
 def test_merge_refuses_partials_from_two_different_runs(ds, device):
@@ -193,19 +220,88 @@ def test_merge_refuses_partials_from_two_different_runs(ds, device):
     leftovers leaves one stale partial, and stale slices reduce cleanly —
     double-counting the corpus they overlap, missing what nobody covered.
 
-    Again: not detectable by comparison, only by refusing it.
-    """
-    cfg3 = build_config(ds, _specs(), out_tag=f"mixed_{device or 'auto'}")
+    Again: not detectable by comparison, only by refusing it — and the refusal
+    must point at the stale partial (rank 2, the one the re-run did not
+    overwrite)."""
+    cfg3 = _computed(ds, device, "mixed")
     with pinned_device(device):
-        for rank in range(3):
-            run_compute(cfg3, num_jobs=3, job_rank=rank)
         # A second run over the same output, 2 ranks — leaves rank2 from the
         # first run behind.
         for rank in range(2):
             run_compute(cfg3, num_jobs=2, job_rank=rank)
 
-    with pytest.raises(Exception) as exc:
+    with pytest.raises(RuntimeError, match="come from MORE THAN ONE run") as exc:
         run_merge(cfg3)
-    msg = str(exc.value).lower()
-    assert "run" in msg or "rank" in msg or "fingerprint" in msg, (
-        f"merge failed, but not with a message identifying the mixed run: {exc.value}")
+    msg = str(exc.value)
+    assert "1 partial(s), e.g. " in msg and "rank002.parquet" in msg, msg
+    assert "2 partial(s)" in msg, msg
+
+
+# ------------------------------------------------------- stride partitioning
+#
+# AGENTS.md: rank r of W reads files i with i % W == r, over the SORTED file
+# list — stride, not chunking, so large and small files interleave across
+# workers with no coordination. Every comparison above is blind to the split
+# (any partition of the files merges to the same answer), so the contract is
+# asserted directly: with k above the corpus size and no filter, each rank's
+# partial lists every row it scored, and those rows must be exactly the rows
+# of its stride files.
+
+STRIDE_FILE_SIZES = (3, 0, 5, 2, 4, 1, 6, 2, 3, 4, 5)   # 11 files, one empty
+
+
+@pytest.fixture(scope="module")
+def stride_ds(tmp_path_factory):
+    import numpy as np
+    import pyarrow as pa
+
+    from . import layouts, naive
+
+    rng = np.random.default_rng(31)
+    tables, docs, g = [], [], 0
+    for n in STRIDE_FILE_SIZES:
+        v = rng.standard_normal((n, 8))
+        tables.append(pa.table({
+            "dense_embedding": layouts.dense_array(v.tolist()) if n
+            else pa.array([], type=pa.list_(pa.float32())),
+            "rid": pa.array([str(g + i) for i in range(n)], type=pa.string()),
+        }))
+        for i in range(n):
+            docs.append(naive.Doc(row=g + i, dense=layouts.as_stored(v[i], "float32")))
+        g += n
+    qv = rng.standard_normal((3, 8)).astype(np.float32)
+    return layouts.build(
+        tmp_path_factory.mktemp("stride"), "stride", tables, docs,
+        pa.table({"dense_embedding": layouts.dense_array(qv.tolist()),
+                  "qid": pa.array([str(i) for i in range(len(qv))])}),
+        [{"dense": [float(x) for x in q], "payload": {}} for q in qv])
+
+
+@pytest.mark.parametrize("num_jobs", [3, 5])
+def test_rank_r_reads_exactly_the_stride_files(num_jobs, stride_ds, device):
+    import pyarrow.parquet as pq
+
+    from . import layouts
+
+    ds = stride_ds
+    starts = [sum(ds.file_rows[:i]) for i in range(len(ds.files))]
+    k = ds.n_docs + 5
+    cfg = layouts.build_config(ds, [layouts.spec("s", metric="dot", k=k)],
+                               tag=f"stride_W{num_jobs}_{device}")
+    pdir = Path(cfg.output.path) / partial_dir(cfg, cfg.searches[0])
+    seen = set()
+    with pinned_device(device):
+        for rank in range(num_jobs):
+            run_compute(cfg, num_jobs=num_jobs, job_rank=rank)
+            mine = [i for i in range(len(ds.files)) if i % num_jobs == rank]
+            want = {starts[i] + r for i in mine for r in range(ds.file_rows[i])}
+            t = pq.read_table(pdir / f"rank{rank:03d}.parquet").to_pydict()
+            assert len(t["query_id"]) == len(ds.queries)
+            for qid, ids in zip(t["query_id"], t["hit_ids"]):
+                got = [int(i) for i in ids]
+                assert len(got) == len(set(got))
+                assert set(got) == want, (
+                    f"W={num_jobs} rank {rank} q{qid}: scored rows {sorted(got)}, "
+                    f"its stride files {mine} hold {sorted(want)}")
+            seen |= want
+    assert seen == set(range(ds.n_docs))

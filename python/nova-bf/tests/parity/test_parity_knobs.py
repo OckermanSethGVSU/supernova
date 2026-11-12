@@ -195,36 +195,58 @@ def test_a_small_merge_batch_gives_the_same_merged_answer(
             f"[{device}] merge_batch_size={batch_rows} changed {name} at q{qi}")
 
 
-def test_ranged_reads_are_out_of_reach_at_this_scale():
-    """`merge_ranged_reads` cannot be exercised by this harness, and saying so
-    is worth more than a test that pretends otherwise.
+def _ranged_merge(ds, device, *, tag, ranged):
+    """`_sharded` with `merge_ranged_reads=ranged`, and the ranged path made
+    REACHABLE: `io._ranged_download` is gated on a file of at least
+    `_RANGED_GET_MIN_BYTES` (256 MiB), which no parity partial comes near, so
+    the gate is lowered to 1 byte and the range size to 4 KiB (so a partial is
+    fetched as several ranges, not one). Returns the merged results and how
+    many partial files were read through the ranged path."""
+    from nova_bf import io as io_mod
 
-    `io._ranged_download` is gated on a partial being at least
-    `_RANGED_GET_MIN_BYTES` (256 MiB). Parity partials are kilobytes, so
-    setting the flag changes nothing here: an earlier version of this file ran
-    both arms and compared them, which compared byte-identical code to itself
-    and claimed to cover "the read path production actually uses". It did not,
-    and `tests/test_io.py::test_ranged_path_is_actually_taken_on_a_local_file`
-    already covers that path properly.
+    calls = {"n": 0}
+    real = io_mod.Store._ranged_download
 
-    This asserts the reason, so the gap is documented where someone would
-    otherwise re-add the tautology. If the threshold is ever lowered, this
-    fails and a real parity case becomes possible.
-    """
-    from nova_bf.io import _RANGED_GET_MIN_BYTES
+    def counting(self, read_path, size):
+        calls["n"] += 1
+        return real(self, read_path, size)
 
-    assert _RANGED_GET_MIN_BYTES >= 1 << 28, (
-        "the ranged-read threshold dropped below 256 MiB; a parity case for "
-        "merge_ranged_reads is now reachable and should replace this test")
+    mp = pytest.MonkeyPatch()
+    try:
+        mp.setattr(io_mod, "_RANGED_GET_MIN_BYTES", 1)
+        mp.setattr(io_mod, "_RANGED_GET_BYTES", 4096)
+        mp.setattr(io_mod.Store, "_ranged_download", counting)
+        got = _sharded(ds, device, tag=tag,
+                       params={"merge_batch_size": 2, "merge_ranged_reads": ranged})
+    finally:
+        mp.undo()
+    return got, calls["n"]
+
+
+@pytest.fixture(scope="module")
+def merge_knobs_run(ds, device):
+    return _ranged_merge(ds, device, tag="mk_both", ranged=True)
+
+
+def test_the_ranged_merge_read_path_is_reached_only_by_its_knob(ds, device,
+                                                                merge_knobs_run):
+    """The knob, not the lowered gate, is what routes the merge through the
+    ranged reader: on, every search's partials (3 searches x 3 ranks) go
+    through it; off, with the same lowered gate, none do."""
+    _, n_on = merge_knobs_run
+    assert n_on >= len(MERGE_SPECS) * 3, n_on
+    _, n_off = _ranged_merge(ds, device, tag="mk_unranged", ranged=False)
+    assert n_off == 0, n_off
 
 
 @pytest.mark.parametrize("name", MERGE_IDS)
-def test_the_merge_knobs_still_agree_with_the_oracle(name, ds, oracle, device):
-    """Both knobs at once, against the oracle rather than against another
-    nova-bf run — two merges agreeing with each other and both being wrong is
-    the failure a self-comparison cannot see."""
-    got = _sharded(ds, device, tag="mk_both",
-                   params={"merge_batch_size": 2, "merge_ranged_reads": True})
+def test_the_merge_knobs_still_agree_with_the_oracle(name, ds, oracle, device,
+                                                     merge_knobs_run, merge_default):
+    """Both knobs at once (a 2-row merge batch, ranged partial reads), against
+    the oracle rather than against another nova-bf run — two merges agreeing
+    with each other and both being wrong is the failure a self-comparison
+    cannot see — and then against the default merge, which must not move."""
+    got, _ = merge_knobs_run
     idx = MERGE_IDS.index(name)
     _, vt, metric, filt = MERGE_SPECS[idx]
     want = oracle.topk(vector_type=vt, metric=metric, k=cases_mod.K,
@@ -234,3 +256,5 @@ def test_the_merge_knobs_still_agree_with_the_oracle(name, ds, oracle, device):
         compare.assert_scores_agree(
             got[name][qi], want[qi], metric=metric,
             label=f"[{device}] merge knobs {name} q{qi}")
+        assert [r for r, _ in got[name][qi]] == [r for r, _ in merge_default[name][qi]], (
+            f"[{device}] ranged merge changed {name} at q{qi}")

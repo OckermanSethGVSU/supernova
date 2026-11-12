@@ -63,6 +63,8 @@ _QDRANT: dict = {"probed": False, "reachable": None, "graded": False,
 
 def pytest_configure(config):
     config.addinivalue_line("markers", "qdrant: needs a reachable Qdrant server")
+    # The NOVA_BF_PARITY_EXPECT_SRC import guard (mutation runs) lives in the
+    # parent `tests/conftest.py`, so it covers the non-parity tests too.
 
 
 @pytest.fixture(scope="session")

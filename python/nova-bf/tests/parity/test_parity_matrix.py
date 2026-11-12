@@ -22,6 +22,8 @@ agree beautifully on the wrong answer.
 
 from __future__ import annotations
 
+import copy
+
 import pytest
 
 from . import cases as cases_mod
@@ -89,6 +91,21 @@ def test_eligible_rows_are_exactly_the_filter_predicate(case, ds, matrix_run, de
             f"{len(eligible)} rows are eligible and k={case.k}")
 
 
+@pytest.mark.qdrant
+@pytest.mark.parametrize("fname", [f for f, d in cases_mod.FILTERS.items() if d is not None])
+def test_eligible_counts_agree_with_qdrant(fname, ds, client, collection):
+    """The eligibility guard above trusts the naive predicate; this pins that
+    predicate to the ENGINE, per query, by Qdrant's own count of the points
+    the filter admits — no scoring involved, so a filter-semantics
+    disagreement cannot hide behind a ranking that happens to agree."""
+    fdict = _filter_from_dict(ds, cases_mod.FILTERS[fname])
+    for qi, q in enumerate(ds.queries):
+        want = sum(naive.filter_matches(fdict, d.payload, q["payload"], ds.date_fields,
+                                        ds.query_date_fields) for d in ds.docs)
+        got = qdrant_ref.count(client, collection, fdict, q["payload"], ds.date_fields)
+        assert got == want, f"{fname} q{qi}: Qdrant counts {got} eligible, naive {want}"
+
+
 def test_the_filters_actually_discriminate(ds):
     """A guard on the FIXTURE, not on nova-bf: every filter in the table must
     leave a non-trivial subset — enough rows to fill a top-K, but not the whole
@@ -138,18 +155,21 @@ def test_oracle_matches_the_direct_path(ds, oracle):
 
 
 def _filter_model(case, ds):
-    """The case's filter as the validated `Filter` model nova-bf itself will
-    hold — including the date-bound normalization, so the oracles compare
-    against the same instants nova-bf does rather than against the raw YAML
-    strings."""
+    """The case's filter in the form the ORACLES consume: the raw dict, after
+    nova-bf has confirmed it is a legal config (so a typo cannot pass as a
+    filter nova-bf would have rejected)."""
     return _filter_from_dict(ds, case.filter_dict)
 
 
 def _filter_from_dict(ds, fdict):
+    """Validate `fdict` through nova-bf's own config path, then hand back the
+    RAW dict — never nova-bf's parsed `Filter`. Both oracles parse the raw
+    form themselves (`naive.parse_filter`, `qdrant_ref.to_qdrant_filter`), so
+    a date-bound conversion or a match coercion nova-bf gets wrong is visible
+    to them instead of being shared with them."""
     if fdict is None:
         return None
     from .runner import build_config, spec
 
-    cfg = build_config(
-        ds, [spec("probe", filter=fdict)], out_tag="unused")
-    return cfg.searches[0].filter
+    build_config(ds, [spec("probe", filter=fdict)], out_tag="unused")
+    return copy.deepcopy(fdict)

@@ -31,7 +31,6 @@ missed a neighbour".
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, timezone
 
 from qdrant_client import QdrantClient, models
 
@@ -52,7 +51,16 @@ _INDEXES = {
     "views": models.PayloadSchemaType.INTEGER,
     "rating": models.PayloadSchemaType.FLOAT,
     "published_at": models.PayloadSchemaType.DATETIME,
+    # the edge columns (see corpus.EDGE_SEED)
+    "event_at": models.PayloadSchemaType.DATETIME,
+    "score_i": models.PayloadSchemaType.INTEGER,
+    "flag": models.PayloadSchemaType.BOOL,
+    "weight": models.PayloadSchemaType.FLOAT,
+    "lang_dict": models.PayloadSchemaType.KEYWORD,
 }
+# Full-text fields, all with the tokenizer settings `nova_bf.tokenize`
+# documents itself as matching.
+_TEXT_FIELDS = ("title", "note")
 
 
 def create_collection(client: QdrantClient, ds) -> str:
@@ -80,15 +88,16 @@ def create_collection(client: QdrantClient, ds) -> str:
             "sparse_cos": models.SparseVectorParams(),
         },
     )
-    client.create_payload_index(
-        name, field_name="title",
-        field_schema=models.TextIndexParams(
-            type=models.TextIndexType.TEXT,
-            tokenizer=models.TokenizerType.WORD,
-            lowercase=True,
-        ),
-        wait=True,
-    )
+    for text_field in _TEXT_FIELDS:
+        client.create_payload_index(
+            name, field_name=text_field,
+            field_schema=models.TextIndexParams(
+                type=models.TextIndexType.TEXT,
+                tokenizer=models.TokenizerType.WORD,
+                lowercase=True,
+            ),
+            wait=True,
+        )
     for field, schema in _INDEXES.items():
         client.create_payload_index(name, field_name=field, field_schema=schema,
                                     wait=True)
@@ -128,8 +137,18 @@ def _sparse_vector(vec: dict[int, float]) -> models.SparseVector:
 
 
 # ----------------------------------------------------------- filter transla-
-# tion: a nova-bf `Filter` -> Qdrant's own filter language, resolved for ONE
-# query (per-query conditions become that query's literal).
+# tion: a RAW filter dict (exactly as a YAML config writes it) -> Qdrant's own
+# filter language, resolved for ONE query (per-query conditions become that
+# query's literal). Never nova-bf's parsed `Filter` model: its date bounds are
+# already nova-bf-converted epoch µs and its range bounds already floats, and
+# grading nova-bf's conversion with nova-bf's conversion is no grade at all. A
+# date bound reaches Qdrant as the very RFC-3339 string the config holds.
+
+# A condition that matches NO point, for a per-query condition whose value is
+# null for this query (nova-bf: matches nothing). `has_id: []` is the
+# measured way to say it: under `must` it matches nothing, under `must_not`
+# it excludes nothing, under `should` it contributes nothing.
+_NOTHING = models.HasIdCondition(has_id=[])
 
 
 def to_qdrant_filter(filt, query_row: dict, date_fields: dict[str, str]):
@@ -137,75 +156,85 @@ def to_qdrant_filter(filt, query_row: dict, date_fields: dict[str, str]):
     `query_row` here — Qdrant has no notion of a filter that varies per query,
     so the translation is per query by construction, and that is precisely the
     check: nova-bf's single fused pass over `(n_queries, rows)` must agree,
-    query by query, with N independently-filtered Qdrant searches."""
+    query by query, with N independently-filtered Qdrant searches.
+
+    `filt` is the raw dict (preferred) or an object exposing it as `.raw`."""
     if filt is None:
         return None
+    raw = getattr(filt, "raw", filt)
+    if not isinstance(raw, dict):
+        raise TypeError(
+            "qdrant_ref translates RAW filter dicts only, not nova-bf's parsed "
+            f"Filter model (got {type(raw).__name__})")
     kwargs = {}
     for group in ("must", "should", "must_not"):
-        conds = [_condition(c, query_row, date_fields) for c in getattr(filt, group)]
+        conds = [_condition(c, query_row, date_fields) for c in raw.get(group) or ()]
         if conds:
             kwargs[group] = conds
     return models.Filter(**kwargs) if kwargs else None
 
 
-def _condition(cond, query_row: dict, date_fields: dict[str, str]):
-    is_date = cond.field in date_fields
-
-    if cond.match is not None:
-        return _match(cond.field, cond.match)
-    if cond.match_from_query is not None:
-        return _match(cond.field, query_row[cond.match_from_query])
-    if cond.match_text is not None:
+def _condition(cond: dict, query_row: dict, date_fields: dict[str, str]):
+    field = cond["field"]
+    is_date = field in date_fields
+    if cond.get("match") is not None:
+        return _match(field, cond["match"])
+    if cond.get("match_from_query") is not None:
+        return _match(field, query_row[cond["match_from_query"]])
+    if cond.get("match_text") is not None:
         return models.FieldCondition(
-            key=cond.field, match=models.MatchText(text=cond.match_text))
-    if cond.match_text_from_query is not None:
-        return models.FieldCondition(
-            key=cond.field,
-            match=models.MatchText(text=query_row[cond.match_text_from_query]))
-    if cond.range is not None:
-        bounds = {b: getattr(cond.range, b) for b in ("gt", "gte", "lt", "lte")}
-        return _range(cond.field, bounds, is_date)
-    if cond.range_from_query is not None:
+            key=field, match=models.MatchText(text=cond["match_text"]))
+    if cond.get("match_text_from_query") is not None:
+        phrase = query_row[cond["match_text_from_query"]]
+        if not isinstance(phrase, str):
+            return _NOTHING
+        return models.FieldCondition(key=field, match=models.MatchText(text=phrase))
+    if cond.get("range") is not None:
+        return _range(field, dict(cond["range"]), is_date)
+    if cond.get("range_from_query") is not None:
         bounds = {}
-        for b in ("gt", "gte", "lt", "lte"):
-            col = getattr(cond.range_from_query, b)
-            bounds[b] = None if col is None else query_row[col]
-        # A per-query bound drawn from a declared queries date column arrives
-        # as an RFC-3339 string; the static path's bounds have already been
-        # converted to epoch µs by the config prepass. `_range` normalizes
-        # both, so the two paths compare against the same instant.
-        return _range(cond.field, bounds, is_date)
-    raise ValueError(f"cannot translate condition on {cond.field!r}")
+        for b, col in cond["range_from_query"].items():
+            if col is None:
+                continue
+            v = query_row[col]
+            if v is None:
+                return _NOTHING      # a null per-query bound never matches
+            bounds[b] = v
+        return _range(field, bounds, is_date)
+    raise ValueError(f"cannot translate condition {cond!r}")
 
 
 def _match(field: str, value):
+    if value is None:
+        return _NOTHING
     if isinstance(value, (list, tuple)):
+        # A null ELEMENT is simply absent (it can equal nothing); an empty list
+        # is sent as-is — Qdrant's MatchAny([]) matches nothing (measured).
         return models.FieldCondition(
-            key=field, match=models.MatchAny(any=list(value)))
+            key=field, match=models.MatchAny(any=[v for v in value if v is not None]))
     return models.FieldCondition(key=field, match=models.MatchValue(value=value))
 
 
 def _range(field: str, bounds: dict, is_date: bool):
+    bounds = {b: v for b, v in bounds.items() if v is not None}
     if is_date:
-        return models.FieldCondition(
-            key=field,
-            range=models.DatetimeRange(
-                **{b: _as_datetime(v) for b, v in bounds.items() if v is not None}),
-        )
-    return models.FieldCondition(
-        key=field,
-        range=models.Range(**{b: v for b, v in bounds.items() if v is not None}),
-    )
+        # The raw literal: an RFC-3339 string from the config or the queries
+        # column, handed to Qdrant's own parser. A numeric bound on a date
+        # field would be nova-bf's µs convention — not something Qdrant can
+        # be told — so it is refused rather than silently converted here.
+        for b, v in bounds.items():
+            if not isinstance(v, str):
+                raise TypeError(f"date bound {b}={v!r} on {field!r} is not a string")
+        return models.FieldCondition(key=field, range=models.DatetimeRange(**bounds))
+    return models.FieldCondition(key=field, range=models.Range(**bounds))
 
 
-def _as_datetime(value) -> datetime:
-    """A date bound as a real datetime, from either form it can arrive in:
-    epoch microseconds (a static bound, already converted by the config
-    prepass) or an RFC-3339 string (a per-query bound read straight from the
-    queries column)."""
-    if isinstance(value, str):
-        return datetime.fromisoformat(value.replace("Z", "+00:00"))
-    return datetime.fromtimestamp(float(value) / 1_000_000, tz=timezone.utc)
+def count(client, collection, filt, query_row: dict, date_fields: dict[str, str]) -> int:
+    """How many points Qdrant itself says satisfy `filt` for this query — an
+    eligibility count independent of both scoring and of the naive oracle."""
+    return client.count(
+        collection, count_filter=to_qdrant_filter(filt, query_row, date_fields),
+        exact=True).count
 
 
 # ------------------------------------------------------------------ querying

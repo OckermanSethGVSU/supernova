@@ -156,6 +156,29 @@ def _normalize(vec: list[float]) -> list[float]:
 
 
 # ------------------------------------------------------------------ filters
+#
+# The oracle reads the RAW filter dict — exactly what a YAML config carries
+# (dates as RFC-3339 strings, numbers as written, `match: true` as a bool) —
+# and never nova-bf's validated `Filter` model. Feeding it the model would let
+# every coercion nova-bf's config layer performs (date bounds to epoch µs,
+# range bounds to float, `match` values through pydantic's union) happen
+# invisibly on BOTH sides of the comparison, which is how a ±1 µs date-bound
+# bug once sat undetected under a fully green suite.
+#
+# Semantics below are Qdrant's, MEASURED against a live 1.18.2 server (see
+# the README's "measured Qdrant semantics" table), not guessed:
+#
+#   * a null payload value never satisfies a condition (so `must_not` keeps it);
+#   * `match` is TYPE-STRICT: `true` never equals `1`, `"1"` never equals `1`;
+#   * `match: []` (MatchAny over nothing) matches nothing;
+#   * a `match_text` phrase with no tokens (``""``, ``"!!!"``) matches nothing
+#     (so as a `must_not` it excludes nothing, and as a `should` member it
+#     adds nothing);
+#   * a per-query value that is null makes that condition match nothing for
+#     that query (a null element inside a MatchAny list is just absent);
+#   * an empty `should` is no constraint; `{}` keeps every row;
+#   * datetimes compare as integer epoch microseconds; digits past the sixth
+#     fractional place are TRUNCATED.
 
 
 _TOKEN_SPLIT = re.compile(r"[^0-9A-Za-z]+")
@@ -165,16 +188,53 @@ def tokens(text) -> list[str]:
     """Qdrant `word`-tokenizer semantics: split the ORIGINAL text on maximal
     runs of non-alphanumerics, then lowercase each token.
 
-    Written against ASCII on purpose. nova-bf splits with RE2's `\\p{L}\\p{N}`
-    and lowercases with Arrow, which differ from Python on a known handful of
-    non-ASCII codepoints (see `nova_bf.tokenize`'s docstring); the harness
-    generates ASCII-only text so this reference is exact rather than
-    approximately exact, and that divergence stays where it is documented
-    instead of being silently absorbed into a passing test.
+    Written against ASCII on purpose. nova-bf splits on a measured Qdrant
+    word-character table and lowercases per token like Rust `to_lowercase`
+    (`İ` expansion, Final_Sigma); its non-ASCII behaviour is checked against
+    the live engine directly by `test_parity_tokenizer.py`. The shared corpus
+    is ASCII-only so this reference is exact rather than approximately exact.
     """
     if not isinstance(text, str):
         return []
     return [t.lower() for t in _TOKEN_SPLIT.split(text) if t]
+
+
+# ---- datetimes, in integer arithmetic only (no float seconds anywhere)
+
+_RFC3339 = re.compile(
+    r"^(\d{4})-(\d{2})-(\d{2})"
+    r"(?:[T ](\d{2}):(\d{2})(?::(\d{2})(?:\.(\d+))?)?)?"
+    r"(Z|z|[+-]\d{2}:?\d{2})?$")
+
+
+def _days_from_civil(y: int, m: int, d: int) -> int:
+    """Days since 1970-01-01 of a proleptic-Gregorian date (H. Hinnant's
+    algorithm) — integer-only, so it cannot share a float rounding with
+    `datetime.timestamp()` or with Arrow's parser."""
+    y -= m <= 2
+    era = (y if y >= 0 else y - 399) // 400
+    yoe = y - era * 400
+    doy = (153 * (m + (-3 if m > 2 else 9)) + 2) // 5 + d - 1
+    doe = yoe * 365 + yoe // 4 - yoe // 100 + doy
+    return era * 146097 + doe - 719468
+
+
+def rfc3339_to_epoch_us(text: str) -> int:
+    """An RFC-3339 / ISO-8601 literal as integer epoch µs, parsed by hand.
+    A missing offset means UTC; fractional digits past µs are truncated
+    (Qdrant's measured behaviour)."""
+    m = _RFC3339.match(text.strip())
+    if m is None:
+        raise ValueError(f"not an RFC-3339 datetime: {text!r}")
+    y, mo, d, hh, mm, ss, frac, tz = m.groups()
+    days = _days_from_civil(int(y), int(mo), int(d))
+    secs = days * 86400 + int(hh or 0) * 3600 + int(mm or 0) * 60 + int(ss or 0)
+    us = int(((frac or "") + "000000")[:6])
+    if tz and tz not in ("Z", "z"):
+        sign = -1 if tz[0] == "-" else 1
+        digits = tz[1:].replace(":", "")
+        secs -= sign * (int(digits[:2]) * 3600 + int(digits[2:]) * 60)
+    return secs * 1_000_000 + us
 
 
 def to_epoch_us(value, fmt: str = "rfc3339") -> int | None:
@@ -190,109 +250,172 @@ def to_epoch_us(value, fmt: str = "rfc3339") -> int | None:
     if fmt == "epoch_us":
         return int(value)
     if fmt == "rfc3339":
-        text = value.replace("Z", "+00:00") if isinstance(value, str) else value
-        dt = datetime.fromisoformat(text)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return int(dt.timestamp() * 1_000_000)
+        return rfc3339_to_epoch_us(value)
     dt = datetime.strptime(value, fmt).replace(tzinfo=timezone.utc)
-    return int(dt.timestamp() * 1_000_000)
+    return rfc3339_to_epoch_us(dt.strftime("%Y-%m-%dT%H:%M:%S.%f"))
 
 
-def _as_number(value, field_name: str, date_fields: dict[str, str]):
-    """Range comparisons are numeric. A field declared as a date is parsed to
-    epoch µs first; anything else is used as-is."""
-    if field_name in date_fields:
-        return to_epoch_us(value, date_fields[field_name])
-    return value
+# ---- the oracle's own filter representation, parsed from the raw dict
+
+_BOUND_OPS = ("gt", "gte", "lt", "lte")
+
+
+@dataclass(frozen=True)
+class Cond:
+    """One condition, exactly as written: `kind` is the key that was set
+    (`match`, `match_text`, `range`, or a `*_from_query` variant), `arg` its
+    raw value (a list made a tuple, a range a tuple of `(op, bound)` pairs)."""
+
+    field: str
+    kind: str
+    arg: object
+
+
+@dataclass(frozen=True)
+class NFilter:
+    must: tuple = ()
+    should: tuple = ()
+    must_not: tuple = ()
+
+
+_KINDS = ("match", "match_text", "range", "match_from_query",
+          "match_text_from_query", "range_from_query")
+
+
+def _freeze(v):
+    if isinstance(v, list):
+        return tuple(_freeze(x) for x in v)
+    if isinstance(v, dict):
+        return tuple((op, v[op]) for op in _BOUND_OPS if v.get(op) is not None)
+    return v
+
+
+def parse_filter(fdict) -> NFilter | None:
+    """The oracle's OWN parse of a raw filter dict. `None` stays `None`."""
+    if fdict is None:
+        return None
+    if isinstance(fdict, NFilter):
+        return fdict
+    if not isinstance(fdict, dict):
+        return _from_model(fdict)
+    groups = {}
+    for g in ("must", "should", "must_not"):
+        conds = []
+        for c in fdict.get(g) or ():
+            set_kinds = [k for k in _KINDS if c.get(k) is not None]
+            if len(set_kinds) != 1:
+                raise ValueError(f"condition {c!r} must set exactly one predicate")
+            kind = set_kinds[0]
+            conds.append(Cond(c["field"], kind, _freeze(c[kind])))
+        groups[g] = tuple(conds)
+    return NFilter(**groups)
+
+
+def _from_model(model) -> NFilter:
+    """Back-compat for a caller still holding a nova-bf `Filter` model.
+    Discouraged — the model's bounds are already nova-bf-converted, which is
+    exactly what the raw-dict path exists to avoid — and marked as such so a
+    date bound arriving as a number is taken as µs, not re-parsed."""
+    groups = {}
+    for g in ("must", "should", "must_not"):
+        conds = []
+        for c in getattr(model, g):
+            for kind in _KINDS:
+                v = getattr(c, kind)
+                if v is None:
+                    continue
+                if kind in ("range", "range_from_query"):
+                    v = tuple((op, getattr(v, op)) for op in _BOUND_OPS
+                              if getattr(v, op) is not None)
+                conds.append(Cond(c.field, kind, _freeze(v)))
+        groups[g] = tuple(conds)
+    return NFilter(**groups)
+
+
+def _same(a, b) -> bool:
+    """Qdrant's type-strict equality: a bool only equals a bool, a string
+    only a string, and numbers compare by value (`3 == 3.0`, the one place
+    nova-bf's static check deliberately lets an int column take a float)."""
+    if a is None or b is None:
+        return False
+    if isinstance(a, bool) or isinstance(b, bool):
+        return type(a) is bool and type(b) is bool and a == b
+    if isinstance(a, str) or isinstance(b, str):
+        return isinstance(a, str) and isinstance(b, str) and a == b
+    return a == b
+
+
+def _matches_any(value, wanted) -> bool:
+    if isinstance(wanted, (list, tuple)):
+        return any(_same(value, w) for w in wanted)
+    return _same(value, wanted)
+
+
+def _text_holds(value, phrase) -> bool:
+    if value is None or not isinstance(phrase, str):
+        return False
+    want = tokens(phrase)
+    if not want:
+        return False          # measured: a token-less phrase matches nothing
+    have = set(tokens(value))
+    return all(t in have for t in want)
+
+
+def _bound_us(bound, fmt: str):
+    """A static date bound: a string is parsed; a number is already µs for
+    rfc3339/strptime/epoch_us fields and in the field's own unit for
+    epoch_s/epoch_ms (nova-bf's documented rule for numeric date bounds)."""
+    if isinstance(bound, str):
+        return to_epoch_us(bound, fmt)
+    if fmt in ("epoch_s", "epoch_ms"):
+        return to_epoch_us(bound, fmt)
+    return bound
 
 
 def condition_matches(cond, payload: dict, query_row: dict,
                       date_fields: dict[str, str],
                       query_date_fields: dict[str, str] | None = None) -> bool:
-    """Does ONE `FilterCondition` hold for one point?
+    """Does ONE condition hold for one point (for one query)?
 
     `date_fields` declares which CORPUS columns are datetimes, `query_date_fields`
-    which QUERIES columns are — the two are separate declarations in the config
-    and both get normalized to epoch microseconds at load. A per-query bound
-    drawn from a declared query date column therefore has to be parsed here
-    too; comparing a µs corpus value against a raw RFC-3339 string is not a
-    near-miss, it is a type error, and nova-bf never does it.
-
-    A null payload value never matches anything — the field being absent is
-    not a wildcard. That is Qdrant's rule and nova-bf's (`pc.fill_null(mask,
-    False)`), and it is the rule an over-eager reference would get wrong by
-    letting `None` compare its way through a range.
+    which QUERIES columns are. A null payload value never matches anything.
     """
     query_date_fields = query_date_fields or {}
     value = payload.get(cond.field)
-
-    # --- per-query variants: same predicate, comparison value read from the
-    # query's own row instead of a literal in the config.
-    if cond.match_from_query is not None:
-        wanted = query_row[cond.match_from_query]
-        if value is None or wanted is None:
-            return False
-        if isinstance(wanted, (list, tuple)):
-            return any(value == w for w in wanted)
-        return value == wanted
-    if cond.match_text_from_query is not None:
-        phrase = query_row[cond.match_text_from_query]
-        if value is None or not isinstance(phrase, str):
-            return False
-        want = tokens(phrase)
-        have = set(tokens(value))
-        # An empty phrase constrains nothing on the rows it is applied to,
-        # matching an AND-fold over zero tokens.
-        return all(t in have for t in want)
-    if cond.range_from_query is not None:
+    kind, arg = cond.kind, cond.arg
+    if kind == "match_from_query":
+        return value is not None and _matches_any(value, query_row[arg])
+    if kind == "match":
+        return value is not None and _matches_any(value, arg)
+    if kind == "match_text_from_query":
+        return _text_holds(value, query_row[arg])
+    if kind == "match_text":
+        return _text_holds(value, arg)
+    if kind in ("range", "range_from_query"):
         if value is None:
             return False
-        num = _as_number(value, cond.field, date_fields)
-        r = cond.range_from_query
-        for attr, op in (("gt", ">"), ("gte", ">="), ("lt", "<"), ("lte", "<=")):
-            col = getattr(r, attr)
-            if col is None:
-                continue
-            bound = query_row[col]
-            if col in query_date_fields:
-                bound = to_epoch_us(bound, query_date_fields[col])
-            if bound is None or not _cmp(num, op, bound):
+        fmt = date_fields.get(cond.field)
+        num = value if fmt is None else to_epoch_us(value, fmt)
+        for op, b in arg:
+            if kind == "range_from_query":
+                col = b
+                b = query_row[col]
+                if b is not None and col in query_date_fields:
+                    b = to_epoch_us(b, query_date_fields[col])
+            elif fmt is not None:
+                b = _bound_us(b, fmt)
+            if b is None or not _cmp(num, op, b):
                 return False
         return True
-
-    # --- static variants
-    if cond.match is not None:
-        if value is None:
-            return False
-        wanted = cond.match if isinstance(cond.match, tuple) else (cond.match,)
-        return any(value == w for w in wanted)
-    if cond.match_text is not None:
-        if value is None:
-            return False
-        have = set(tokens(value))
-        return all(t in have for t in tokens(cond.match_text))
-    if cond.range is not None:
-        if value is None:
-            return False
-        num = _as_number(value, cond.field, date_fields)
-        r = cond.range
-        for attr, op in (("gt", ">"), ("gte", ">="), ("lt", "<"), ("lte", "<=")):
-            bound = getattr(r, attr)
-            if bound is None:
-                continue
-            if not _cmp(num, op, bound):
-                return False
-        return True
-    raise ValueError(f"condition on {cond.field!r} sets none of the six predicates")
+    raise ValueError(f"unknown condition kind {kind!r}")
 
 
 def _cmp(value, op: str, bound) -> bool:
-    if op == ">":
+    if op == "gt":
         return value > bound
-    if op == ">=":
+    if op == "gte":
         return value >= bound
-    if op == "<":
+    if op == "lt":
         return value < bound
     return value <= bound
 
@@ -302,7 +425,10 @@ def filter_matches(filt, payload: dict, query_row: dict, date_fields: dict[str, 
     """`must` = AND, `should` = at-least-one, `must_not` = AND-NOT — Qdrant's
     own composition. An EMPTY `should` is no constraint at all (not an OR over
     nothing, which would reject everything); an empty filter keeps every row.
+
+    `filt` is a raw filter dict (preferred), an `NFilter`, or None.
     """
+    filt = parse_filter(filt)
     if filt is None:
         return True
     for cond in filt.must:
@@ -367,6 +493,7 @@ def topk(
     agreement is not what the parity tests lean on."""
     query_row = query_row or {}
     date_fields = date_fields or {}
+    filt = parse_filter(filt)
     scored = []
     for doc in docs:
         if not filter_matches(filt, doc.payload, query_row, date_fields,
@@ -419,9 +546,9 @@ class Oracle:
         return self._scores[key]
 
     def _mask(self, filt):
-        # A `Filter` is frozen and hashable by design (see config.py), so it is
-        # its own cache key — two spellings of the same filter share a mask.
-        key = filt
+        # The oracle's own parsed form is frozen and hashable, so it is its
+        # own cache key (a raw dict is parsed first; it is not hashable).
+        key = filt = parse_filter(filt)
         if key not in self._masks:
             self._masks[key] = [
                 [filter_matches(filt, d.payload, q["payload"], self.date_fields,
