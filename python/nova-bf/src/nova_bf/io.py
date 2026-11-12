@@ -935,7 +935,8 @@ def multivector_to_ragged(col: pa.ChunkedArray) -> tuple[np.ndarray, np.ndarray]
     return doc_offsets, np.ascontiguousarray(phys, dtype=np.float32)
 
 
-def sparse_to_coo_parts(col: pa.ChunkedArray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+def sparse_to_coo_parts(col: pa.ChunkedArray, source: str = "",
+                        ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """A `struct<indices: list<uint32>, values: list<float32>>` column → CSR parts.
 
     Same flatten-the-Arrow-buffer-once approach as `dense_to_2d`: no per-row
@@ -960,6 +961,9 @@ def sparse_to_coo_parts(col: pa.ChunkedArray) -> tuple[np.ndarray, np.ndarray, n
     dtype-agnostic on purpose: `_build_query_vocab` (`np.unique`),
     `_vocab_lookup` (LUT gather or `searchsorted`), `_zero_gate_file_ok`
     (comparisons), `_sparse_file_norms` (accumulates in float64 explicitly).
+
+    `source` (a file name) only labels the error raised when a row's
+    `indices` and `values` lists differ in length.
     """
     col = col.combine_chunks()
     n = len(col)
@@ -970,4 +974,115 @@ def sparse_to_coo_parts(col: pa.ChunkedArray) -> tuple[np.ndarray, np.ndarray, n
     row_offsets = idx_list.offsets.to_numpy(zero_copy_only=False).astype(np.int64)
     indices = idx_list.values.to_numpy(zero_copy_only=False)
     values = val_list.values.to_numpy(zero_copy_only=False).astype(np.float32, copy=False)
+    # Row i's values are taken at `row_offsets`, i.e. the INDICES list's
+    # offsets, so the two lists must have the same per-row lengths. One
+    # vectorised comparison of the offset buffers (n + 1 ints, no copy of
+    # the nonzeros); a mismatch used to surface as an IndexError deep in
+    # scoring, or as silently misaligned weights.
+    val_offsets = val_list.offsets.to_numpy(zero_copy_only=False)
+    if not np.array_equal(row_offsets, val_offsets):
+        _check_sparse_lengths(row_offsets, val_offsets.astype(np.int64), source)
+        # Same per-row lengths, different physical base: re-base both onto 0.
+        b_i, b_v = int(row_offsets[0]), int(val_offsets[0])
+        indices = indices[b_i:int(row_offsets[-1])]
+        values = values[b_v:int(val_offsets[-1])]
+        row_offsets = row_offsets - b_i
     return row_offsets, indices, values
+
+
+def _check_sparse_lengths(idx_offsets: np.ndarray, val_offsets: np.ndarray,
+                          source: str) -> None:
+    """Raise if any row's `indices` and `values` lists differ in length.
+
+    Checked on EVERY row, null struct rows included: the values are located
+    through the indices' offsets, so one mismatched row (even a null one
+    whose children carry entries) shifts every later row's weights."""
+    bad = np.diff(idx_offsets) != np.diff(val_offsets)
+    rows = np.flatnonzero(bad)
+    if not rows.size:
+        return
+    li, lv = np.diff(idx_offsets)[rows], np.diff(val_offsets)[rows]
+    shown = ", ".join(f"row {int(r)}: {int(a)} indices vs {int(b)} values"
+                      for r, a, b in zip(rows[:5], li[:5], lv[:5]))
+    more = f" (and {rows.size - 5} more rows)" if rows.size > 5 else ""
+    where = f"{source}: " if source else ""
+    raise ValueError(
+        f"{where}sparse vector column has {rows.size} row(s) whose `indices` and "
+        f"`values` lists differ in length — {shown}{more}. Each index needs "
+        "exactly one weight (row numbers count from 0 within this file); fix "
+        "the writer that produced this file.")
+
+
+# Elements per `check_finite` chunk: bounds its bool temporary at 4 MB, so the
+# check never allocates a full-file mask (peak RSS on memory-tight nodes).
+_FINITE_CHUNK_ELEMS = 4 << 20
+_FINITE_SHOW_ROWS = 5
+
+
+def _finite_step(arr: np.ndarray) -> int:
+    width = int(np.prod(arr.shape[1:])) if arr.ndim > 1 else 1
+    return max(1, _FINITE_CHUNK_ELEMS // max(1, width))
+
+
+def _nonfinite_units(arr: np.ndarray, start: int = 0) -> np.ndarray:
+    """Sorted indices (along axis 0) of `arr`'s units holding a NaN/inf, from
+    unit `start` on, scanned chunk by chunk."""
+    step = _finite_step(arr)
+    out = []
+    for u0 in range(start, arr.shape[0], step):
+        ok = np.isfinite(arr[u0:u0 + step])
+        if arr.ndim > 1:
+            ok = ok.reshape(ok.shape[0], -1).all(axis=1)
+        bad = np.flatnonzero(~ok)
+        if bad.size:
+            out.append(bad + u0)
+    return np.concatenate(out) if out else np.zeros(0, dtype=np.int64)
+
+
+def check_finite(arr: np.ndarray, source: str, column: str,
+                 row_offsets: np.ndarray | None = None) -> None:
+    """Raise if a decoded vector array holds a NaN or an inf.
+
+    `arr` is one file's decoded data: a `(rows, dim)` dense matrix, a flat
+    `(tokens, dim)` multivector token matrix or a flat `(nnz,)` sparse value
+    array. For the flat layouts `row_offsets` (length rows + 1, CSR style)
+    maps each unit back to its file row, so the error names rows, not tokens
+    or nonzeros. Integer arrays cannot hold either and are skipped.
+
+    One pass over memory already decoded, in chunks of `_FINITE_CHUNK_ELEMS`
+    elements (never a full-size temporary). Rows are located -- a second
+    pass, from the first bad chunk on -- only once something is found."""
+    if arr.size == 0 or not np.issubdtype(arr.dtype, np.floating):
+        return
+    if arr.dtype == np.float16 and arr.flags.c_contiguous:
+        # numpy's float16 isfinite is ~17x slower than this (measured on a
+        # FineWeb file: 23 ms vs 1.4 ms): a half is NaN/inf iff its five
+        # exponent bits are all set, so AND them out into a reused uint16
+        # buffer and take the max.
+        flat = arr.reshape(-1).view(np.uint16)
+        buf = np.empty(min(_FINITE_CHUNK_ELEMS, flat.size), np.uint16)
+        for i in range(0, flat.size, _FINITE_CHUNK_ELEMS):
+            c = flat[i:i + _FINITE_CHUNK_ELEMS]
+            if np.bitwise_and(c, np.uint16(0x7C00), out=buf[:c.size]).max() == 0x7C00:
+                break
+        else:
+            return
+        first_bad = 0
+    else:
+        step = _finite_step(arr)
+        first_bad = None
+        for u0 in range(0, arr.shape[0], step):
+            if not np.isfinite(arr[u0:u0 + step]).all():
+                first_bad = u0
+                break
+        if first_bad is None:
+            return
+    units = _nonfinite_units(arr, first_bad)
+    rows = units if row_offsets is None else np.unique(
+        np.searchsorted(np.asarray(row_offsets), units, side="right") - 1)
+    shown = ", ".join(str(int(r)) for r in rows[:_FINITE_SHOW_ROWS])
+    more = f", ... ({rows.size} in total)" if rows.size > _FINITE_SHOW_ROWS else ""
+    raise ValueError(
+        f"{source}: column `{column}` has {rows.size} row(s) with NaN/inf vector "
+        f"values (rows {shown}{more}; row numbers count from 0 within this file). "
+        "NaN/inf vectors corrupt results; clean or drop these rows.")

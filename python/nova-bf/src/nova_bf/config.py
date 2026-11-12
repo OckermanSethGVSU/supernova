@@ -731,6 +731,30 @@ class BruteForceConfig(BaseModel):
         return self
 
     @model_validator(mode="after")
+    def _validate_static_match_nonempty(self) -> "BruteForceConfig":
+        """A static `match: []` is rejected here, at config load, instead of
+        crashing a reader thread mid-run (Arrow cannot type an empty value set:
+        `ArrowTypeError: string vs null`). Runs after `_validate_searches`, so
+        every search already has its name. `match_from_query` with an empty
+        per-query list is left alone: that one matches nothing for that query,
+        which is measured to agree with Qdrant."""
+        for s in self.searches:
+            if s.filter is None:
+                continue
+            for group in ("must", "should", "must_not"):
+                for i, cond in enumerate(getattr(s.filter, group)):
+                    if isinstance(cond.match, tuple) and not cond.match:
+                        raise ValueError(
+                            f"search `{s.name}`: filter.{group}[{i}] on field "
+                            f"`{cond.field}` has `match: []` (an empty list). An "
+                            "empty MatchAny matches no point (Qdrant semantics), so "
+                            "the condition is either always false or, under "
+                            "must_not, a no-op. List at least one value, or remove "
+                            "the condition."
+                        )
+        return self
+
+    @model_validator(mode="after")
     def _validate_tiebreak(self) -> "BruteForceConfig":
         """`tiebreak: id` orders ties by the point id, so there has to be one.
         """

@@ -1056,9 +1056,9 @@ def test_shared_io_and_decode_once_per_file_not_per_spec(ds, monkeypatch):
 
     orig_sparse = compute_mod.sparse_to_coo_parts
 
-    def counting_sparse(col):
+    def counting_sparse(col, **kw):
         calls["sparse_to_coo_parts"] += 1
-        return orig_sparse(col)
+        return orig_sparse(col, **kw)
 
     monkeypatch.setattr(Store, "read_columns", counting_read)
     monkeypatch.setattr(compute_mod, "dense_to_2d", counting_dense)

@@ -165,6 +165,20 @@ A manifest records configuration, hardware, code version, and timings.
 
 Exact-score ties use corpus order (`ordinal`, default) or `corpus.id_column`.
 
+## Input validation
+
+Inputs that cannot produce valid ground truth stop the run with an error naming the file, column or field, and the rows involved, rather than failing later or producing wrong results:
+
+| Input | When it is checked | Error |
+| --- | --- | --- |
+| A static `match: []` (empty list) | Config load | Names the search, the condition (`filter.must[i]` etc.) and the field. An empty MatchAny matches no point, so the condition is always false (or a no-op under `must_not`). `match_from_query` with an empty per-query list is still allowed and matches nothing for that query. |
+| A filtered corpus field stored as a list column (`list`, `large_list`, `fixed_size_list`) | First corpus file at start, then every file as it is read | Names the field, the file and the type. List-valued payload fields are not supported: Qdrant matches a point if *any* element matches, and nova-bf does not implement that. |
+| A filtered corpus field missing from a file | First corpus file at start, then every file as it is read | Names the field, the file, the columns present and a close spelling if there is one. Write an all-null column where a file has no values, or leave the file out with `corpus.exclude`. |
+| A sparse row whose `indices` and `values` lists differ in length | Every corpus and queries file, at decode | Names the file, the row numbers and both lengths. |
+| `NaN` or `±inf` in a dense vector, a sparse value or a multivector token | Every corpus file as it is decoded (pyarrow and native readers alike), and every queries file at load | Names the file, the column, the first bad row numbers and the total count: "NaN/inf vectors corrupt results; clean or drop these rows." |
+
+Row numbers count from 0 within the named file. These checks only look at data that is already in memory, plus one footer read of the first corpus file at start, so they add no reads to the scan. A distributed rank only checks the files it reads.
+
 ## Performance and tuning
 
 Execution overlaps corpus I/O, CPU decoding, and GPU scoring. Reading and decoding often dominate runtime.
@@ -204,7 +218,7 @@ All workers need a shared `output.path` with listing and read permissions. Every
 
 Each partial records its applied threshold. During `nova bf merge`, the final per-query *k*-th score must meet the largest recorded threshold; a violation fails verification even with force enabled. This protects against inconsistent or stale peer data. Partial files are self-contained, but must be merged with a compatible version aware of `applied_threshold` and `nan_hits`.
 
-If validation fails, rerun the named ranks with `threshold_exchange: false`. Queries affected by invalid (`NaN`/infinite) scores use the recorded `nan_hits` count to reduce the final result length, matching single-node behavior. When exchanging thresholds, missing ranks or mixed runs can invalidate the merge.
+If validation fails, rerun the named ranks with `threshold_exchange: false`. Queries affected by invalid (`NaN`/infinite) scores use the recorded `nan_hits` count to reduce the final result length, matching single-node behavior (non-finite input vectors are rejected at read time, see [Input validation](#input-validation), so such scores now come only from finite vectors whose score overflows float32). When exchanging thresholds, missing ranks or mixed runs can invalidate the merge.
 
 For rank retries, prefer the original scoring configuration (GPU, batching, and precision). The rerun tolerance covers exact FP32 cosine scoring, not necessarily dot product, Euclidean distance, TF32, or other scoring-order differences.
 

@@ -1087,6 +1087,67 @@ def check_static_match_types(named_filters, corpus_schema: pa.Schema, skip_field
             "holds strings).")
 
 
+def _is_list_type(t: pa.DataType) -> bool:
+    """Any Arrow list layout (list, large_list, fixed_size_list, list views)."""
+    return (pa.types.is_list(t) or pa.types.is_large_list(t)
+            or pa.types.is_fixed_size_list(t)
+            or (hasattr(pa.types, "is_list_view") and pa.types.is_list_view(t))
+            or (hasattr(pa.types, "is_large_list_view") and pa.types.is_large_list_view(t)))
+
+
+def filter_field_users(named_filters) -> dict[str, list[str]]:
+    """`{corpus field: [search names whose filter reads it]}`, for messages."""
+    users: dict[str, list[str]] = {}
+    for name, filt in named_filters:
+        if filt is None:
+            continue
+        for f in sorted(filt.fields()):
+            users.setdefault(f, [])
+            if name not in users[f]:
+                users[f].append(name)
+    return users
+
+
+def check_corpus_filter_columns(field_users: dict[str, list[str]],
+                                schema: pa.Schema, file: str) -> None:
+    """Every corpus field a filter reads must be present in `file`, and must
+    not be list-valued. Called on the first corpus file's schema before the
+    scan, and on every file's decoded table in the reader (the schema is
+    already in hand there, so the per-file check reads nothing extra).
+
+    Raises ValueError saying which field, which file, and why."""
+    if not field_users:
+        return
+    names = schema.names
+    missing = [c for c in field_users if c not in names]
+    if missing:
+        import difflib
+
+        parts = []
+        for c in missing:
+            close = difflib.get_close_matches(c, names, n=1, cutoff=0.75)
+            hint = f" (did you mean `{close[0]}`?)" if close else ""
+            parts.append(f"`{c}` (used by search(es) {field_users[c]}){hint}")
+        shown = names if len(names) <= 40 else names[:40] + [f"... {len(names) - 40} more"]
+        raise ValueError(
+            f"corpus file {file}: filter field(s) {', '.join(parts)} absent — the "
+            "column is not in this file, so its rows cannot be filtered. Columns "
+            f"present: {shown}. Every corpus file must carry every filtered field "
+            "(write it as an all-null column where a file has no values: a null "
+            "never matches, same as a point without that payload key in Qdrant), "
+            "or leave the file out with corpus.exclude.")
+    for c, searches in field_users.items():
+        t = schema.field(c).type
+        if _is_list_type(t):
+            raise ValueError(
+                f"corpus file {file}: filter field `{c}` (used by search(es) "
+                f"{searches}) is a list column ({t}); list-valued payload fields "
+                "are not supported — Qdrant would match a point if ANY element "
+                "matches, which nova-bf does not implement, so the result would "
+                "not be valid ground truth. Store one scalar value per row in "
+                "this column.")
+
+
 def pack_rows(mask: np.ndarray) -> PackedRowMask:
     """Bit-pack an `(n_queries, n_rows)` bool mask along the row axis."""
     return PackedRowMask(np.packbits(mask, axis=1), mask.shape[1])

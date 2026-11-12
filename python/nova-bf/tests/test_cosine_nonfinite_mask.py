@@ -1,5 +1,10 @@
-"""A per-query filter must keep excluded rows excluded under cosine, even when
-a corpus or query vector has a non-finite norm.
+"""Non-finite corpus/query vectors under a cosine per-query filter.
+
+nova-bf now rejects NaN/inf vectors at read time (`io.check_finite`), so the
+tests below assert that error. The history, kept because the guards it
+describes are still in the scorer (now unreachable from `run_compute`): a
+per-query filter had to keep excluded rows excluded under cosine even when a
+corpus or query vector had a non-finite norm.
 
 Cosine divides by the corpus norm (fused cnorm, the default) and by the query
 norm in the PACKER, i.e. after the per-query mask set excluded cells to -inf.
@@ -94,46 +99,29 @@ def _final(files):
     return files[name].to_pydict()
 
 
+_MSG = "NaN/inf vectors corrupt results; clean or drop these rows."
+
+
 @pytest.mark.parametrize("bad", ["nan", "inf"])
+@pytest.mark.parametrize("fuse", [True, False])
 @pytest.mark.parametrize("batch", [32, 8192])     # bad row mid-slice / one slice
-def test_excluded_broken_row_does_not_cost_a_hit(tmp_path, monkeypatch, bad, batch):
-    got, tenant = _run(tmp_path, monkeypatch, "bad", corpus_bad=bad, batch=batch)
-    ref, _ = _run(tmp_path, monkeypatch, "ref", drop_bad=True, batch=batch)
-    g, r = _final(got), _final(ref)
-    bad_tenant = tenant[BAD]
-    checked = 0
-    for i, qid in enumerate(g["query_id"]):
-        if TENANTS[int(qid[1:]) % 4] == bad_tenant:
-            continue                       # the broken row is ALLOWED for this query
-        # Same hits; scores to float tolerance only, because dropping the row
-        # shifts slice composition and with it the GEMM's summation order.
-        assert g["hit_ids"][i] == r["hit_ids"][i], qid
-        np.testing.assert_allclose(g["hit_scores"][i], r["hit_scores"][i], rtol=1e-5, atol=1e-6)
-        checked += 1
-    assert checked >= NQ // 2
+def test_broken_corpus_row_is_an_input_error(tmp_path, monkeypatch, bad, fuse, batch):
+    """Non-finite vectors are rejected in the reader, before any scoring, so
+    the cosine-mask NaN handling this file used to pin is never reached:
+    the run fails naming the file, the column and the row."""
+    with pytest.raises(RuntimeError) as e:
+        _run(tmp_path, monkeypatch, "bad", corpus_bad=bad, fuse=fuse, batch=batch)
+    msg = str(e.value)
+    assert "part0.parquet" in msg and "column `dense`" in msg
+    assert f"1 row(s)" in msg and f"rows {BAD};" in msg and _MSG in msg
 
 
-@pytest.mark.parametrize("bad", ["nan", "inf"])
-def test_fused_equals_unfused_with_broken_rows(tmp_path, monkeypatch, bad):
-    a, _ = _run(tmp_path, monkeypatch, "fused", corpus_bad=bad, fuse=True)
-    b, _ = _run(tmp_path, monkeypatch, "unfused", corpus_bad=bad, fuse=False)
-    assert sorted(a) == sorted(b)
-    for n in a:
-        assert a[n].equals(b[n]), n
-
-
-def test_nan_query_counts_only_allowed_rows(tmp_path, monkeypatch):
-    nanq = (5, 6, 13)
-    files, tenant = _run(tmp_path, monkeypatch, "nq", sharded=True, k=40, nan_queries=nanq)
-    part = [t for t in files.values() if "nan_hits" in t.column_names]
-    assert part, "expected a sharded partial with nan_hits"
-    d = part[0].to_pydict()
-    for i, qid in enumerate(d["query_id"]):
-        q = int(qid[1:])
-        allowed = int((tenant == TENANTS[q % 4]).sum())
-        assert d["nan_hits"][i] <= allowed, (qid, d["nan_hits"][i], allowed)
-        if q not in nanq:
-            assert d["nan_hits"][i] == 0
+def test_nan_queries_are_an_input_error(tmp_path, monkeypatch):
+    with pytest.raises(ValueError) as e:
+        _run(tmp_path, monkeypatch, "nq", sharded=True, k=40, nan_queries=(5, 6, 13))
+    msg = str(e.value)
+    assert "queries file" in msg and "q.parquet" in msg and "column `dense`" in msg
+    assert "3 row(s)" in msg and "rows 5, 6, 13;" in msg and _MSG in msg
 
 
 def test_finite_data_unchanged_by_the_guards(tmp_path, monkeypatch):

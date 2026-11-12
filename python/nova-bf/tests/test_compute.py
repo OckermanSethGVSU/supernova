@@ -228,9 +228,14 @@ def test_bad_filter_field_raises_instead_of_hanging(ds):
     exception in the main thread, not hang forever (an uncaught exception in
     a daemon thread silently kills it, and the consumer's fixed-count
     `fq.get()` loop would otherwise block waiting for an item that never
-    arrives)."""
+    arrives).
+
+    A column absent from EVERY file is now caught before the scan (the first
+    corpus file's schema is checked at start); the reader-thread path itself
+    -- a column missing from a LATER file -- is pinned by
+    test_input_validation.py::test_field_missing_from_a_later_file."""
     filt = Filter(must=[FilterCondition(field="no_such_column", match="eng")])
-    with pytest.raises(RuntimeError, match="reader thread failed"):
+    with pytest.raises(ValueError, match="`no_such_column`.* absent"):
         _run(ds, batch=None, id_column="id", out_name="filter_bad_field", filt=filt)
 
 

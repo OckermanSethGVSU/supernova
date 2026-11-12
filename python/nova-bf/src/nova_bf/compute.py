@@ -65,7 +65,7 @@ from nova_bf.ids import make_point_id
 from nova_bf.io import (
     ParquetFile, Store, configure_rust_fetch, dense_to_2d, multivector_to_ragged, rust_fetch_dense_enabled,
     rust_fetch_columns_enabled, rust_fetch_settings,
-    sparse_to_coo_parts,
+    sparse_to_coo_parts, check_finite,
 )
 from nova_bf.results import (
     build_result_table,
@@ -273,6 +273,7 @@ def load_queries(
             
         # Queries are kept float32 for scoring/packing, regardless of storage dtype.
         embs.append(dense_to_2d(conv[qcfg.dense_column]).astype(np.float32, copy=False))
+        check_finite(embs[-1], f"queries file {f.key}", qcfg.dense_column)
         n = len(conv)
         if qcfg.id_column:
             ids += [str(x) for x in d[qcfg.id_column]]
@@ -607,7 +608,10 @@ def load_queries_sparse(
         d = _query_meta_pydict(table, cols, qcfg.sparse_column)
         # Date columns -> epoch µs for filter arrays only (payload keeps strings).
         conv = convert_table_date_columns(table, q_date_fmts)
-        row_offsets, idx, val = sparse_to_coo_parts(conv[qcfg.sparse_column])
+        row_offsets, idx, val = sparse_to_coo_parts(
+            conv[qcfg.sparse_column], source=f"queries file {f.key} (queries.sparse_column `{qcfg.sparse_column}`)")
+        check_finite(val, f"queries file {f.key}", f"{qcfg.sparse_column}.values",
+                     row_offsets=row_offsets)
         counts_parts.append(np.diff(row_offsets))
         indices_parts.append(idx)
         values_parts.append(val)
@@ -693,6 +697,8 @@ def load_queries_multivector(
         # reading it straight from `table` removes any doubt); `conv` feeds only
         # the filter fields, which may be date-normalized.
         doc_offsets, flat = multivector_to_ragged(table[qcfg.multivector_column])
+        check_finite(flat, f"queries file {f.key}", qcfg.multivector_column,
+                     row_offsets=doc_offsets)
         if flat.shape[1] > 0:
             if dim and flat.shape[1] != dim:
                 raise ValueError(
@@ -1539,13 +1545,25 @@ def _zero_gate_file_ok(values: np.ndarray, q_nonneg: bool, q_min_pos: float) -> 
     smallest possible cross-product stays comfortably normal (see
     `_ZERO_GATE_MIN_PRODUCT`). Strictness matters twice over: a negative
     value allows cancellation zeros (real candidates), and a STORED-ZERO
-    entry is a structural overlap (it occupies a posting in an inverted
-    index — Qdrant would surface the doc at score 0.0) that contributes 0 to
-    the dot, so `raw == 0` would wrongly gate it — both fall back to the
-    structural indicator path. `values` are the file's raw pre-coalesce
-    entries — coalescing only ever SUMS same-sign values, so raw strict
-    positivity implies scored positivity, and the raw min is a lower bound
-    on the scored min (conservative)."""
+    entry is a structural overlap that contributes 0 to the dot, so
+    `raw == 0` would wrongly gate it — both fall back to the structural
+    indicator path. `values` are the file's raw pre-coalesce entries —
+    coalescing only ever SUMS same-sign values, so raw strict positivity
+    implies scored positivity, and the raw min is a lower bound on the
+    scored min (conservative).
+
+    Zero-score documents (a known, deliberately unhandled difference from
+    Qdrant): a document that shares a token with the query is a candidate even
+    when its score comes out exactly 0.0 (a stored 0.0 weight, signed weights
+    cancelling, or an underflowed product), so it can fill the bottom of a
+    query's top-k at score 0.0. A query token whose weight is 0.0 does not
+    count as an overlap, though, because the query is densified. Qdrant drops
+    every exactly-0.0 candidate in unfiltered sparse search but keeps them under
+    any filter, so neither rule matches it everywhere. This only shows up when
+    a query has fewer than k positive-scoring documents AND a document's only
+    overlap scores 0.0, which real non-negative SPLADE-style data essentially
+    never produces (it needs stored zeros, e.g. from zero padding or weights
+    rounded to 0 by low-precision storage), so it is left as is."""
     if not q_nonneg:
         return False
     if len(values) == 0:
@@ -5727,40 +5745,25 @@ def _plan_static_device(plan, device):
 
 class _SliceFilters:
     """
-    Cache per-query filter masks and derive exact row/tile liveness.
+    Cache one slice's per-query filter masks for score masking.
 
-    Created once per slice, after pipelined pass one is launched but before
-    two-pass preparation and exact scoring. Liveness can therefore skip
-    rescoring and one-pass GEMM work, but not pass one.
+    Created once per slice. Masks are built lazily, once per filter, and
+    shared by every member search that uses the filter.
 
-    Masks are built lazily and shared between liveness checks and score
-    masking, ensuring both use identical filter decisions.
+    Coordinates: cell_mask(f) is (filter_n_q[f], n_cols), indexed by filter
+    query rows and slice columns (including union-compacted batches); the
+    caller maps a member's own query rows into it.
 
-    Coordinates:
-      * cell_mask(f): (filter_n_q[f], n_cols), indexed by filter query rows
-        and slice columns (including union-compacted batches).
-      * row_live(m) / tile_live(m, w): indexed by member query rows,
-        mapped through spec_qrows[m] exactly as during score masking.
-
-    None liveness means no filter restriction for that slice. Dead rows/tiles
-    are exact (all cells masked), never approximate. Liveness methods return
-    fresh contiguous tensors. For two-pass, use tile_info["width"].
-
-    Masks are released after all members using the filter call select() or
-    release(). Requesting liveness for multiple members up front retains
-    their masks until release, increasing peak memory. Request liveness
-    before select(); requests after final release rebuild the mask.
+    A filter's mask is released after the last member using it calls select().
     """
 
 
     __slots__ = ("_specs", "_rows", "_true_rows", "n_cols", "_device",
-                 "_build_mask", "_uniform_idx", "_qsel", "_qrows",
-                 "_member_height", "_per_query", "_masks", "_local_idx",
-                 "_users", "builds")
+                 "_build_mask", "_uniform_idx", "_per_query", "_masks",
+                 "_local_idx", "_users", "builds")
 
     def __init__(self, specs, member_idxs, rows, true_rows, n_cols: int, device,
-                 *, build_mask, uniform_idx, spec_qsel, spec_qrows,
-                 member_height, per_query):
+                 *, build_mask, uniform_idx, per_query):
         self._specs = specs
         self._rows = rows
         self._true_rows = true_rows
@@ -5768,9 +5771,6 @@ class _SliceFilters:
         self._device = device
         self._build_mask = build_mask      # (f, rows, true_rows) -> tensor | None
         self._uniform_idx = uniform_idx    # (f, true_rows) -> int64 tensor
-        self._qsel = spec_qsel
-        self._qrows = spec_qrows
-        self._member_height = member_height
         self._per_query = per_query        # f -> bool
         self._masks: dict = {}
         self._local_idx: dict = {}
@@ -5792,13 +5792,6 @@ class _SliceFilters:
             self.builds += 1
             self._masks[f] = got
         return got
-
-    def _member_mask(self, m):
-        """Member `m`'s mask in its own rows, or `None` (no allowed cell)."""
-        cm = self.cell_mask(self._specs[m].filter)
-        if cm is not None and self._qsel[m] is not None:
-            cm = cm[self._qrows[m]]
-        return cm
 
     def _uniform_local(self, f):
         idx = self._local_idx.get(f)
@@ -5827,77 +5820,10 @@ class _SliceFilters:
             return None, None, None
         return self._rows[local_idx], local_idx, None
 
-    def release(self, m) -> None:
-        """Member `m` will not call `select` this slice (it was skipped, e.g.
-        because it is filter-dead): count it as done so its filter's mask is
-        released after the remaining members, not held to the slice's end."""
-        f = self._specs[m].filter
-        if not _is_unfiltered(f) and self._per_query(f):
-            self._done(f)
-
     def _done(self, f) -> None:
         self._users[f] -= 1
         if self._users[f] <= 0:
             self._masks.pop(f, None)
-
-    # -- liveness ------------------------------------------------------------
-
-    def row_live(self, m):
-        """`(member_height[m],)` bool: does member `m`'s query have at least
-        one allowed cell in this slice? `None` = every row is live."""
-        import torch
-
-        f = self._specs[m].filter
-        if _is_unfiltered(f):
-            return None
-        h = self._member_height(m)
-        if self._per_query(f):
-            cm = self._member_mask(m)
-            if cm is None:
-                return torch.zeros(h, dtype=torch.bool, device=self._device)
-            return cm.any(dim=1)
-        if self._uniform_local(f).numel() == 0:
-            return torch.zeros(h, dtype=torch.bool, device=self._device)
-        return None
-
-    def tile_live(self, m, width: int):
-        """`(n_tiles, member_height[m])` bool, `n_tiles = ceil(n_cols / width)`:
-        does member `m`'s query have an allowed cell in column tile `t`
-        (columns `[t*width, (t+1)*width)`, the last tile partial)? Same layout
-        as `_twopass_prepare`'s `tile_live[:, rng]`. `None` = all live."""
-        import torch
-
-        width = int(width)
-        if width <= 0:
-            raise ValueError(f"tile width must be positive, got {width}")
-        f = self._specs[m].filter
-        if _is_unfiltered(f):
-            return None
-        h = self._member_height(m)
-        n_tiles = -(-self.n_cols // width)
-        if self._per_query(f):
-            cm = self._member_mask(m)
-            if cm is None:
-                return torch.zeros((n_tiles, h), dtype=torch.bool, device=self._device)
-            return _tile_any(cm, width, n_tiles).T.contiguous()
-        local = self._uniform_local(f)
-        cols = torch.zeros(self.n_cols, dtype=torch.bool, device=self._device)
-        cols[local] = True
-        return (_tile_any(cols[None, :], width, n_tiles)[0][:, None]
-                .expand(n_tiles, h).contiguous())
-
-
-def _tile_any(mask, width: int, n_tiles: int):
-    """`(r, n_cols)` bool -> `(r, n_tiles)`: any True per column tile, the last
-    tile zero-padded (padding is False, so it never makes a tile live)."""
-    import torch
-
-    r, n_cols = mask.shape
-    pad = n_tiles * width - n_cols
-    if pad:
-        mask = torch.cat(
-            (mask, torch.zeros((r, pad), dtype=torch.bool, device=mask.device)), dim=1)
-    return mask.reshape(r, n_tiles, width).any(dim=2)
 
 
 def _process_shared_batch(
@@ -5993,8 +5919,6 @@ def _process_shared_batch(
         return _SliceFilters(
             specs, member_idxs, rows, true_rows, n_cols, device,
             build_mask=build_mask, uniform_idx=uniform_idx,
-            spec_qsel=spec_qsel, spec_qrows=spec_qrows,
-            member_height=lambda m: int(spec_thr[m].shape[0]),
             per_query=per_query,
         )
 
@@ -6179,6 +6103,34 @@ def _validate_query_filter_cols(
             f"queries file is missing column(s): {' and '.join(parts)} "
             f"— available columns: {sorted(schema_names)}"
         )
+
+
+def _validate_corpus_filter_fields(specs, corpus_files, cstore: Store) -> None:
+    """Fail before the scan if the FIRST corpus file lacks a filtered field or
+    holds one as a list column (see `filters.check_corpus_filter_columns`).
+    Later files get the same check in the reader, against the table it has
+    already decoded, so this footer read is the only extra IO."""
+    users = filters_mod.filter_field_users(
+        [(s.name, s.filter) for s in specs if s.filter is not None])
+    if not users or not corpus_files:
+        return
+    f = corpus_files[0]
+    filters_mod.check_corpus_filter_columns(users, cstore.read_schema(f.read_path), f.key)
+
+
+def _explain_corpus_read_error(exc: BaseException, field_users, cstore: Store, f) -> None:
+    """A corpus read failed. If the cause is a filtered field this file does
+    not have, raise the explicit error instead of pyarrow's `No match for
+    FieldRef` (chained to it); otherwise return so the caller re-raises the
+    original. Reads the footer only on this failure path."""
+    if not field_users:
+        return
+    try:
+        schema = cstore.read_schema(f.read_path)
+    except Exception:
+        return
+    if any(c not in schema.names for c in field_users):
+        filters_mod.check_corpus_filter_columns(field_users, schema, f.key)
 
 
 def _validate_match_types(specs, qstore: Store, corpus_files, cstore: Store, cfg) -> None:
@@ -6513,6 +6465,7 @@ def run_compute(
     # Applied BEFORE striding so the global file index — and thus make_point_id — is
     # over the filtered set, consistent between compute workers and merge.
     all_files = filter_corpus_files(all_files, cfg.corpus.include, cfg.corpus.exclude)
+    _validate_corpus_filter_fields(specs, all_files, cstore)
     _validate_match_types(specs, qstore, all_files, cstore, cfg)
     # Compute the corpus fingerprint for both the manifest and threshold exchange.
     corpus_fp = run_manifest.corpus_fingerprint(all_files)
@@ -7290,6 +7243,9 @@ def run_compute(
         if s.filter
         for c in s.filter.fields()
     })
+    # {field: [search names]} for the per-file column checks' messages.
+    filter_users = filters_mod.filter_field_users(
+        [(s.name, s.filter) for s in specs if s.filter is not None])
 
     corpus_date_fmts = normalize_date_fields(cfg.corpus.date_fields)
 
@@ -7394,52 +7350,62 @@ def run_compute(
                     # arrives already decoded; pyarrow reads only the OTHER
                     # columns (projected -- never a whole-file ranged GET,
                     # which would re-buy the dense bytes). None = fall back.
-                    native = (
-                        cstore.read_dense_versioned(f.read_path, dense_col)
-                        if use_native_dense else None
-                    )
-                    native_dense, native_etag = native if native is not None else (None, None)
-                    if read_timing:
-                        table, rt = profiling.fetch_and_decode(
-                            cstore, f.read_path, read_cols, read_col_groups)
-                    elif native_dense is not None:
-                        rest_cols = [c for c in read_cols if c != dense_col]
-                        table = None
-                        fetch_pinned = False
-                        if rest_cols:
-                            # Native download pinned to the SAME version as the
-                            # dense read (None if that version is gone).
-                            fetched = (cstore.read_columns_fetched(f.read_path, rest_cols,
-                                                                   etag=native_etag)
+                    try:
+                        native = (
+                            cstore.read_dense_versioned(f.read_path, dense_col)
+                            if use_native_dense else None
+                        )
+                        native_dense, native_etag = native if native is not None else (None, None)
+                        if read_timing:
+                            table, rt = profiling.fetch_and_decode(
+                                cstore, f.read_path, read_cols, read_col_groups)
+                        elif native_dense is not None:
+                            rest_cols = [c for c in read_cols if c != dense_col]
+                            table = None
+                            fetch_pinned = False
+                            if rest_cols:
+                                # Native download pinned to the SAME version as the
+                                # dense read (None if that version is gone).
+                                fetched = (cstore.read_columns_fetched(f.read_path, rest_cols,
+                                                                       etag=native_etag)
+                                           if use_native_fetch else None)
+                                if fetched is not None:
+                                    table, fetch_pinned = fetched[0], True
+                                else:
+                                    table = cstore.read_columns(f.read_path, rest_cols, ranged=False)
+                                # Never keep a second reference to the table: the
+                                # reader drops it before compaction (peak memory).
+                                fetched = None
+                            if (table is not None and not fetch_pinned
+                                    and not cstore.same_version(f.read_path, native_etag)):
+                                # Rewritten between the two reads: never pair one
+                                # version's ids/filters with another's vectors.
+                                # Read everything again in ONE pyarrow read.
+                                logger.warning("%s changed during the read; re-reading it with "
+                                               "pyarrow", f.key)
+                                native_dense = None
+                                table = cstore.read_columns(f.read_path, read_cols)
+                            if (table is not None and native_dense is not None
+                                    and len(table) != native_dense.shape[0]):
+                                raise ValueError(
+                                    f"{f.key}: native dense read gave {native_dense.shape[0]} "
+                                    f"rows but the other columns have {len(table)}"
+                                )
+                        else:
+                            fetched = (cstore.read_columns_fetched(f.read_path, read_cols)
                                        if use_native_fetch else None)
-                            if fetched is not None:
-                                table, fetch_pinned = fetched[0], True
-                            else:
-                                table = cstore.read_columns(f.read_path, rest_cols, ranged=False)
-                            # Never keep a second reference to the table: the
-                            # reader drops it before compaction (peak memory).
-                            fetched = None
-                        if (table is not None and not fetch_pinned
-                                and not cstore.same_version(f.read_path, native_etag)):
-                            # Rewritten between the two reads: never pair one
-                            # version's ids/filters with another's vectors.
-                            # Read everything again in ONE pyarrow read.
-                            logger.warning("%s changed during the read; re-reading it with "
-                                           "pyarrow", f.key)
-                            native_dense = None
-                            table = cstore.read_columns(f.read_path, read_cols)
-                        if (table is not None and native_dense is not None
-                                and len(table) != native_dense.shape[0]):
-                            raise ValueError(
-                                f"{f.key}: native dense read gave {native_dense.shape[0]} "
-                                f"rows but the other columns have {len(table)}"
-                            )
-                    else:
-                        fetched = (cstore.read_columns_fetched(f.read_path, read_cols)
-                                   if use_native_fetch else None)
-                        table = (fetched[0] if fetched is not None
-                                 else cstore.read_columns(f.read_path, read_cols))
-                        fetched = None  # see above: no second reference to the table
+                            table = (fetched[0] if fetched is not None
+                                     else cstore.read_columns(f.read_path, read_cols))
+                            fetched = None  # see above: no second reference to the table
+                    except Exception as exc:
+                        # A filtered field this file lacks: say so (field, file) instead
+                        # of pyarrow's bare `No match for FieldRef`.
+                        _explain_corpus_read_error(exc, filter_users, cstore, f)
+                        raise
+                    # Per-file twin of the start-up check: a filtered field must not be
+                    # a list column in ANY file. The schema is already decoded -- free.
+                    if table is not None and filter_users:
+                        filters_mod.check_corpus_filter_columns(filter_users, table.schema, f.key)
 
                     # Normalize declared datetime columns before any filter reads them.
                     ts = time.perf_counter()
@@ -7454,6 +7420,9 @@ def run_compute(
                     if "dense" in vts_needed:
                         arrs["dense"] = (native_dense if native_dense is not None
                                          else dense_to_2d(table[dense_col]))
+                        # Same check on both read paths (native rust_fetch and
+                        # pyarrow): a chunked np.isfinite over the decoded array.
+                        check_finite(arrs["dense"], f"corpus file {f.key}", dense_col)
                     native_dense = None
                     if rt is not None:
                         # Recorded only when the stage RAN
@@ -7462,13 +7431,21 @@ def run_compute(
                         ts = time.perf_counter()
                     if "multivector" in vts_needed:
                         arrs["multivector"] = multivector_to_ragged(table[multivector_col])
+                        check_finite(arrs["multivector"][1], f"corpus file {f.key}",
+                                     multivector_col, row_offsets=arrs["multivector"][0])
                         if rt is not None:
                             rt["multivector_cast"] = time.perf_counter() - ts
                     if rt is not None:
                         ts = time.perf_counter()
                     if "sparse" in vts_needed:
                         # Time sparse decode, norms/gate, and vocab remap separately.
-                        sp_offsets, sp_idx, sp_val = sparse_to_coo_parts(table[sparse_col])
+                        sp_offsets, sp_idx, sp_val = sparse_to_coo_parts(
+                            table[sparse_col],
+                            source=f"corpus file {f.key} (corpus.sparse_column `{sparse_col}`)")
+                        # Original (pre-remap) values: a NaN anywhere in the file
+                        # is an error, even on a token no query uses.
+                        check_finite(sp_val, f"corpus file {f.key}", f"{sparse_col}.values",
+                                     row_offsets=sp_offsets)
                         if rt is not None:
                             rt["sparse_decode"] = time.perf_counter() - ts
                             ts = time.perf_counter()
@@ -7686,8 +7663,12 @@ def run_compute(
         def _fetch_or_raise() -> tuple:
             it = fq.get()
             if isinstance(it, Exception):
+                # The cause's text is repeated in the message: a validation
+                # error (missing/list filter field, bad sparse row, non-finite
+                # vector) is the useful part, and a CLI may print only str().
                 raise RuntimeError(
-                    "a reader thread failed while reading/decoding/filtering a corpus file"
+                    "a reader thread failed while reading/decoding/filtering a corpus file: "
+                    f"{type(it).__name__}: {it}"
                 ) from it
             return it
 

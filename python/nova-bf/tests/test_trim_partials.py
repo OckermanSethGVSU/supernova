@@ -238,25 +238,19 @@ def test_trim_with_two_pass_engaged(tmp_path, monkeypatch):
     _assert_same(_read(run_merge(cfg)), single)
 
 
-@pytest.mark.parametrize("fold", ["numpy", "torch"])
-def test_trim_nan_corpus_rows_untouched_and_exact(tmp_path, monkeypatch, fold):
+def test_nan_corpus_row_fails_the_rank_that_reads_it(tmp_path, monkeypatch):
+    """NaN corpus vectors are an input error raised by the reader (they used
+    to be dropped at write, with `nan_hits` telling the merge not to trim
+    that query). Only the rank whose stride owns the file sees it."""
     monkeypatch.setenv("NOVA_BF_DEVICE", TEST_DEVICE)
-    monkeypatch.setenv("NOVA_BF_MERGE_FOLD", fold)
     cdir, qpath = _dataset(tmp_path, n_files=6, rows=30, seed=3, nan_row=(1, 4))
-    (tmp_path / "s").mkdir(); (tmp_path / "x").mkdir()
-    single = _read(run_compute(_cfg(cdir, qpath, tmp_path / "s", False, types=("dense",))))
-    cfg = _cfg(cdir, qpath, tmp_path / "x", True, types=("dense",))
-    _shard(cfg, 2)
-    # Rank 1 owns file 1 (the NaN row): its NaN-affected queries are written
-    # whole (k minus the dropped NaN hits), never trimmed.
-    for f in _partials(tmp_path / "x"):
-        if f.endswith("rank001.parquet"):
-            t = pq.read_table(f).to_pydict()
-            k = 6 + 1 if "euc_eng" in f else 6 - 1 if "dot_half" in f else 6
-            for hits, nn in zip(t["hit_ids"], t["nan_hits"]):
-                if nn:
-                    assert len(hits) == k - nn, f
-    _assert_same(_read(run_merge(cfg)), single)
+    (tmp_path / "x").mkdir()
+    cfg = _cfg(cdir, qpath, tmp_path / "x", False, types=("dense",))
+    with pytest.raises(RuntimeError) as e:
+        run_compute(cfg, num_jobs=2, job_rank=1)          # owns part1
+    msg = str(e.value)
+    assert "part1.parquet" in msg and "column `dense_embedding`" in msg
+    assert "rows 4;" in msg and "NaN/inf vectors corrupt results; clean or drop these rows." in msg
 
 
 def test_trimmed_mixed_with_untrimmed_remedy_rerun(tmp_path, monkeypatch):
