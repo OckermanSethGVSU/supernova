@@ -8270,8 +8270,14 @@ def run_compute(
         results[s_w.name] = path
         entry_w["output_path"] = path
 
+    # Wall time of the final per-search top-K sort and its copy to the host
+    # (below). It follows the scan, so `scan_seconds` excludes it; an engine
+    # that returns its sorted top-K to the host inside its timed pass has paid
+    # this, so `search_seconds` (= scan + this) is the comparable figure.
+    result_sort_secs = 0.0
     try:
         for i, s in enumerate(specs):
+            sort_t0 = time.perf_counter()
             # Sort the final top-K by packed key so ties follow deterministic tie-break
             # order. Process query rows in chunks to bound peak GPU memory during sorting.
             h_i = spec_top_key[i].shape[0]
@@ -8296,6 +8302,9 @@ def run_compute(
             del enc_parts, sc_parts
             # Release this search's GPU state before decoding results on the CPU.
             spec_top_key[i] = spec_top_enc[i] = None
+            # The `.cpu()` copies above waited for the device, so this interval
+            # also covers any scan work still queued when `wall` was taken.
+            result_sort_secs += time.perf_counter() - sort_t0
             valid = sc > float("-inf")
             nan_hits = np.isnan(sc).sum(axis=1).astype(np.int32) if num_jobs is not None else None
             if trim_key is not None:
@@ -8544,12 +8553,18 @@ def run_compute(
             "corpus_bytes_decoded": bytes_seen,
         },
         # `elapsed_seconds` is the whole invocation; `scan_seconds` and the four
-        # splits below cover the corpus pass only (see the bf-bench log line).
+        # splits below cover the corpus pass only (see the bf-bench log line);
+        # `search_seconds` adds the final result sort + copy-back to the scan.
         # read/filter seconds are SUMMED across io_workers reader threads, so
         # divide by io_workers to compare either with wall time.
         "timing": {
             "elapsed_seconds": round(time.perf_counter() - run_t0, 2),
             "scan_seconds": round(wall, 2),
+            # Final top-K sort + device-to-host copy, all searches (after the
+            # scan), and the scan plus it: the figure to compare with an engine
+            # whose timed pass ends with sorted results on the host.
+            "result_sort_seconds": round(result_sort_secs, 3),
+            "search_seconds": round(wall + result_sort_secs, 2),
             "io_wait_seconds": round(io_wait, 2),
             "gpu_seconds": round(gpu_secs, 2),
             "read_seconds_summed": round(read_secs, 2),

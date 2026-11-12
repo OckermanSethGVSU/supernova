@@ -244,6 +244,12 @@ def test_single_node_manifest_describes_the_run(ds, tmp_path, monkeypatch):
     assert doc["counts"]["queries_searched"] == 4  # no search subsets its rows
     assert doc["counts"]["corpus_rows_scanned"] == 9
     assert doc["timing"]["elapsed_seconds"] >= 0
+    # the final top-K sort + copy-back is timed on its own, and `search_seconds`
+    # is the scan plus it (the figure comparable with a baseline's timed pass)
+    t = doc["timing"]
+    assert t["result_sort_seconds"] >= 0
+    assert abs(t["search_seconds"] - (t["scan_seconds"] + t["result_sort_seconds"])) <= 0.011
+    assert t["search_seconds"] <= t["elapsed_seconds"] + 0.011
 
     # Every search it computed, with the filter that defined it.
     by_name = {s["name"]: s for s in doc["searches"]}
