@@ -200,12 +200,13 @@ class ParamsConfig(BaseModel):
     rust_fetch_concurrency: int = Field(default=128, ge=1, strict=True)
     rust_fetch_part_mib: int = Field(default=16, ge=1, strict=True)
     rust_fetch_chunks: int = Field(default=8, ge=1, strict=True)
-    # Maximum rows scored per GPU batch for dense searches to limit memory usage.
-    # Shared across searches of this vector type. None processes the entire file
-    # (or union of filtered rows). Defaults to 8192 for efficient Triton top-K;
-    # larger batches may fall back to slower selection.
+    # Maximum rows scored per GPU batch for dense / sparse searches to limit
+    # memory usage. Shared across searches of this vector type. None processes
+    # the entire file (or union of filtered rows). Both default to 8192, the
+    # Triton top-K kernel's block size; larger batches may fall back to slower
+    # selection.
     dense_batch_size: int | None = Field(default=8192, gt=0)
-    sparse_batch_size: int | None = Field(default=None, gt=0)
+    sparse_batch_size: int | None = Field(default=8192, gt=0)
     # Sparse scoring only. When the dense corpus operand exceeds the swap-memory
     # budget, chunk rows and stay on the faster, more reproducible dense GEMM path.
     # Set False to use the legacy sparse-CSR transpose fallback.
