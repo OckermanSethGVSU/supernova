@@ -228,11 +228,11 @@ class ParamsConfig(BaseModel):
     # MaxSim implementation. `torch` is the established matmul + segmented
     # reduction path. `triton_reduce` retains the cuBLAS FP32 matmul but
     # fuses the ragged max/sum reduction (requires CUDA + Triton, fails
-    # clearly otherwise). `auto` selects `triton_reduce` on a compatible CUDA
-    # run and otherwise falls back to torch. (A fully fused `triton` backend
-    # was removed after measuring ~4x slower than triton_reduce — see
-    # docs/brute-force/multivector-maxsim.md.)
-    multivector_kernel: Literal["torch", "triton_reduce", "auto"] = "torch"
+    # clearly otherwise). `auto` (the default) selects `triton_reduce` on a
+    # compatible CUDA run and otherwise falls back to torch, so CPU runs keep
+    # working. (A fully fused `triton` backend was removed after measuring
+    # ~4x slower than triton_reduce — see docs/brute-force/multivector-maxsim.md.)
+    multivector_kernel: Literal["torch", "triton_reduce", "auto"] = "auto"
     # Target element count for each materialized `(block_query_tokens ×
     # slice_doc_tokens)` score matrix. It still derives either item-count knob
     # left unset, but is also enforced against the ACTUAL ragged query/document
@@ -243,8 +243,8 @@ class ParamsConfig(BaseModel):
     # CUDA-only ordered transfer prefetch for multivector slices. The next
     # packed ragged slice is copied through pinned host staging on a dedicated
     # CUDA stream while the current slice's GEMM/reduction/top-k work runs.
-    # CPU and non-multivector paths remain synchronous.
-    multivector_double_buffer: bool = False
+    # CPU and non-multivector paths remain synchronous. On by default.
+    multivector_double_buffer: bool = True
 
     # Optional FP16 pass for multivector pruning, enabled by default.
     # It is admissible: live pairs are never pruned, so only the amount of work

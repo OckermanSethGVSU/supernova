@@ -91,7 +91,7 @@ def test_params_dense_and_sparse_batch_size_fields_work():
 
 
 def test_params_multivector_kernel_values():
-    assert ParamsConfig().multivector_kernel == "torch"
+    assert ParamsConfig().multivector_kernel == "auto"
     for value in ("torch", "triton_reduce", "auto"):
         assert ParamsConfig(multivector_kernel=value).multivector_kernel == value
     with pytest.raises(ValidationError):
@@ -103,7 +103,7 @@ def test_params_multivector_kernel_values():
 
 
 def test_params_multivector_double_buffer():
-    assert ParamsConfig().multivector_double_buffer is False
+    assert ParamsConfig().multivector_double_buffer is True
     assert ParamsConfig(multivector_double_buffer=True).multivector_double_buffer is True
 
 
