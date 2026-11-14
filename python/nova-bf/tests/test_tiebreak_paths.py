@@ -33,6 +33,8 @@ from nova_bf.config import (
 )
 from nova_bf.merge import run_merge
 
+import mv_tiles
+
 SPARSE_TYPE = pa.struct([
     pa.field("indices", pa.list_(pa.uint32())),
     pa.field("values", pa.list_(pa.float32())),
@@ -189,7 +191,7 @@ def _mv_corpus(tmp, per_file_ids, tokens_per_doc):
     return cdir
 
 
-def _mv_cfg(cdir, tmp, out, k, tiebreak, budget=None, batch=None):
+def _mv_cfg(cdir, tmp, out, k, tiebreak, budget=None):
     return BruteForceConfig(
         corpus=CorpusConfig(path=str(cdir),
                             multivector_column="multivector_embedding",
@@ -199,8 +201,9 @@ def _mv_cfg(cdir, tmp, out, k, tiebreak, budget=None, batch=None):
                               id_column="qid"),
         output=OutputConfig(path=str(out)),
         params=ParamsConfig(io_workers=2, tiebreak=tiebreak,
-                            multivector_token_budget=budget,
-                            multivector_batch_size=batch),
+                            # `budget` is in score ELEMENTS; None = default MiB.
+                            **({} if budget is None else
+                               {"multivector_budget_mib": mv_tiles.mib(budget)})),
         searches=[SearchSpec(name="t", k=k, metric="dot",
                              vector_type="multivector")],
     )
@@ -217,15 +220,18 @@ MV_FLAT = [i for f in MV for i in f]
     (None, None, 2), (3, None, 2), (None, 1, 3),
 ])
 def test_multivector_ties_do_not_move_with_the_token_tiling(
-    tmp_path, tiebreak, budget, batch, n_jobs
+    tmp_path, monkeypatch, tiebreak, budget, batch, n_jobs
 ):
     """The token budget slices by TOKENS, so a doc's index inside a slice is
     unrelated to its row in the file. Docs here have 1-3 tokens each, so the
-    slice boundaries land differently at every budget."""
+    slice boundaries land differently at every budget. `batch` pins docs per
+    slice (test-only) under the default budget, as the old row knob did."""
+    if batch is not None:
+        mv_tiles.pin(monkeypatch, batch, 10**6)
     cdir = _mv_corpus(tmp_path, MV, lambda i: 1 + (int(i[1:]) % 3))
     out = tmp_path / f"mv{tiebreak}{budget}{batch}{n_jobs}"
     out.mkdir()
-    cfg = _mv_cfg(cdir, tmp_path, out, 3, tiebreak, budget, batch)
+    cfg = _mv_cfg(cdir, tmp_path, out, 3, tiebreak, budget)
     expected = sorted(MV_FLAT)[:3] if tiebreak == "id" else MV_FLAT[:3]
     assert _run(cfg, tmp_path, "mv", n_jobs) == expected
 

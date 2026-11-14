@@ -18,8 +18,20 @@ from contextlib import contextmanager
 
 import pyarrow.parquet as pq
 
+import mv_tiles
 from nova_bf.compute import run_compute
 from nova_bf.config import BruteForceConfig, _normalize_static_date_bounds
+
+# `params.multivector_budget_mib` values that, through the production even
+# split, derive a fixed docs-per-slice on the SHARED corpus (`corpus.build`:
+# mean 3.99 tokens/doc in its first file, 3.75 tokens/query, 8 queries).
+# sqrt(92*92) = 92 tokens per axis -> int(92 / 3.99) = 23 docs per slice and
+# one query tile (24 > 8 queries); 68*68 -> 17 docs. The 30-token query tile
+# then allows 282 / 154 doc tokens, so the item cap binds, exactly as the old
+# fixed `23` / `17`. `test_parity_invariance::test_the_matrix_budget_derives_
+# the_slicing_it_claims` pins the derivation.
+MV_23_DOCS_MIB = mv_tiles.mib(92 * 92)
+MV_17_DOCS_MIB = mv_tiles.mib(68 * 68)
 
 
 def spec(
@@ -157,10 +169,16 @@ def read_results(paths: dict[str, str], qids: dict[str, int] | None = None
 
 
 def run(ds, specs: list[dict], *, out_tag: str, device: str | None = None,
-        params: dict | None = None):
-    """Run one nova-bf config on `device` and return its hits per search."""
+        params: dict | None = None, mv_tiles: tuple[int, int] | None = None):
+    """Run one nova-bf config on `device` and return its hits per search.
+
+    `mv_tiles=(docs_per_slice, queries_per_tile)` pins the derived multivector
+    tile shape (test-only, see `tests/mv_tiles.py`) for a test that needs an
+    exact shape a single `multivector_budget_mib` cannot express."""
+    import mv_tiles as mv_tiles_mod
+
     cfg = build_config(ds, specs, out_tag=f"{out_tag}_{device or 'auto'}", params=params)
-    with pinned_device(device):
+    with pinned_device(device), mv_tiles_mod.pinned(mv_tiles):
         paths = run_compute(cfg)
     return read_results(paths, qid_index(ds))
 

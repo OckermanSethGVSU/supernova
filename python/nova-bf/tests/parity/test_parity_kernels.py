@@ -36,7 +36,7 @@ import pytest
 from . import compare, qdrant_ref
 from .cases import FILTERS, K
 from .devices import has_cuda, parity_devices
-from .runner import env, run, spec
+from .runner import MV_17_DOCS_MIB, env, run, spec
 from .test_parity_matrix import _filter_from_dict
 
 # Kernel eligibility depends on the SHAPES a run produces, so the probes span
@@ -61,7 +61,7 @@ IDS = [p[0] for p in PROBES]
 # extra merge rounds nova-bf warns about: more fold calls per query, each with
 # a partially-filled state, which is the case its sentinel handling exists for.
 PARAMS = {"dense_batch_size": 31, "sparse_batch_size": 19,
-          "multivector_batch_size": 17}
+          "multivector_budget_mib": MV_17_DOCS_MIB}   # 17 docs per slice
 
 needs_cuda = pytest.mark.skipif(
     not has_cuda(),

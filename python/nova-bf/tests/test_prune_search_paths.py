@@ -23,6 +23,7 @@ import pytest
 pytest.importorskip("torch")
 
 import gpu_contract
+import mv_tiles
 from nova_bf.compute import run_compute
 from nova_bf.config import (
     BruteForceConfig, CorpusConfig, OutputConfig, ParamsConfig, QueriesConfig,
@@ -182,7 +183,7 @@ def test_sparse_underfilled_state_keeps_its_rows_live(tmp_path, monkeypatch, mod
 
 
 # ---------------------------------------------------------------------------
-# multivector — token-budget tiling, so slice position != file row
+# multivector — budgeted token tiling, so slice position != file row
 # ---------------------------------------------------------------------------
 
 
@@ -233,7 +234,9 @@ def _mv_cfg(cdir, qpath, out, k=5, budget=None):
                               id_column="qid"),
         output=OutputConfig(path=str(out)),
         params=ParamsConfig(io_workers=1, tiebreak="id",
-                            multivector_token_budget=budget,
+                            # `budget` is in score ELEMENTS; None = default MiB.
+                            **({} if budget is None else
+                               {"multivector_budget_mib": mv_tiles.mib(budget)}),
                             # This file pins the ROW prune's mask/tiling
                             # association, and `_assert_same` is exact. The
                             # float16 multivector prune is a second variable

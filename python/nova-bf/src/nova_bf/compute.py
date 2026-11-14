@@ -112,7 +112,7 @@ MAX_ROWS_PER_FILE = 100_000_000
 # Fraction of FREE CUDA memory a multivector batch's whole token matrix may
 # occupy for the batch to be transferred to the device ONCE and sliced as
 # zero-copy views (see _process_batch_group), instead of one H2D per slice.
-# Conservative: the per-slice score matrix P (bounded by the token budget),
+# Conservative: the per-slice score matrix P (bounded by multivector_budget_mib),
 # metric copies, and the running top-k state share the same pool.
 _MV_RESIDENT_FREE_FRACTION = 0.5
 
@@ -671,7 +671,7 @@ def load_queries_multivector(
     token vectors into one flat `(total_query_tokens, D)` matrix plus a
     length-`n_q+1` token-offset array (`doc_offsets` semantics, query side).
     Queries are few, so holding every query token on the GPU at once is cheap;
-    the query axis is tiled at SCORE time (`multivector_query_block`), not
+    the query axis is tiled at SCORE time (derived from `multivector_budget_mib`), not
     here. Returns `(flat_tokens, q_offsets, ids, payload, filter_vals)`."""
     cols = [qcfg.multivector_column]
     if qcfg.id_column:
@@ -2192,8 +2192,10 @@ class MultiVectorBatchSlice:
                 logger.warning(
                     "multivector: a %s similarity tile overflows the fused "
                     "reducer's int32 pointer arithmetic; using the torch "
-                    "reference for this query block. Lower "
-                    "params.multivector_token_budget to keep the fast path.",
+                    "reference for this query block. Lowering "
+                    "params.multivector_budget_mib shrinks query tiles and "
+                    "slices; a single document over the budget always takes "
+                    "this path.",
                     tuple(P.shape),
                 )
                 col_doc = torch.repeat_interleave(
@@ -2433,8 +2435,8 @@ def _trim_mask(keys, ext_key):
 
 def _sample_mean_doc_tokens(store: Store, mine: list, column: str) -> float:
     """Mean tokens-per-doc from this worker's FIRST corpus file (a metadata-
-    cheap, single-file read) — used only to derive multivector tile sizes from
-    `multivector_token_budget`. Returns 1.0 if the worker has no files or the
+    cheap, single-file read) — used only to derive the multivector tile shape
+    from `multivector_budget_mib`. Returns 1.0 if the worker has no files or the
     sample is empty (a safe floor: it just makes the derived doc-tile larger)."""
     if not mine:
         return 1.0
@@ -2445,37 +2447,62 @@ def _sample_mean_doc_tokens(store: Store, mine: list, column: str) -> float:
     return total / n if n > 0 and total > 0 else 1.0
 
 
+# The fused MaxSim reducer's int32 limit and tile padding, mirrored from
+# `multivector_kernels` (`_INT32_MAX` and `offsets_fit_int32`'s
+# `block_query`/`block_document` defaults). That module imports Triton, so it
+# cannot be imported here for CPU-only installs; a test pins the two copies
+# together.
+_MV_INT32_MAX = (1 << 31) - 1
+_MV_KERNEL_BLOCK_QUERY = 8
+_MV_KERNEL_BLOCK_DOCUMENT = 128
+_MV_FP32_BYTES = 4
+
+
+def _multivector_budget_elements(budget_mib: float) -> int:
+    """`params.multivector_budget_mib` -> element budget for one fp32 score
+    block `(block_query_tokens x slice_doc_tokens)`.
+
+    `int(mib * 2**20 / 4)`, floored at 1 (a sub-element budget still has to
+    make progress) and capped at the fused reducer's int32 limit: the default
+    8192 MiB is exactly 2**31 elements, one past `_INT32_MAX`. The cap alone
+    does not keep a full tile inside the kernel's guard — the guard also
+    counts tile padding — which `_mv_max_doc_tokens` handles per slice."""
+    elements = int(budget_mib * (1 << 20) / _MV_FP32_BYTES)
+    return max(1, min(elements, _MV_INT32_MAX))
+
+
+def _mv_max_doc_tokens(budget_elements: int, max_query_tokens: int) -> int:
+    """Limit document tokens per slice to fit the memory budget and int32
+    indexing limits, including kernel padding. Use the same limit across
+    kernels to keep work partitioning consistent. Oversized documents
+    are scored alone."""
+
+    q = max(1, max_query_tokens)
+    by_budget = budget_elements // q
+    by_int32 = (_MV_INT32_MAX - _MV_KERNEL_BLOCK_DOCUMENT) // (q + _MV_KERNEL_BLOCK_QUERY + 1)
+    return max(1, min(by_budget, by_int32))
+
+
 def _resolve_multivector_tiles(
-    budget: int, mean_q_tokens: float, mean_doc_tokens: float,
-    configured_bs: int | None, configured_qb: int | None,
-) -> tuple[int | None, int | None]:
-    """Derive `(multivector_batch_size, multivector_query_block)` from a target
-    peak element count for the per-slice score matrix `P = (block_query_tokens
-    × slice_doc_tokens)`. Split geometrically — aim each axis near
-    `sqrt(budget)` elements — then convert tokens back to items via the two
-    means. An explicitly-configured knob is passed through untouched; only a
-    `None` knob is filled in. Every derived value is floored at 1 (a
-    zero/negative tile would empty the batch loop)."""
+    budget_elements: int, mean_q_tokens: float, mean_doc_tokens: float,
+) -> tuple[int, int]:
+    
+    """Choose document and query tile sizes by splitting the score budget
+    evenly across both token dimensions. Use average token counts to estimate
+    item limits, then enforce actual token counts during scoring."""
     import math
 
-    axis = math.sqrt(max(1, budget))
-    bs = configured_bs if configured_bs is not None else max(1, int(axis / max(1e-9, mean_doc_tokens)))
-    qb = configured_qb if configured_qb is not None else max(1, int(axis / max(1e-9, mean_q_tokens)))
-    return bs, qb
+    axis = math.sqrt(max(1, budget_elements))
+    docs = max(1, int(axis / max(1e-9, mean_doc_tokens)))
+    queries = max(1, int(axis / max(1e-9, mean_q_tokens)))
+    return docs, queries
 
 
 def _resolve_vt_batch_size(configured: int | None, k_floor: int, vt: str,
                            device=None) -> int | None:
-    """Preserve the configured batch size, even when below the largest k
-    for this vector type. All searches share a batch grid, so increasing it
-    could exceed another search's memory budget. Warn about extra top-K
-    merge rounds instead.
-
-    Also warn when batches exceed Triton's MAX_BLOCK, forcing slower
-    portable selection (~4x). Suppress warnings when the kernel is
-    unavailable or k_floor > MAX_BLOCK; use INFO for unbounded batches.
-    Multivector uses a separate token-based batch budget.
-    """
+    """Keep the configured batch size to respect all searches' memory budgets.
+    Warn if small batches require extra top-k merges or large batches require
+    slower selection. Multivector token budgets are enforced separately."""
     on_cuda = device is None or getattr(device, "type", str(device)) == "cuda"
     if (vt in ("dense", "sparse") and on_cuda and k_floor <= topk_triton.MAX_BLOCK
             and topk_triton.kernel_may_apply()):
@@ -2497,6 +2524,15 @@ def _resolve_vt_batch_size(configured: int | None, k_floor: int, vt: str,
                 vt, topk_triton.MAX_BLOCK, vt, topk_triton.MAX_BLOCK,
             )
     if configured is None or configured >= k_floor:
+        return configured
+    if vt == "multivector":
+        logger.info(
+            "multivector: %d documents per slice (derived from "
+            "params.multivector_budget_mib) is below k=%d, so each search's "
+            "top-K fills over several slices' merges; expected for MaxSim, "
+            "results are unaffected.",
+            configured, k_floor,
+        )
         return configured
     logger.warning(
         "params.%s_batch_size=%d is below k=%d, the largest among searches "
@@ -4792,7 +4828,7 @@ def _process_batch_group(
     encoded_row_ids: np.ndarray | None = None,
     ordinal_base: int = 0,
     ordinal_row_ids: np.ndarray | None = None,
-    multivector_token_budget: int | None = None,
+    multivector_budget_elements: int | None = None,
     multivector_double_buffer: bool = False,
     two_pass: bool = True,
     mv_prune=None,
@@ -4822,12 +4858,12 @@ def _process_batch_group(
     # two-pass, exactly as it did under whole-file slices.
     step = min(batch_size, n_rows) if batch_size else n_rows
     max_doc_tokens = None
-    if isinstance(batch, MultiVectorCorpusBatch) and multivector_token_budget is not None:
+    if isinstance(batch, MultiVectorCorpusBatch) and multivector_budget_elements is not None:
         # Size document slices against the largest query-token block.
         max_query_tokens = max(
             1, max(spec_Q[m].max_block_tokens for m in member_idxs)
         )
-        max_doc_tokens = max(1, multivector_token_budget // max_query_tokens)
+        max_doc_tokens = _mv_max_doc_tokens(multivector_budget_elements, max_query_tokens)
     if isinstance(batch, MultiVectorCorpusBatch):
         ranges = _ragged_batch_ranges(batch.doc_offsets, step, max_doc_tokens)
     else:
@@ -5902,7 +5938,7 @@ def _process_shared_batch(
     encoded_row_ids: np.ndarray | None = None,
     ordinal_base: int = 0,
     ordinal_row_ids: np.ndarray | None = None,
-    multivector_token_budget: int | None = None,
+    multivector_budget_elements: int | None = None,
     multivector_double_buffer: bool = False,
     two_pass: bool = True,
     mv_prune=None,
@@ -5992,7 +6028,7 @@ def _process_shared_batch(
         slice_filters=slice_filters,
         encoded_row_ids=encoded_row_ids,
         ordinal_base=ordinal_base, ordinal_row_ids=ordinal_row_ids,
-        multivector_token_budget=multivector_token_budget,
+        multivector_budget_elements=multivector_budget_elements,
         multivector_double_buffer=multivector_double_buffer,
         two_pass=two_pass, mv_prune=mv_prune,
         spec_qsel=spec_qsel, spec_qrows=spec_qrows,
@@ -6356,6 +6392,8 @@ def run_compute(
     device = _select_device(torch)
     if device == "cpu":
         logger.warning("No GPU detected — brute force on CPU will be slow.")
+    # Reject duplicate CUDA libraries unless explicitly allowed.
+    run_manifest.refuse_duplicate_cuda_libraries(device)
     if "multivector" in vts_needed and cfg.params.multivector_kernel != "torch":
         if device != "cuda":
             if cfg.params.multivector_kernel == "triton_reduce":
@@ -6545,45 +6583,32 @@ def run_compute(
         )
         mine = mine[:max_files]
 
-    # Multivector tile sizes: resolve the two knobs once. When
-    # `multivector_token_budget` is set it fills in whichever of
-    # `multivector_batch_size`/`multivector_query_block` was left None (an
-    # explicit knob always wins), deriving from the mean tokens-per-query (from
-    # the loaded queries) and mean tokens-per-doc (sampled cheaply from this
-    # worker's first corpus file). See `_resolve_multivector_tiles`.
-    mv_batch_size = cfg.params.multivector_batch_size
-    mv_query_block = cfg.params.multivector_query_block
-    if "multivector" in vts_needed and cfg.params.multivector_token_budget is not None:
-        if mv_batch_size is None or mv_query_block is None:
-            mean_q_tok = float(mv_q_offsets[-1]) / max(1, n_q) if n_q else 1.0
-            mean_doc_tok = _sample_mean_doc_tokens(
-                cstore, mine, cfg.corpus.multivector_column
-            )
-            mv_batch_size, mv_query_block = _resolve_multivector_tiles(
-                cfg.params.multivector_token_budget,
-                mean_q_tok,
-                mean_doc_tok,
-                mv_batch_size,
-                mv_query_block,
-            )
-            logger.info(
-                "multivector token_budget=%d derived batch_size=%s query_block=%s "
-                "(mean tokens/query=%.1f, tokens/doc=%.1f); actual ragged offsets "
-                "enforce the budget at scoring time",
-                cfg.params.multivector_token_budget,
-                mv_batch_size,
-                mv_query_block,
-                mean_q_tok,
-                mean_doc_tok,
-            )
-        else:
-            logger.info(
-                "multivector token_budget=%d enforces an actual ragged token-product "
-                "cap within batch_size=%d query_block=%d",
-                cfg.params.multivector_token_budget,
-                mv_batch_size,
-                mv_query_block,
-            )
+    # Estimate multivector tile sizes from the memory budget and average
+    # tokens per query and document. Enforce the actual token budget during scoring.
+    mv_budget_elements = None
+    mv_docs_per_slice = None
+    mv_queries_per_tile = None
+    if "multivector" in vts_needed:
+        mv_budget_elements = _multivector_budget_elements(cfg.params.multivector_budget_mib)
+        mean_q_tok = float(mv_q_offsets[-1]) / max(1, n_q) if n_q else 1.0
+        mean_doc_tok = _sample_mean_doc_tokens(
+            cstore, mine, cfg.corpus.multivector_column
+        )
+        mv_docs_per_slice, mv_queries_per_tile = _resolve_multivector_tiles(
+            mv_budget_elements, mean_q_tok, mean_doc_tok,
+        )
+        logger.info(
+            "multivector budget=%g MiB (%d fp32 score elements) derived "
+            "docs_per_slice=%d queries_per_tile=%d (mean tokens/query=%.1f, "
+            "tokens/doc=%.1f); actual ragged offsets enforce the budget at "
+            "scoring time",
+            cfg.params.multivector_budget_mib,
+            mv_budget_elements,
+            mv_docs_per_slice,
+            mv_queries_per_tile,
+            mean_q_tok,
+            mean_doc_tok,
+        )
 
     # 3. per-spec GPU state: each spec gets its own running (top_scores, top_enc)
     #    pair, but every spec of the same vector_type shares ONE raw query
@@ -6603,7 +6628,7 @@ def run_compute(
             off_cpu = np.ascontiguousarray(mv_q_offsets, dtype=np.int64)
             Q_gpu_by_vt[vt] = MultiVectorQuery(
                 flat, torch.tensor(off_cpu, dtype=torch.int64, device=device),
-                off_cpu, n_q, mv_query_block, cfg.params.multivector_kernel,
+                off_cpu, n_q, mv_queries_per_tile, cfg.params.multivector_kernel,
             )
         else:
             Q_gpu_by_vt[vt] = flat
@@ -7087,7 +7112,7 @@ def run_compute(
     vt_configured_batch = {
         "dense": cfg.params.dense_batch_size,
         "sparse": cfg.params.sparse_batch_size,
-        "multivector": mv_batch_size,  # already merged with the token-budget derivation
+        "multivector": mv_docs_per_slice,  # derived from multivector_budget_mib
     }
     has_baseline: dict[str, bool] = {}
     vt_batch_size: dict[str, int | None] = {}
@@ -7821,8 +7846,8 @@ def run_compute(
                 encoded_row_ids=encoded_ids, ordinal_row_ids=ordinal_ids,
                 spec_qsel=spec_qsel, spec_qrows=spec_qrows, filter_n_q=filter_n_q,
                 spec_cos_scale=spec_cos_scale,
-                multivector_token_budget=(
-                    cfg.params.multivector_token_budget if vt == "multivector" else None
+                multivector_budget_elements=(
+                    mv_budget_elements if vt == "multivector" else None
                 ),
                 multivector_double_buffer=(
                     cfg.params.multivector_double_buffer if vt == "multivector" else False
@@ -7927,8 +7952,8 @@ def run_compute(
                             ),
                             spec_qsel=spec_qsel, spec_qrows=spec_qrows,
                             filter_n_q=filter_n_q, spec_cos_scale=spec_cos_scale,
-                            multivector_token_budget=(
-                                cfg.params.multivector_token_budget
+                            multivector_budget_elements=(
+                                mv_budget_elements
                                 if vt == "multivector"
                                 else None
                             ),
@@ -8093,6 +8118,10 @@ def run_compute(
                 finally:
                     _close_resident_pools()
 
+    # Wait for GPU work to finish so search timing includes execution,
+    # not just kernel launches. The final sort would wait anyway.
+    if str(getattr(device, "type", device)).startswith("cuda") and torch.cuda.is_available():
+        torch.cuda.synchronize()
     wall = time.perf_counter() - wall0
     gb = bytes_seen / 1e9
     wall_mbps = bytes_seen / 1e6 / max(wall, 1e-9)         # effective aggregate S3 throughput
@@ -8530,6 +8559,16 @@ def run_compute(
     finally:
         write_pool.shutdown(wait=True, cancel_futures=True)
 
+    # The comparable figure as a log line too (the manifest's
+    # `timing.search_seconds`), for scripts that read the log rather than the
+    # manifest (which may live on S3): reads + filters + scoring + top-K
+    # through the sorted top-K on the host; query load, setup and result
+    # writing excluded, as in a streaming baseline's timed pass.
+    logger.info(
+        "bf-bench-search search_s=%.2f scan_s=%.2f result_sort_s=%.3f",
+        wall + result_sort_secs, wall, result_sort_secs,
+    )
+
     # The run manifest — written LAST, so it only ever describes outputs that
     # actually landed, and best-effort, so it cannot fail a run that produced
     # them (see manifest.py).
@@ -8543,6 +8582,13 @@ def run_compute(
     doc = run_manifest.base_manifest(cfg, "compute", device=device)
     doc["compute"].update(run_manifest.gpu_peak(device))
     doc["compute"].update(run_manifest.host_peak())
+    doc["compute"].update(run_manifest.loaded_cuda_libraries(device))
+    if doc["compute"].get("cuda_library_duplicates"):
+        # mapped lazily, after the start-of-run refusal: the outputs have landed,
+        # so recorded (every copy in the manifest), not raised
+        logger.error("two copies of a CUDA library were mapped during the run: %s "
+                     "(see the manifest's compute.cuda_library_duplicates)",
+                     sorted(doc["compute"]["cuda_library_duplicates"]))
     if "sparse" in vts_needed:
         doc["params"]["sparse_branches"] = dict(_SPARSE_BRANCHES)
     # Which corpus, as an ordered file list — the ids depend on that order.
@@ -8552,16 +8598,20 @@ def run_compute(
     doc["source"]["corpus"]["fingerprint"] = corpus_fp
     # `params` records what RAN, so the CLI overrides and the sizes resolved at
     # runtime replace the configured values (which are `null` whenever a knob
-    # was left to be derived — see `_resolve_vt_batch_size` and the
-    # multivector token-budget derivation).
+    # was left to be derived — see `_resolve_vt_batch_size`); the multivector
+    # tile shape is always derived from `multivector_budget_mib`.
     doc["params"].update({
         "io_workers": io_workers,
         "io_thread_count": itc,
         # RESOLVED, not configured
         "cpu_thread_count": cpu_n,
         "batch_size_by_vector_type": vt_batch_size,
-        "multivector_batch_size": mv_batch_size,
-        "multivector_query_block": mv_query_block,
+        # Multivector: the configured MiB is recorded with `params` above;
+        # these are what it RESOLVED to (all null without a multivector
+        # search). Docs/queries are the even split's item caps, not settings.
+        "multivector_budget_elements": mv_budget_elements,
+        "multivector_derived_docs_per_slice": mv_docs_per_slice,
+        "multivector_derived_queries_per_tile": mv_queries_per_tile,
         # Dense H2D policy and actual use: 0 is pageable, 2 uses pinned memory
         # with one-slice copy-stream overlap. `prefetch_inline` records
         # NOVA_BF_PREFETCH_INLINE: mode-2 staging on the GPU-feeding thread

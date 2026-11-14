@@ -51,6 +51,9 @@ pytest.importorskip("torch")
 
 from . import compare, layouts, reach
 from .devices import has_cuda, parity_devices
+from .runner import MV_23_DOCS_MIB
+
+import mv_tiles
 
 import os
 
@@ -118,7 +121,7 @@ def test_triton_maxsim_on_awkward_shapes_matches_the_oracle(prune, mv_ds, monkey
     `_fused_ragged_reduce_kernel` (a 1-token doc borrowing its neighbour's
     token), an empty doc not left at -inf (it would surface at 0.0 in the
     k=200 list), a query span cut at the block edge (the 40-token query), a
-    per-block `query_start` offset error (multivector_query_block=3)."""
+    per-block `query_start` offset error (3 queries per tile, pinned)."""
     from nova_bf import multivector_kernels as mk
 
     calls = {"n": 0}
@@ -132,9 +135,8 @@ def test_triton_maxsim_on_awkward_shapes_matches_the_oracle(prune, mv_ds, monkey
     with reach.LineRecorder(f"triton_maxsim[{prune}]") as rec:
         hits = layouts.run(mv_ds, _mv_specs(), tag=f"gpu_triton_{prune}", device=DEV,
                            params={"multivector_kernel": "torch" if DRYRUN else "triton_reduce",
-                                   "multivector_prune": prune,
-                                   "multivector_batch_size": 5,
-                                   "multivector_query_block": 3})
+                                   "multivector_prune": prune},
+                           mv_tiles=(5, 3))
     gpu_check(calls["n"] > 0, "triton_reduce never launched — every block declined")
     require(rec, "multivector_kernels.py", "_fused_ragged_reduce_kernel[",
                 "the Triton reducer must have been launched")
@@ -156,8 +158,8 @@ def test_mv_fp16_prune_on_awkward_shapes_matches_the_oracle(kernel, mv_ds):
                        device=DEV,
                        params={"multivector_kernel": "torch" if DRYRUN else kernel,
                                "multivector_prune": "fp16",
-                               "multivector_min_prune_rate": 0.0,
-                               "multivector_batch_size": 5})
+                               "multivector_min_prune_rate": 0.0},
+                       mv_tiles=(5, 10**6))
     st = dict(compute_mod._MV_PRUNE)
     gpu_check(st["calls"] > 0 and st["pruned"] > 0, f"the fp16 prune never pruned: {st}")
     _assert_mv_vs_naive(mv_ds, hits, f"[cuda] mv fp16 prune {kernel}", k_small=3)
@@ -171,7 +173,7 @@ def test_mv_device_residency_matches_the_oracle(mv_ds):
     with 5-doc slices over the 1/230/260-token docs that moves real hits."""
     with reach.LineRecorder("mv_residency") as rec:
         hits = layouts.run(mv_ds, _mv_specs(), tag="gpu_mvres", device=DEV,
-                           params={"multivector_batch_size": 5, "multivector_prune": "off"})
+                           params={"multivector_prune": "off"}, mv_tiles=(5, 10**6))
     require(rec, "compute.py", "flat_gpu = torch.from_numpy(batch.flat_tokens).to(device)",
                 "residency declined (free VRAM?) — the slice loop ran instead")
     _assert_mv_vs_naive(mv_ds, hits, "[cuda] mv residency")
@@ -188,7 +190,8 @@ def test_mv_double_buffer_ring_matches_the_oracle(mv_ds):
     with reach.LineRecorder("mv_double_buffer") as rec:
         hits = layouts.run(mv_ds, _mv_specs(), tag="gpu_mvdb", device=DEV,
                            params={"multivector_double_buffer": True,
-                                   "multivector_batch_size": 3, "multivector_prune": "off"})
+                                   "multivector_prune": "off"},
+                           mv_tiles=(3, 10**6))
     require(rec, "compute.py", "stage_tokens = max(", "the double-buffer ring did not run")
     forbid(rec, "compute.py", "flat_gpu = torch.from_numpy(batch.flat_tokens).to(device)",
                "residency must not replace the ring when double buffering is requested")
@@ -464,7 +467,7 @@ def test_resident_text_windows_on_device_match_the_oracle(ds, oracle, monkeypatc
     monkeypatch.setattr(compute_mod, "_RESIDENT_WINDOW_MAX_BYTES", 16)
     hits, present = _combo_run(ds, "gpu_resident",
                                {"dense_batch_size": 37, "sparse_batch_size": 29,
-                                "multivector_batch_size": 23})
+                                "multivector_budget_mib": MV_23_DOCS_MIB})
     u = filters.combo_usage()
     from .corpus import FILE_SIZES
     n_files = len(FILE_SIZES)
@@ -495,7 +498,7 @@ def test_budget_fallback_on_device_matches_the_oracle(ds, oracle):
 
 
 def test_reach_recorder_sees_a_path_that_ran(tmp_path_factory):
-    """On CPU: a 3-doc multivector run with a token budget MUST execute the
+    """On CPU: a 3-doc multivector run (every multivector run is budgeted) MUST execute the
     budgeted branch of `_ragged_batch_ranges`; the recorder must see it, and
     must NOT see a CUDA-only line. If this fails the GPU requirements above
     are meaningless."""
@@ -504,9 +507,9 @@ def test_reach_recorder_sees_a_path_that_ran(tmp_path_factory):
     ds = _build(tmp_path_factory.mktemp("reach_self"))
     with reach.LineRecorder("self-test") as rec:
         layouts.run(ds, _mv_specs(), tag="reach_self", device="cpu",
-                    params={"multivector_token_budget": 64})
+                    params={"multivector_budget_mib": mv_tiles.mib(64)})
     rec.require("compute.py", "token_cap_row = int(np.searchsorted(offsets, token_cap",
-                "the budgeted range split must run under multivector_token_budget")
+                "the budgeted range split must run under multivector_budget_mib")
     rec.forbid("compute.py", "stage_tokens = max(", "CUDA-only ring on a CPU run")
     with pytest.raises(AssertionError, match="did NOT run"):
         rec.require("compute.py", "stage_tokens = max(")

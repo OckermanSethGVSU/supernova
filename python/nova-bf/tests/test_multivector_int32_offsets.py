@@ -19,27 +19,87 @@ import pytest
 from nova_bf.multivector_kernels import _INT32_MAX, offsets_fit_int32
 
 
-# The shipped multivector config at the time of writing.
-_BUDGET = 170_000_000
+# The shipped multivector configs' budget (configs/brute_force/pubmed_bge_m3_*),
+# and the most query tokens one query tile can hold that these tests consider.
+_SHIPPED_MIB = 648.5
 _QUERY_BLOCK = 256
 
 
-def test_the_shipped_config_is_accepted():
-    """A false decline is a silent slowdown nothing would report, so the shape
-    the repo's own multivector config produces has to stay on the fast path.
+def _doc_tokens_for(budget_mib: float, q_tokens: int) -> int:
+    from nova_bf.compute import _multivector_budget_elements, _mv_max_doc_tokens
 
-    `multivector_token_budget` bounds `P`'s element count, so the worst tile is
-    about the budget itself, however the two tile sizes are derived from it."""
-    for q_tokens in (256, 4096, 32_768):
-        d_tokens = max(1, _BUDGET // q_tokens)
-        assert offsets_fit_int32(q_tokens, d_tokens, _QUERY_BLOCK, 1000, 1000), (
-            f"budget={_BUDGET} split as {q_tokens}x{d_tokens} must be accepted"
-        )
+    return _mv_max_doc_tokens(_multivector_budget_elements(budget_mib), q_tokens)
+
+
+def test_the_compute_side_mirror_of_the_guard_constants_is_exact():
+    """compute.py cannot import this module (it imports Triton), so it keeps
+    its own copy of the int32 limit and the guard's tile padding. A drift
+    would silently re-open the fallback the copy exists to avoid."""
+    import inspect
+
+    from nova_bf import compute
+
+    params = inspect.signature(offsets_fit_int32).parameters
+    assert compute._MV_INT32_MAX == _INT32_MAX
+    assert compute._MV_KERNEL_BLOCK_QUERY == params["block_query"].default
+    assert compute._MV_KERNEL_BLOCK_DOCUMENT == params["block_document"].default
+
+
+@pytest.mark.parametrize("budget_mib", [_SHIPPED_MIB, 8192.0, 10**6])
+@pytest.mark.parametrize("q_tokens", [1, 8, 256, 4096, 32_768, 46_341, 1_000_000])
+def test_a_budget_tile_is_accepted(budget_mib, q_tokens):
+    """A false decline is a silent slowdown nothing would report, so a tile the
+    budget itself produces has to stay on the fast path — at the shipped
+    budget, at the 8192 MiB default (exactly 2**31 elements, capped to
+    `_INT32_MAX`), and far past it. Whatever the query tile's token count,
+    the slice's doc tokens are sized so the PADDED tile still fits."""
+    d_tokens = _doc_tokens_for(budget_mib, q_tokens)
+    assert offsets_fit_int32(q_tokens, d_tokens, _QUERY_BLOCK, 1000, 1000), (
+        f"budget={budget_mib} MiB split as {q_tokens}x{d_tokens} must be accepted"
+    )
+
+
+def test_the_default_budget_is_capped_and_its_padding_is_charged():
+    """8192 MiB is 2**31 elements, one past int32: the cap brings it to
+    `_INT32_MAX`. Even then a full tile `q * (E // q)` would sit within a few
+    elements of the limit and be declined by its padding alone — which is why
+    the doc-token bound also charges the guard's padding, and why that bound
+    is tight (one more doc token would be declined)."""
+    from nova_bf.compute import _multivector_budget_elements
+
+    assert int(8192 * 2**20 / 4) == 2**31 == _INT32_MAX + 1
+    elements = _multivector_budget_elements(8192)
+    assert elements == _INT32_MAX
+    for q_tokens in (256, 4096, 46_341):
+        naive = elements // q_tokens
+        assert not offsets_fit_int32(q_tokens, naive, 1, 1, 1), (
+            "the budget alone would push a full default tile onto the fallback")
+        d_tokens = _doc_tokens_for(8192, q_tokens)
+        assert d_tokens < naive
+        assert offsets_fit_int32(q_tokens, d_tokens, 1, 1, 1)
+        assert not offsets_fit_int32(q_tokens, d_tokens + 1, 1, 1, 1)
+
+
+def test_the_derived_item_caps_keep_the_output_term_inside_int32():
+    """The guard's other term indexes `out` by whole queries x documents. The
+    even split's item caps multiply to at most `elements / (mean_q * mean_d)`,
+    so with at least one token per item on average it stays within the
+    element budget. (Below one token per item on average — a corpus or query
+    set dominated by zero-token rows — the item caps can exceed it; that case
+    is not covered by the budget and a slice can then take the fallback.)"""
+    from nova_bf.compute import _multivector_budget_elements, _resolve_multivector_tiles
+
+    elements = _multivector_budget_elements(8192)
+    for mean_q, mean_d in ((1.0, 1.0), (32.0, 1.0), (1.0, 200.0), (32.0, 180.0)):
+        docs, queries = _resolve_multivector_tiles(elements, mean_q, mean_d)
+        assert offsets_fit_int32(8, 8, queries, docs, docs), (mean_q, mean_d)
 
 
 def test_a_tile_past_int32_is_declined():
     """The failure this exists for: `P` past 2**31 - 1 ELEMENTS — 8.6 GB of
-    float32, which is one `multivector_token_budget` bump away on a large card.
+    float32, about the default `multivector_budget_mib` (8192). A single
+    document longer than the budget is still scored alone, so such a tile can
+    still reach the kernel and must be declined.
     """
     # ~2.15e9 elements: just over the line.
     assert not offsets_fit_int32(65_536, 32_768, 256, 1000, 1000)

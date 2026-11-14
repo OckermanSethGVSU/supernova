@@ -32,7 +32,7 @@ import pytest
 
 from . import compare, naive, qdrant_ref
 from .cases import FILTERS, K
-from .runner import run, spec
+from .runner import MV_23_DOCS_MIB, run, spec
 from .test_parity_matrix import _filter_from_dict
 
 VECTOR_TYPES = ("dense", "sparse", "multivector")
@@ -85,7 +85,7 @@ def test_every_search_survives_every_combination(subset, regime, ds, oracle, dev
     got = run(ds, [s for *_, s in entries],
               out_tag=f"combo_{'_'.join(subset)}_{regime}", device=device,
               params={"dense_batch_size": 37, "sparse_batch_size": 29,
-                      "multivector_batch_size": 23})
+                      "multivector_budget_mib": MV_23_DOCS_MIB})
     for vt, metric, fname, s in entries:
         want = oracle.topk(vector_type=vt, metric=metric, k=K,
                            filt=_filter_from_dict(ds, FILTERS[fname] if fname else None))
@@ -105,7 +105,7 @@ def test_every_combination_still_agrees_with_qdrant(
     got = run(ds, [s for *_, s in entries],
               out_tag=f"comboq_{'_'.join(subset)}_{regime}", device=device,
               params={"dense_batch_size": 37, "sparse_batch_size": 29,
-                      "multivector_batch_size": 23})
+                      "multivector_budget_mib": MV_23_DOCS_MIB})
     for vt, metric, fname, s in entries:
         want = qdrant_ref.topk(
             client, collection, ds, vector_type=vt, metric=metric, k=K,

@@ -212,8 +212,8 @@ def fused_ragged_maxsim_reduce(
         raise ValueError(
             f"fused ragged reduction: a {tuple(similarity.shape)} similarity "
             f"tile makes the kernel's int32 pointer arithmetic overflow "
-            f"(> {_INT32_MAX} elements). Lower params.multivector_token_budget "
-            "(it sizes this matrix directly), or set params.multivector_kernel="
+            f"(> {_INT32_MAX} elements). Lower params.multivector_budget_mib "
+            "(it sizes this matrix), or set params.multivector_kernel="
             "'torch', whose reference path has no such limit."
         )
 

@@ -38,6 +38,8 @@ from qdrant_client import QdrantClient, models
 from nova_bf.compute import run_compute
 from nova_bf.config import load_config
 
+import mv_tiles
+
 QDRANT_URL = os.environ.get("QDRANT_URL", "http://localhost:6333")
 DIM = 16
 M = 400        # corpus points
@@ -136,8 +138,6 @@ output:
   path: {out}
 params:
   io_workers: 2
-  multivector_batch_size: 128
-  multivector_query_block: 4
 searches:
   - name: mv
     k: {K}
@@ -146,7 +146,10 @@ searches:
 """
     p = data["tmp"] / f"cfg_{metric}.yaml"
     p.write_text(cfg_text)
-    t = pq.read_table(run_compute(load_config(str(p)))["mv"]).to_pydict()
+    # 128 docs per slice x 4 queries per tile, pinned (test-only) so the
+    # parity check runs over several tiles on both axes.
+    with mv_tiles.pinned((128, 4)):
+        t = pq.read_table(run_compute(load_config(str(p)))["mv"]).to_pydict()
     return {int(q): {int(i): float(s) for i, s in zip(hi, hs)}
             for q, hi, hs in zip(t["query_id"], t["hit_ids"], t["hit_scores"])}
 

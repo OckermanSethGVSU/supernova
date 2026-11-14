@@ -194,12 +194,15 @@ def build_config(ds: LayoutDS, specs: list[dict], *, tag: str,
 
 def run(ds: LayoutDS, specs: list[dict], *, tag: str, device: str | None = "cpu",
         params: dict | None = None, corpus: dict | None = None,
-        env: dict | None = None, raw_ids: bool = False):
+        env: dict | None = None, raw_ids: bool = False,
+        mv_tiles: tuple[int, int] | None = None):
     """`{search: {query_index: [(id, score), …]}}`, rank order kept.
 
     ids are ints (the global row, read back from the `rid` column every
     builder writes) unless `raw_ids`, which returns the strings nova-bf wrote —
-    what the md5-id tests need."""
+    what the md5-id tests need. `mv_tiles` pins the multivector tile shape
+    (see `runner.run`)."""
+    import mv_tiles as mv_tiles_mod
     from nova_bf.compute import run_compute
 
     from .runner import env as env_ctx
@@ -207,7 +210,7 @@ def run(ds: LayoutDS, specs: list[dict], *, tag: str, device: str | None = "cpu"
 
     cfg = build_config(ds, specs, tag=f"{tag}_{device or 'auto'}", params=params,
                        corpus=corpus)
-    with env_ctx(**(env or {})), pinned_device(device):
+    with env_ctx(**(env or {})), pinned_device(device), mv_tiles_mod.pinned(mv_tiles):
         paths = run_compute(cfg)
     out = {}
     for name, path in paths.items():

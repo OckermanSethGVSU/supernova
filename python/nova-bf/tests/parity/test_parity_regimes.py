@@ -41,13 +41,14 @@ from nova_bf.merge import run_merge
 from . import cases as cases_mod
 from . import compare, naive, qdrant_ref
 from .corpus import FILE_SIZES
-from .runner import build_config, pinned_device, probe, read_results, run, spec
+from .runner import (MV_23_DOCS_MIB, build_config, pinned_device, probe,
+                     read_results, run, spec)
 
 EDGE = {**cases_mod.EDGE_FILTERS, **cases_mod.UNFILTERED_EDGE_FILTERS}
 KS = cases_mod.EDGE_KS
 MODS = cases_mod.MODALITIES
 MATRIX_PARAMS = {"dense_batch_size": 37, "sparse_batch_size": 29,
-                 "multivector_batch_size": 23}
+                 "multivector_budget_mib": MV_23_DOCS_MIB}
 
 # arm -> (filters it runs, NOVA_BF_NO_GPU_COMBO set?)
 ARMS = {

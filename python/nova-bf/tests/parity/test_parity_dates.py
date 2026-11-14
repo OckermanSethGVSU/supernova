@@ -29,7 +29,7 @@ import pytest
 
 from . import cases as cases_mod
 from . import compare, corpus, naive, qdrant_ref
-from .runner import run, spec
+from .runner import MV_23_DOCS_MIB, run, spec
 
 DATES = cases_mod.DATE_FILTERS
 K = cases_mod.DATE_K
@@ -46,7 +46,7 @@ def date_run(ds, device):
              for f, fd in DATES.items() for vt, m in MODS]
     return run(ds, specs, out_tag="dates", device=device,
                params={"dense_batch_size": 37, "sparse_batch_size": 29,
-                       "multivector_batch_size": 23})
+                       "multivector_budget_mib": MV_23_DOCS_MIB})
 
 
 def _eligible(ds, fdict, query):

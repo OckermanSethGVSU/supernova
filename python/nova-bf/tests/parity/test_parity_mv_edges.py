@@ -9,7 +9,7 @@ decode + re-prefix-summed offsets) rather than the single-array path:
   * 1-token documents and a 1-token query (the segmented max over one
     element);
   * 230- and 260-token documents (a single doc larger than a whole slice's
-    token budget, which `multivector_token_budget` must process ALONE) and a
+    token budget, which `multivector_budget_mib` must process ALONE) and a
     40-token query;
   * a zero-norm token inside an otherwise normal document, a document made
     only of zero tokens, and a query containing a zero token — under cosine
@@ -19,8 +19,8 @@ decode + re-prefix-summed offsets) rather than the single-array path:
     file;
 
 each checked against the naive oracle and live Qdrant, under the knobs that
-change how the work is cut: tiny `multivector_batch_size` +
-`multivector_query_block`, a tiny `multivector_token_budget`,
+change how the work is cut: tiny pinned tiles (3 docs x 3 queries, test-only
+via `mv_tiles`), a tiny `multivector_budget_mib` (64 score elements),
 `multivector_double_buffer` (CUDA-only staging ring; on CPU it must be a
 no-op — on a GPU box this same test exercises the ring), and a static filter.
 `rows:` query subsets are REJECTED for multivector at config validation
@@ -37,6 +37,8 @@ import pyarrow.parquet as pq
 import pytest
 
 pytest.importorskip("torch")
+
+import mv_tiles
 
 import nova_bf.io as io_mod
 
@@ -117,14 +119,15 @@ STATIC = {"must": [{"field": "grp", "match": ["a", "c"]}]}
 EVEN = {"column": "query_set", "isin": ["even"]}
 ODD = {"column": "query_set", "isin": ["odd"]}
 
+# knob -> (params, pinned (docs_per_slice, queries_per_tile) or None)
 KNOBS = {
-    "default": {},
-    "tiny_tiles": {"multivector_batch_size": 3, "multivector_query_block": 3},
+    "default": ({}, None),
+    "tiny_tiles": ({}, (3, 3)),
     # Far below one long document's 230 x 40 token product, so the budget
     # must split the corpus axis per doc and process each long doc alone.
-    "token_budget": {"multivector_token_budget": 64},
-    "double_buffer": {"multivector_double_buffer": True, "multivector_batch_size": 5},
-    "prune_off": {"multivector_prune": "off", "multivector_batch_size": 5},
+    "token_budget": ({"multivector_budget_mib": mv_tiles.mib(64)}, None),
+    "double_buffer": ({"multivector_double_buffer": True}, (5, 10**6)),
+    "prune_off": ({"multivector_prune": "off"}, (5, 10**6)),
 }
 
 
@@ -143,11 +146,11 @@ def mv_runs(mv_ds, device):
             return real(chunks)
 
         mp.setattr(io_mod, "_stitch_ragged_chunks", spy)
-        for name, params in KNOBS.items():
+        for name, (params, tiles) in KNOBS.items():
             calls["stitch"] = 0
             specs = _specs() + _specs(filter=STATIC, tag="f")
             hits = layouts.run(mv_ds, specs, tag=f"mv_{name}", device=device,
-                               params=params)
+                               params=params, mv_tiles=tiles)
             out[name] = (hits, calls["stitch"])
     finally:
         mp.undo()

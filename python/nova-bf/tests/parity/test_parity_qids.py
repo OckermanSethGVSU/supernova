@@ -25,7 +25,8 @@ import pytest
 
 from . import cases as cases_mod
 from . import compare, corpus, naive, qdrant_ref
-from .runner import build_config, pinned_device, qid_index, read_results, run, spec
+from .runner import (MV_23_DOCS_MIB, build_config, pinned_device, qid_index,
+                     read_results, run, spec)
 from .test_parity_matrix import _filter_from_dict
 
 
@@ -53,7 +54,7 @@ IDS = [c.id for c in CASES]
 def qids_run(ds_qids, device):
     return run(ds_qids, [c.spec() for c in CASES], out_tag="qids", device=device,
                params={"dense_batch_size": 37, "sparse_batch_size": 29,
-                       "multivector_batch_size": 23})
+                       "multivector_budget_mib": MV_23_DOCS_MIB})
 
 
 def test_the_fixture_ids_are_not_positions(ds, ds_qids):

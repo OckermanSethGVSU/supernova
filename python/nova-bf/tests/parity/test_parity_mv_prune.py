@@ -50,10 +50,11 @@ MV_IDS = [f"{n}-{m}" for n, m in MV_CASES]
 PRUNE_PARAMS = {
     "multivector_prune": "fp16",
     "multivector_min_prune_rate": 0.0,
-    # Several slices per file, so the top-K fills and the threshold the prune
-    # works against is genuinely a running one.
-    "multivector_batch_size": 37,
 }
+# Several slices per file (37 docs each, pinned test-only via `mv_tiles`), so
+# the top-K fills and the threshold the prune works against is genuinely a
+# running one.
+PRUNE_TILES = (37, 10**6)
 
 
 @contextlib.contextmanager
@@ -118,7 +119,7 @@ def _specs():
 
 def _run(ds, tag, **extra):
     return runner.run(ds, _specs(), out_tag=tag, device="cuda",
-                      params=PRUNE_PARAMS | extra)
+                      params=PRUNE_PARAMS | extra, mv_tiles=PRUNE_TILES)
 
 
 def _pruned_fraction():
@@ -184,8 +185,8 @@ def test_pruning_changes_nothing_a_prune_disabled_run_returns(mv_ds, name, metri
     assert _pruned_fraction() > 0.01
     plain = runner.run(mv_ds, _specs(), out_tag=f"mvprune_off_{name}",
                        device="cuda",
-                       params={"multivector_prune": "off",
-                               "multivector_batch_size": 37})[name]
+                       params={"multivector_prune": "off"},
+                       mv_tiles=PRUNE_TILES)[name]
     for qi in range(len(mv_ds.queries)):
         compare.assert_scores_agree(
             pruned[qi], plain[qi], metric=metric,

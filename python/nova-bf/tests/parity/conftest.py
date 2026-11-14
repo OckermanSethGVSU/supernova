@@ -122,7 +122,7 @@ def matrix_run(ds, device):
         # filter's row compaction are all exercised rather than short-circuited
         # by a single whole-file batch.
         params={"dense_batch_size": 37, "sparse_batch_size": 29,
-                "multivector_batch_size": 23},
+                "multivector_budget_mib": runner.MV_23_DOCS_MIB},
     )
 
 

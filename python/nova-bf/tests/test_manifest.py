@@ -11,7 +11,9 @@ describes, and that the search-level detail survives from config to JSON.
 from __future__ import annotations
 
 import json
+import logging
 import os
+import re
 
 import numpy as np
 import pytest
@@ -191,13 +193,14 @@ def test_scan_failure_before_id_coordinator_starts(ds, tmp_path, monkeypatch):
     assert reads == []
 
 
-def test_single_node_manifest_describes_the_run(ds, tmp_path, monkeypatch):
+def test_single_node_manifest_describes_the_run(ds, tmp_path, monkeypatch, caplog):
     monkeypatch.delenv("NOVA_BF_PINNED", raising=False)
     monkeypatch.delenv("NOVA_BF_PREFETCH_INLINE", raising=False)
     out = tmp_path / "single"
     out.mkdir()
     cfg = _cfg(ds, out)
-    results = run_compute(cfg)
+    with caplog.at_level(logging.INFO, logger="nova_bf"):
+        results = run_compute(cfg)
 
     doc = _read(out / "_bf_manifest_queries_compute.json")
     assert doc["phase"] == "compute"
@@ -250,6 +253,18 @@ def test_single_node_manifest_describes_the_run(ds, tmp_path, monkeypatch):
     assert t["result_sort_seconds"] >= 0
     assert abs(t["search_seconds"] - (t["scan_seconds"] + t["result_sort_seconds"])) <= 0.011
     assert t["search_seconds"] <= t["elapsed_seconds"] + 0.011
+    # ...and the same figure is in the log, where benchmark scripts read it
+    # (coyo_parity/parity_summary.py, the filtered run.sh / realfile.sh): one
+    # line per run, after the bf-bench line, equal to the manifest's values
+    lines = [r.getMessage() for r in caplog.records
+             if r.getMessage().startswith(("bf-bench-search ", "bf-bench io_workers"))]
+    assert [x.split()[0] for x in lines] == ["bf-bench", "bf-bench-search"]
+    m = re.fullmatch(r"bf-bench-search search_s=([\d.]+) scan_s=([\d.]+) "
+                     r"result_sort_s=([\d.]+)", lines[1])
+    assert m, lines[1]
+    assert abs(float(m.group(1)) - t["search_seconds"]) <= 0.011
+    assert abs(float(m.group(2)) - t["scan_seconds"]) <= 0.011
+    assert abs(float(m.group(3)) - t["result_sort_seconds"]) <= 0.0011
 
     # Every search it computed, with the filter that defined it.
     by_name = {s["name"]: s for s in doc["searches"]}
@@ -394,6 +409,103 @@ def test_gpu_peak_is_empty_without_cuda():
     assert gpu_peak(None) == {}
 
 
+def _maps(paths):
+    """/proc/self/maps text mapping each of `paths` (fake addresses)."""
+    return "".join(f"7f00-7f01 r-xp 00000000 08:01 1 {p}\n" for p in paths)
+
+
+def _pip_cuda_lib(name):
+    """A real pip-wheel CUDA library file (torch's nvidia/ dir), or None."""
+    import glob
+    import site
+
+    hits = sorted(p for d in site.getsitepackages()
+                  for p in glob.glob(os.path.join(d, "nvidia", "cu*", "lib", name))
+                  + glob.glob(os.path.join(d, "nvidia", "*", "lib", name)))
+    return hits[0] if hits else None
+
+
+def test_loaded_cuda_libraries_names_each_copy_and_moves_two_copies_to_duplicates():
+    from nova_bf.manifest import loaded_cuda_libraries
+
+    got = loaded_cuda_libraries("cuda", _maps([
+        "/env/lib/libcublas.so.13.4.1.3", "/env/lib/libcublas.so.13.4.1.3",   # one file, 2 maps
+        "/env/lib/libcublasLt.so.13", "/site/nvidia/cu13/lib/libcublasLt.so.13",
+        "/site/nvidia/cu13/lib/libcurand.so.10", "/site/nvidia/cu13/lib/libnvJitLink.so.13",
+        "/site/nvidia/cu13/lib/libnvrtc-builtins.so.13.2",
+        "/env/lib/libcudart.so.13", "/env/lib/libtorch_cuda.so", "/env/lib/libcublas_fake.txt",
+        "/env/lib/libcusolverMg.so.12", "/env/lib/libcufftw.so.12",   # other libraries
+    ]))
+    # the fake files cannot be asked: version "" (never loaded, never raises)
+    assert got["cuda_libraries"] == {
+        "libcublas": {"path": "/env/lib/libcublas.so.13.4.1.3", "version": ""},
+        "libcudart": {"path": "/env/lib/libcudart.so.13", "version": ""},
+        "libcurand": {"path": "/site/nvidia/cu13/lib/libcurand.so.10", "version": ""},
+        "libnvJitLink": {"path": "/site/nvidia/cu13/lib/libnvJitLink.so.13", "version": ""},
+        "libnvrtc-builtins": {"path": "/site/nvidia/cu13/lib/libnvrtc-builtins.so.13.2",
+                              "version": ""},
+    }
+    # two copies: no single one can be named, so both go to the duplicates
+    assert got["cuda_library_duplicates"] == {"libcublasLt": [
+        {"path": "/env/lib/libcublasLt.so.13", "version": ""},
+        {"path": "/site/nvidia/cu13/lib/libcublasLt.so.13", "version": ""}]}
+    assert got["cublas_version"] == ""
+
+
+def test_loaded_cuda_libraries_is_empty_unless_the_run_used_cuda():
+    from nova_bf.manifest import loaded_cuda_libraries
+
+    # a CPU run still maps the libraries (import torch) but never used them
+    maps = _maps(["/site/nvidia/cu13/lib/libcublas.so.13", "/site/nvidia/cu13/lib/libcudart.so.13"])
+    assert loaded_cuda_libraries("cpu", maps) == {}
+    assert loaded_cuda_libraries(None, maps) == {}
+    # a CUDA run with nothing mapped (or no /proc): the empty record, not {}
+    empty = {"cuda_libraries": {}, "cuda_library_duplicates": {}, "cublas_version": ""}
+    assert loaded_cuda_libraries("cuda", _maps(["/usr/lib/libc.so.6"])) == empty
+    assert loaded_cuda_libraries("cuda:0", _maps([])) == empty
+
+
+def test_loaded_cuda_libraries_reads_each_real_version():
+    """With torch's pip wheels on disk, each mapped copy reports its own
+    version (no GPU needed): cuBLAS / cuRAND MAJOR.MINOR.PATCH, the CUDA
+    runtime MAJOR.MINOR."""
+    import ctypes
+
+    from nova_bf.manifest import loaded_cuda_libraries
+
+    paths = [_pip_cuda_lib("libcublasLt.so.*[0-9]"), _pip_cuda_lib("libcublas.so.*[0-9]"),
+             _pip_cuda_lib("libcudart.so.*[0-9]"), _pip_cuda_lib("libcurand.so.*[0-9]")]
+    if None in paths:
+        pytest.skip("no pip CUDA wheels in this environment")
+    for p in paths:
+        ctypes.CDLL(p)   # this test maps them itself (already mapped: a no-op)
+    got = loaded_cuda_libraries("cuda")   # the REAL /proc/self/maps
+    if got["cuda_library_duplicates"]:
+        pytest.skip(f"this test process maps two copies: {got['cuda_library_duplicates']}")
+    libs = got["cuda_libraries"]
+    assert re.fullmatch(r"\d+\.\d+\.\d+", got["cublas_version"]), got
+    assert got["cublas_version"] == libs["libcublas"]["version"]
+    assert re.fullmatch(r"\d+\.\d+\.\d+", libs["libcurand"]["version"]), got
+    assert re.fullmatch(r"\d+\.\d+", libs["libcudart"]["version"]), got
+
+
+def test_loaded_cuda_library_version_never_maps_a_new_copy(tmp_path):
+    """The version is asked through a handle on the ALREADY-mapped file
+    (RTLD_NOLOAD): a copy that is not mapped stays unmapped and gets ""."""
+    import shutil
+
+    from nova_bf.manifest import _mapped_cuda_libraries, loaded_cuda_libraries
+
+    src = _pip_cuda_lib("libcudart.so.*[0-9]")
+    if src is None:
+        pytest.skip("no pip CUDA runtime wheel in this environment")
+    copy = os.path.realpath(str(tmp_path / os.path.basename(src)))
+    shutil.copyfile(src, copy)   # another file: not the mapped one, if any
+    got = loaded_cuda_libraries("cuda", _maps([copy]))
+    assert got["cuda_libraries"] == {"libcudart": {"path": copy, "version": ""}}
+    assert copy not in _mapped_cuda_libraries().get("libcudart", [])
+
+
 def test_query_counts_distinguish_the_file_from_what_was_searched(ds, tmp_path):
     """With `rows` subsets a search covers fewer queries than the file holds, so
     the two counts must not be one field: a reader taking `queries` for "queries
@@ -458,6 +570,82 @@ def test_code_versions_omits_git_when_the_repo_is_not_ours(monkeypatch, tmp_path
     assert "git_commit" not in info, (
         "git answered about a repo that does not contain this package")
     assert info.get("python_version"), "non-git fields must still be reported"
+
+
+def test_detect_compute_records_the_gpu_uuid_and_driver(monkeypatch):
+    import types
+    import urllib.request
+
+    import torch
+
+    def no_imds(*a, **kw):
+        raise OSError("no instance metadata here")
+
+    monkeypatch.setattr(urllib.request, "urlopen", no_imds)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "get_device_name", lambda i=0: "NVIDIA A10G")
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 1)
+    monkeypatch.setattr(torch.cuda, "get_device_properties",
+                        lambda i=0: types.SimpleNamespace(total_memory=24 << 30,
+                                                          uuid="1234-abcd"))
+    monkeypatch.setattr(run_manifest, "_nvidia_driver", lambda: "580.159.04")
+    got = run_manifest.detect_compute("cuda")
+    assert got["gpu"] == "NVIDIA A10G" and got["gpu_uuid"] == "GPU-1234-abcd"
+    assert got["driver_version"] == "580.159.04" and got["gpu_total_bytes"] == 24 << 30
+    assert "instance_type" not in got                      # off EC2
+    # the paper launcher's variables are not recorded by nova-bf
+    monkeypatch.setenv("PAPER_STACK_SHA", "a" * 64)
+    assert not any(k.startswith("paper_") for k in run_manifest.detect_compute("cuda"))
+
+
+def test_nvidia_driver_parses_proc(tmp_path):
+    p = tmp_path / "version"
+    p.write_text("NVRM version: NVIDIA UNIX Open Kernel Module for x86_64  580.159.04  "
+                 "Release Build  (dvs-builder@U16-I1-N08-12-1)  Thu Oct  2 2025\n")
+    assert run_manifest._nvidia_driver(str(p)) == "580.159.04"
+    p.write_text("NVRM version: NVIDIA UNIX x86_64 Kernel Module  580.82.07  Sun Aug 3\n")
+    assert run_manifest._nvidia_driver(str(p)) == "580.82.07"
+
+
+def test_duplicate_cuda_libraries_refuse_a_cuda_run_unless_overridden(monkeypatch):
+    dup = _maps(["/env/lib/libcusparse.so.12", "/site/nvidia/cu13/lib/libcusparse.so.12",
+                 "/site/nvidia/cu13/lib/libcublas.so.13"])
+    monkeypatch.delenv(run_manifest.ALLOW_DUPLICATE_CUDA_LIBS_ENV, raising=False)
+    with pytest.raises(RuntimeError, match=r"(?s)two copies of a CUDA library.*libcusparse: "
+                                           r"/env/lib/libcusparse.so.12, /site/"):
+        run_manifest.refuse_duplicate_cuda_libraries("cuda", dup)
+    with pytest.raises(RuntimeError, match="libcusparse"):
+        run_manifest.refuse_duplicate_cuda_libraries("cuda:0", dup)
+    # not refused: a CPU run (it never used them), one copy of each, the override
+    run_manifest.refuse_duplicate_cuda_libraries("cpu", dup)
+    run_manifest.refuse_duplicate_cuda_libraries(
+        "cuda", _maps(["/site/nvidia/cu13/lib/libcusparse.so.12"]))
+    monkeypatch.setenv(run_manifest.ALLOW_DUPLICATE_CUDA_LIBS_ENV, "1")
+    run_manifest.refuse_duplicate_cuda_libraries("cuda", dup)
+
+
+def test_run_compute_refuses_duplicate_cuda_libraries_before_any_read(ds, tmp_path, monkeypatch):
+    """The start-of-run check, wired in: a (stand-in) CUDA run that maps two
+    copies stops before it reads anything or writes any output."""
+    from nova_bf import compute
+
+    monkeypatch.delenv(run_manifest.ALLOW_DUPLICATE_CUDA_LIBS_ENV, raising=False)
+    seen = []
+    real = run_manifest.refuse_duplicate_cuda_libraries
+
+    def as_cuda(device, maps_text=None):
+        seen.append(device)
+        return real("cuda", _maps(["/a/libcublas.so.13", "/b/libcublas.so.13"]))
+
+    monkeypatch.setattr(run_manifest, "refuse_duplicate_cuda_libraries", as_cuda)
+    read = []
+    monkeypatch.setattr(compute.Store, "read_columns",
+                        lambda *a, **k: read.append(a) or (_ for _ in ()).throw(AssertionError))
+    out = tmp_path / "dup"
+    out.mkdir()
+    with pytest.raises(RuntimeError, match="two copies of a CUDA library"):
+        run_compute(_cfg(ds, out))
+    assert seen == ["cpu"] and not read and not list(out.iterdir())
 
 
 # --- 18 + today's additions: the manifest records what RAN ----------------

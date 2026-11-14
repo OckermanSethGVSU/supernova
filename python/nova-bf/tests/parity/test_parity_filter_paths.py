@@ -29,11 +29,12 @@ import pytest
 
 from . import cases as cases_mod
 from . import compare, qdrant_ref
-from .runner import probe, run, spec
+from .runner import MV_23_DOCS_MIB, probe, run, spec
 
 EDGE = cases_mod.EDGE_FILTERS
 MODS = cases_mod.MODALITIES
-PARAMS = {"dense_batch_size": 37, "sparse_batch_size": 29, "multivector_batch_size": 23}
+PARAMS = {"dense_batch_size": 37, "sparse_batch_size": 29,
+          "multivector_budget_mib": MV_23_DOCS_MIB}
 TEXTY = [f for f, fd in EDGE.items()
          if any("match_text_from_query" in c for g in fd.values() for c in g)]
 

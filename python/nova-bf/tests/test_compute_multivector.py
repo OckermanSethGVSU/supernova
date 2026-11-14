@@ -26,6 +26,8 @@ from nova_bf.compute import MultiVectorQuery, _ragged_batch_ranges, run_compute
 from nova_bf.config import load_config
 from nova_bf.io import multivector_to_ragged
 
+import mv_tiles
+
 DIM = 8
 
 
@@ -85,15 +87,15 @@ def _ref_topk(qdocs, cdocs, metric, k, keep=None):
     return out
 
 
-def _run(tmp, cdir, qpath, *, metric="dot", k=5, bs=None, qb=None,
+def _run(tmp, cdir, qpath, *, metric="dot", k=5, budget_mib=None,
          filter_yaml="", id_cols=True):
+    """`budget_mib=None` runs the default budget. A test that needs a specific
+    tile shape pins it with `mv_tiles.pin` before calling this."""
     out = tmp / "out"
     out.mkdir(exist_ok=True)
     params = ["io_workers: 2"]
-    if bs is not None:
-        params.append(f"multivector_batch_size: {bs}")
-    if qb is not None:
-        params.append(f"multivector_query_block: {qb}")
+    if budget_mib is not None:
+        params.append(f"multivector_budget_mib: {budget_mib!r}")
     cfg_text = f"""
 corpus:
   path: {cdir}
@@ -276,19 +278,38 @@ def test_fused_triton_matches_torch_ragged(metric, dim, kernel):
         )
 
 
-@pytest.mark.parametrize("metric", ["dot", "cosine"])
-@pytest.mark.parametrize("bs,qb", [(None, None), (1, 1), (3, 2), (2, 4), (1000, 1000)])
-def test_tiling_invariance(ds, metric, bs, qb):
-    """Same ranking + scores regardless of corpus-row tile (`bs`) and
-    query-axis tile (`qb`), including tile=1 and tile>data — the whole point of
-    hiding tiling inside `.score()`."""
-    got = _run(ds["tmp"], ds["cdir"], ds["qpath"], metric=metric, k=8, bs=bs, qb=qb)
+def _assert_matches_reference(ds, got, metric, label):
     ref = _ref_topk(ds["qdocs"], ds["cdocs"], metric, 8)
     for qi in ref:
         assert list(got[qi].keys()) == list(ref[qi].keys()), (
-            f"{metric} bs={bs} qb={qb} q{qi} ids: got {list(got[qi])} ref {list(ref[qi])}")
+            f"{metric} {label} q{qi} ids: got {list(got[qi])} ref {list(ref[qi])}")
         for di in ref[qi]:
             assert abs(got[qi][di] - ref[qi][di]) < 1e-3
+
+
+@pytest.mark.parametrize("metric", ["dot", "cosine"])
+# 1 element: every slice is one document and every tile one query (the floor);
+# 8 / 64: several slices AND several query tiles, budget binding on both axes;
+# None: the 8192 MiB default, one slice per file and one query tile.
+@pytest.mark.parametrize("elements", [1, 8, 64, None])
+def test_tiling_invariance_across_budgets(ds, metric, elements):
+    """Same ranking + scores regardless of `multivector_budget_mib` — the
+    whole point of hiding tiling inside `.score()`."""
+    budget = None if elements is None else mv_tiles.mib(elements)
+    got = _run(ds["tmp"], ds["cdir"], ds["qpath"], metric=metric, k=8, budget_mib=budget)
+    _assert_matches_reference(ds, got, metric, f"elements={elements}")
+
+
+@pytest.mark.parametrize("metric", ["dot", "cosine"])
+@pytest.mark.parametrize("bs,qb", [(1, 1), (3, 2), (2, 4), (1000, 1000)])
+def test_tiling_invariance_pinned_shapes(ds, metric, bs, qb, monkeypatch):
+    """Same ranking + scores for explicit, independent shapes on each axis
+    (docs per slice `bs`, queries per tile `qb`), including tile=1 and
+    tile>data. A single budget cannot produce e.g. bs=2/qb=4, so the derived
+    shape is pinned (test-only) under the default budget."""
+    mv_tiles.pin(monkeypatch, bs, qb)
+    got = _run(ds["tmp"], ds["cdir"], ds["qpath"], metric=metric, k=8)
+    _assert_matches_reference(ds, got, metric, f"bs={bs} qb={qb}")
 
 
 def test_null_and_empty_docs_are_noncandidates(ds):
@@ -306,7 +327,8 @@ def test_null_and_empty_docs_are_noncandidates(ds):
 
 def test_uniform_filter_parity(ds):
     """A uniform `must match lang=eng` filter selects the same candidate set the
-    reference does, with identical MaxSim scores."""
+    reference does, with identical MaxSim scores. (A multivector docs-per-slice
+    is always derived now, so this run goes through cross-file coalescing.)"""
     keep = {i for i, l in enumerate(ds["langs"]) if l == "eng"} \
         - (ds["null_ids"] | ds["empty_ids"])
     filter_yaml = (
@@ -338,16 +360,16 @@ def test_make_point_id_path(ds):
         assert np.allclose(gs, rs, atol=1e-3)
 
 
-def test_token_budget_autoderives_tiles(ds):
-    """`multivector_token_budget` fills in both tile knobs and still produces the
-    exact same ranking as the untiled run."""
+def test_budget_autoderives_tiles(ds):
+    """A tiny `multivector_budget_mib` (64 score elements) derives both tile
+    sizes and still produces the exact same ranking as the reference."""
     out = ds["tmp"] / "out"
     out.mkdir(exist_ok=True)
     cfg_text = f"""
 corpus: {{path: {ds["cdir"]}, multivector_column: multivector_embedding, id_column: id}}
 queries: {{path: {ds["qpath"]}, multivector_column: multivector_embedding, id_column: qid}}
 output: {{path: {out}}}
-params: {{io_workers: 2, multivector_token_budget: 64}}
+params: {{io_workers: 2, multivector_budget_mib: {mv_tiles.mib(64)!r}}}
 searches:
   - {{name: mv, k: 8, metric: dot, vector_type: multivector}}
 """
@@ -387,7 +409,9 @@ def test_query_max_block_tokens_uses_actual_ragged_lengths():
     assert query.max_block_tokens == 10
 
 
-def test_double_buffer_flag_falls_back_exactly_on_cpu(ds):
+def test_double_buffer_flag_falls_back_exactly_on_cpu(ds, monkeypatch):
+    # 1000 docs x 2 queries pinned, under a 64-element budget, as before.
+    mv_tiles.pin(monkeypatch, 1000, 2)
     out = ds["tmp"] / "out_double_buffer"
     out.mkdir(exist_ok=True)
     cfg_text = f"""
@@ -396,9 +420,7 @@ queries: {{path: {ds["qpath"]}, multivector_column: multivector_embedding, id_co
 output: {{path: {out}}}
 params:
   io_workers: 2
-  multivector_batch_size: 1000
-  multivector_query_block: 2
-  multivector_token_budget: 64
+  multivector_budget_mib: {mv_tiles.mib(64)!r}
   multivector_double_buffer: true
 searches:
   - {{name: mv, k: 8, metric: dot, vector_type: multivector}}
@@ -494,9 +516,9 @@ def test_decoder_null_empty_and_slice():
     assert np.array_equal(flat2, np.array([[6.0, 7.0, 8.0]], np.float32))
 
 
-def test_zero_token_query_is_tiling_invariant_noncandidate(tmp_path):
+def test_zero_token_query_is_tiling_invariant_noncandidate(tmp_path, monkeypatch):
     """A zero-token (empty/null) query has nothing to score → it must retrieve
-    NOTHING (all -inf), identically regardless of how `query_block` tiles the
+    NOTHING (all -inf), identically regardless of how the query tile cuts the
     query axis. Regression for the bug where a zero-token query sharing a block
     with a non-empty one scored 0.0 (candidate) while a whole zero-token block
     scored -inf — making the GT depend on a pure performance knob."""
@@ -516,8 +538,13 @@ def test_zero_token_query_is_tiling_invariant_noncandidate(tmp_path):
     pq.write_table(pa.table({"multivector_embedding": _mv_array(qdocs),
                              "qid": pa.array([str(i) for i in range(4)])}), str(qpath))
 
-    runs = {qb: _run(tmp_path, str(cdir), str(qpath), metric="dot", k=12, qb=qb)
-            for qb in (None, 1, 2, 3, 4)}
+    # Only the QUERY axis varies (one whole-file slice): the shape is pinned,
+    # since a budget would move both axes. None = the derived default shape.
+    runs = {}
+    for qb in (None, 1, 2, 3, 4):
+        if qb is not None:
+            mv_tiles.pin(monkeypatch, 10**9, qb)
+        runs[qb] = _run(tmp_path, str(cdir), str(qpath), metric="dot", k=12)
     # zero-token queries q1, q3 -> NO hits, in every tiling
     for qb, got in runs.items():
         assert got[1] == {}, f"qb={qb}: zero-token q1 should retrieve nothing, got {got[1]}"
@@ -529,9 +556,9 @@ def test_zero_token_query_is_tiling_invariant_noncandidate(tmp_path):
             assert list(got[qi].keys()) == list(base[qi].keys()), f"qb={qb} q{qi} ids drift"
 
 
-def test_all_empty_corpus_shard_coalesced(tmp_path):
+def test_all_empty_corpus_shard_coalesced(tmp_path, monkeypatch):
     """A corpus shard that is ENTIRELY zero-token docs must not crash a
-    coalesced run (uniform filter + multivector_batch_size set), and its docs
+    coalesced run (uniform filter + 8 docs per slice, pinned), and its docs
     must be non-candidates. Regression for the `_concat_multivector_batches`
     width-0 concat crash."""
     rng = np.random.default_rng(5)
@@ -557,9 +584,10 @@ def test_all_empty_corpus_shard_coalesced(tmp_path):
                              "qid": pa.array([str(i) for i in range(4)])}), str(qpath))
 
     filter_yaml = ("    filter:\n      must:\n        - field: cat\n          match: a\n")
-    # multivector_batch_size set -> coalescing path; k >= corpus so a candidate is
+    # 8 docs per slice -> coalescing path; k >= corpus so a candidate is
     # missing ONLY if it's a non-candidate or filtered out.
-    got = _run(tmp_path, str(cdir), str(qpath), metric="dot", k=100, bs=8, filter_yaml=filter_yaml)
+    mv_tiles.pin(monkeypatch, 8, 10**6)
+    got = _run(tmp_path, str(cdir), str(qpath), metric="dot", k=100, filter_yaml=filter_yaml)
     cdocs = f0 + f1 + f2
     cats = (["a" if i % 2 else "b" for i in range(5)] + ["a"] * 4
             + ["a" if i % 2 else "b" for i in range(6)])
@@ -574,12 +602,13 @@ def test_all_empty_corpus_shard_coalesced(tmp_path):
             assert abs(got[qi][di] - ref[qi][di]) < 1e-3
 
 
-def test_coalescing_uniform_filter_parity(ds):
-    """Same as the uniform-filter test but WITH multivector_batch_size set, so
+def test_coalescing_uniform_filter_parity(ds, monkeypatch):
+    """Same as the uniform-filter test but with 3 docs per slice (pinned), so
     the cross-file coalescing path (`_flush_coalesce_group` +
-    `_concat_multivector_batches`) actually executes."""
+    `_concat_multivector_batches`) flushes several groups, not one."""
     filter_yaml = ("    filter:\n      must:\n        - field: lang\n          match: eng\n")
-    got = _run(ds["tmp"], ds["cdir"], ds["qpath"], metric="dot", k=8, bs=3, filter_yaml=filter_yaml)
+    mv_tiles.pin(monkeypatch, 3, 10**6)
+    got = _run(ds["tmp"], ds["cdir"], ds["qpath"], metric="dot", k=8, filter_yaml=filter_yaml)
     ref = _ref_topk(ds["qdocs"], ds["cdocs"], "dot", 8,
                     keep={i for i, l in enumerate(ds["langs"]) if l == "eng"})
     for qi in ref:
@@ -588,7 +617,7 @@ def test_coalescing_uniform_filter_parity(ds):
             assert abs(got[qi][di] - ref[qi][di]) < 1e-3
 
 
-def test_multivector_and_dense_shared_run(tmp_path):
+def test_multivector_and_dense_shared_run(tmp_path, monkeypatch):
     """A dense spec and a multivector spec in ONE run share corpus IO/decode —
     each must still produce its own independent, correct ranking."""
     rng = np.random.default_rng(11)
@@ -617,11 +646,12 @@ def test_multivector_and_dense_shared_run(tmp_path):
 corpus: {{path: {cdir}, multivector_column: multivector_embedding, dense_column: dense_embedding, id_column: id}}
 queries: {{path: {qpath}, multivector_column: multivector_embedding, dense_column: dense_embedding, id_column: qid}}
 output: {{path: {out}}}
-params: {{io_workers: 2, multivector_query_block: 2}}
+params: {{io_workers: 2}}
 searches:
   - {{name: mv, k: 10, metric: dot, vector_type: multivector}}
   - {{name: dn, k: 10, metric: dot, vector_type: dense}}
 """
+    mv_tiles.pin(monkeypatch, 10**9, 2)   # whole file x 2-query tiles, as before
     p = tmp_path / "cfg.yaml"
     p.write_text(cfg_text)
     res = run_compute(load_config(str(p)))

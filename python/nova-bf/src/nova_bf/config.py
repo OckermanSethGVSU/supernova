@@ -211,20 +211,19 @@ class ParamsConfig(BaseModel):
     # budget, chunk rows and stay on the faster, more reproducible dense GEMM path.
     # Set False to use the legacy sparse-CSR transpose fallback.
     sparse_chunk: bool = True
-    # The multivector (MaxSim) implementations (torch and triton_reduce) have
-    # TWO memory axes: their intermediate is `(block_query_tokens ×
-    # corpus_doc_tokens)`, so both corpus rows and queries are tiled to bound
-    # the peak.
-    #   multivector_batch_size  = docs per corpus-row slice (bounds doc-token
-    #                             count per slice; None = whole file at once)
-    #   multivector_query_block = queries per query-axis tile — a WHOLE number
-    #                             of queries per block, never splitting one
-    #                             query's tokens across blocks (None = all
-    #                             queries at once)
-    # `gt=0` for the same reason dense/sparse have it (a non-positive step
-    # silently empties the batch loop — see dense_batch_size).
-    multivector_batch_size: int | None = Field(default=None, gt=0)
-    multivector_query_block: int | None = Field(default=None, gt=0)
+    # Memory budget (MiB) for the FP32 MaxSim score block, not total GPU memory.
+    # Tile sizes are estimated by splitting the budget evenly across query and
+    # document tokens, using their average token counts.
+    # Actual token counts and int32 indexing limits are enforced during scoring.
+    # Queries are never split; oversized documents are scored alone.
+    multivector_budget_mib: float = Field(default=8192, gt=0, le=8192, allow_inf_nan=False)
+
+    @field_validator("multivector_budget_mib", mode="before")
+    @classmethod
+    def _budget_is_not_a_boolean(cls, v):
+        if isinstance(v, bool):
+            raise ValueError("multivector_budget_mib is a size in MiB, not a boolean")
+        return v
     # MaxSim implementation. `torch` is the established matmul + segmented
     # reduction path. `triton_reduce` retains the cuBLAS FP32 matmul but
     # fuses the ragged max/sum reduction (requires CUDA + Triton, fails
@@ -233,13 +232,6 @@ class ParamsConfig(BaseModel):
     # working. (A fully fused `triton` backend was removed after measuring
     # ~4x slower than triton_reduce — see docs/brute-force/multivector-maxsim.md.)
     multivector_kernel: Literal["torch", "triton_reduce", "auto"] = "auto"
-    # Target element count for each materialized `(block_query_tokens ×
-    # slice_doc_tokens)` score matrix. It still derives either item-count knob
-    # left unset, but is also enforced against the ACTUAL ragged query/document
-    # offsets: explicit batch/query counts become upper bounds, not permission
-    # to exceed this token-product budget. One over-budget document is processed
-    # alone so every row still makes progress.
-    multivector_token_budget: int | None = Field(default=None, gt=0)
     # CUDA-only ordered transfer prefetch for multivector slices. The next
     # packed ragged slice is copied through pinned host staging on a dedicated
     # CUDA stream while the current slice's GEMM/reduction/top-k work runs.

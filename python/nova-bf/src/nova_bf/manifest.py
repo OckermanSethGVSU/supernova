@@ -25,6 +25,7 @@ import json
 import logging
 import os
 import platform
+import re
 import socket
 import sys
 import subprocess
@@ -114,7 +115,16 @@ def detect_compute(device: str | None = None) -> dict:
             info["cuda_version"] = torch.version.cuda
             # The denominator for this run's peak usage (see `gpu_peak`): a
             # peak is only actionable next to the card it had to fit in.
-            info["gpu_total_bytes"] = torch.cuda.get_device_properties(0).total_memory
+            props = torch.cuda.get_device_properties(0)
+            info["gpu_total_bytes"] = props.total_memory
+            # WHICH card (nvidia-smi's `GPU-...` form, so it joins an
+            # nvidia-smi log of the node) and which driver it ran under.
+            uuid = getattr(props, "uuid", None)
+            if uuid is not None:
+                info["gpu_uuid"] = f"GPU-{uuid}"
+            driver = _nvidia_driver()
+            if driver:
+                info["driver_version"] = driver
     except Exception:
         pass
     if device is not None:
@@ -123,6 +133,28 @@ def detect_compute(device: str | None = None) -> dict:
         # having scored on the CPU, and that gap explains an odd wall time.
         info["device"] = device
     return info
+
+
+def _nvidia_driver(proc: str = "/proc/driver/nvidia/version") -> str:
+    """The NVIDIA driver version ("Kernel Module  580.82.07" / "Open Kernel
+    Module for x86_64  580.82.07" in /proc, else nvidia-smi); "" if neither
+    says. Duplicated from the streaming harness's run.py (nvidia_driver)."""
+    try:
+        with open(proc) as f:
+            m = re.search(r"Kernel Module(?: for \S+)?\s+(\d[\d.]*)", f.read())
+        if m:
+            return m.group(1)
+    except OSError:
+        pass
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=driver_version", "--format=csv,noheader"],
+            capture_output=True, text=True, timeout=10,
+        )
+        lines = out.stdout.strip().splitlines() if out.returncode == 0 else []
+        return lines[0].strip() if lines else ""
+    except Exception:  # noqa: BLE001 - no nvidia-smi: no driver to report
+        return ""
 
 
 def _workspace_version(start: str) -> str | None:
@@ -470,7 +502,7 @@ def gpu_peak(device: str | None) -> dict:
     """How much GPU memory this run actually needed, at its high-water mark.
 
     Sizing a fleet is the recurring question here — `dense_batch_size`,
-    `multivector_token_budget` and the query matrix all trade against one
+    `multivector_budget_mib` and the query matrix all trade against one
     card's memory, and the failure mode is an OOM hours into a run on an
     instance one size too small. The logs say what was configured; only this
     says what it cost. `allocated` is what nova-bf's tensors held, `reserved`
@@ -491,6 +523,133 @@ def gpu_peak(device: str | None) -> dict:
         }
     except Exception:  # noqa: BLE001
         return {}
+
+
+# The CUDA library families the paper stack pins (benchmarks/streaming/
+# paper_results/env/versions.env), each with its own version call (None: no
+# version API). Duplicated, not shared, in the streaming harness's cudalibs.py.
+#   *GetProperty(MAJOR_VERSION=0 / MINOR_VERSION=1 / PATCH_LEVEL=2, int*) -> "M.m.p"
+#   cudaRuntimeGetVersion(int*) -> "M.m"; nvrtcVersion / nvJitLinkVersion(M*, m*) -> "M.m"
+_CUDA_FAMILIES = {
+    "libcublas": "cublasGetProperty",
+    "libcublasLt": "cublasLtGetProperty",
+    "libcusparse": "cusparseGetProperty",
+    "libcusolver": "cusolverGetProperty",
+    "libcufft": "cufftGetProperty",
+    "libcurand": "curandGetProperty",
+    "libcudart": "cudaRuntimeGetVersion",
+    "libnvrtc": "nvrtcVersion",
+    "libnvrtc-builtins": None,
+    "libnvJitLink": "nvJitLinkVersion",
+}
+# libcublasLt.so.13 / libcusparse.so.12.7.10.12 / libnvrtc-builtins.so.13.2;
+# not libcusolverMg / libcufftw / libnvrtc.alt (other libraries)
+_CUDA_LIB = re.compile(r"/(lib(?:cublasLt|cublas|cusparse|cusolver|cufft|curand|cudart|"
+                       r"nvrtc-builtins|nvrtc|nvJitLink|nvjitlink))\.so(?:\.[0-9][^/\s]*)?$")
+
+
+def _mapped_cuda_libraries(maps_text: str | None = None) -> dict[str, list[str]]:
+    """family -> distinct real paths of every copy mapped into this process
+    (/proc/self/maps, or `maps_text`), first-seen order. The maps are
+    address-ordered: with two copies, the order says nothing about which was
+    loaded first. Raises OSError without /proc."""
+    if maps_text is None:
+        with open("/proc/self/maps") as f:
+            maps_text = f.read()
+    fam: dict[str, list[str]] = {}
+    for line in maps_text.splitlines():
+        parts = line.split(None, 5)
+        if len(parts) < 6:
+            continue
+        m = _CUDA_LIB.search(parts[5].strip())
+        if m:
+            key = m.group(1)
+            key = "libnvJitLink" if key.lower() == "libnvjitlink" else key
+            path = os.path.realpath(parts[5].strip())
+            seen = fam.setdefault(key, [])
+            if path not in seen:
+                seen.append(path)
+    return {k: fam[k] for k in sorted(fam)}
+
+
+def _cuda_library_version(fam: str, path: str) -> str:
+    """The version the mapped copy at `path` reports about itself, through a
+    handle on that very file: dlopen(RTLD_NOLOAD) returns the already-mapped
+    object and never maps a new copy. No GPU needed. "" when it is not
+    mapped, has no version call, or the call fails."""
+    fn_name = _CUDA_FAMILIES.get(fam)
+    if fn_name is None:
+        return ""
+    try:
+        import ctypes
+
+        lib = ctypes.CDLL(path, mode=os.RTLD_NOLOAD | os.RTLD_NOW)
+        fn = getattr(lib, fn_name)
+        if fn_name.endswith("GetProperty"):
+            vals = []
+            for prop in (0, 1, 2):    # MAJOR_VERSION, MINOR_VERSION, PATCH_LEVEL
+                v = ctypes.c_int()
+                if fn(prop, ctypes.byref(v)) != 0:
+                    return ""
+                vals.append(v.value)
+            return ".".join(map(str, vals))
+        if fn_name == "cudaRuntimeGetVersion":
+            v = ctypes.c_int()
+            if fn(ctypes.byref(v)) != 0:
+                return ""
+            return f"{v.value // 1000}.{v.value % 1000 // 10}"
+        a, b = ctypes.c_int(), ctypes.c_int()
+        if fn(ctypes.byref(a), ctypes.byref(b)) != 0:
+            return ""
+        return f"{a.value}.{b.value}"
+    except Exception:  # noqa: BLE001 - provenance must never fail a run
+        return ""
+
+
+def loaded_cuda_libraries(device: str, maps_text: str | None = None) -> dict:
+    """Report CUDA library paths and versions from the files actually loaded
+    by the process, not just installed libraries.
+
+    Report duplicate copies separately, since they violate the pinned CUDA
+    stack. Include the cuBLAS version only when exactly one copy is loaded.
+    Return empty results for CPU runs or unreadable process maps. Never raises.
+    """
+    if str(device).split(":", 1)[0] != "cuda":
+        return {}
+    out: dict = {"cuda_libraries": {}, "cuda_library_duplicates": {}, "cublas_version": ""}
+    try:
+        libs = _mapped_cuda_libraries(maps_text)
+    except Exception:  # noqa: BLE001 - provenance must never fail a run
+        return out
+    for fam, paths in libs.items():
+        copies = [{"path": p, "version": _cuda_library_version(fam, p)} for p in paths]
+        if len(copies) == 1:
+            out["cuda_libraries"][fam] = copies[0]
+        else:
+            out["cuda_library_duplicates"][fam] = copies
+    out["cublas_version"] = out["cuda_libraries"].get("libcublas", {}).get("version", "")
+    return out
+
+
+ALLOW_DUPLICATE_CUDA_LIBS_ENV = "NOVA_BF_ALLOW_DUPLICATE_CUDA_LIBS"
+
+
+def refuse_duplicate_cuda_libraries(device: str, maps_text: str | None = None) -> None:
+    """Reject CUDA runs that load multiple copies of the same CUDA library,
+    Allow overrides for debugging via NOVA_BF_ALLOW_DUPLICATE_CUDA_LIBS=1. 
+    Libraries loaded later are checked in the manifest. Skip CPU runs."""
+    if os.environ.get(ALLOW_DUPLICATE_CUDA_LIBS_ENV):
+        return
+    dups = loaded_cuda_libraries(device, maps_text).get("cuda_library_duplicates") or {}
+    if dups:
+        lines = "\n".join(f"  {fam}: " + ", ".join(c["path"] for c in copies)
+                          for fam, copies in sorted(dups.items()))
+        raise RuntimeError(
+            "two copies of a CUDA library are mapped into this process, so the run "
+            f"need not use the copy it records:\n{lines}\nImport torch first and keep "
+            "other copies off LD_LIBRARY_PATH (the paper env's activate.sh does); "
+            f"{ALLOW_DUPLICATE_CUDA_LIBS_ENV}=1 runs anyway, for diagnosis."
+        )
 
 
 def host_peak() -> dict:

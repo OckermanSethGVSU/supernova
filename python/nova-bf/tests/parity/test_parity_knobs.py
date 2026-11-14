@@ -7,10 +7,9 @@ Cross-referencing `ParamsConfig` against the suite leaves five never varied
 here; these are the three that gate a distinct CODE PATH rather than only a
 pool size:
 
-  * `multivector_token_budget` — splits the MaxSim similarity tile by
-    `max_doc_tokens = budget // max_query_tokens`. Unset, a slice is one tile
-    and the per-block loop runs once, which is the only shape the rest of the
-    suite ever builds.
+  * `multivector_budget_mib` — splits the MaxSim similarity tile by
+    `max_doc_tokens = elements // max_query_tokens`. At the default a parity
+    slice is one tile and the per-block loop runs once.
   * `merge_batch_size` — rows per fold in `nova bf merge`. The default resolves
     to a ceiling far above any parity corpus, so the merge always folds in ONE
     batch and the multi-batch fold is never exercised against an oracle.
@@ -30,6 +29,8 @@ from nova_bf.merge import run_merge
 from . import cases as cases_mod
 from . import compare
 from .runner import build_config, read_results, pinned_device, run, spec
+
+import mv_tiles
 
 try:  # `run_compute` moved once; keep the import obvious if it moves again
     from nova_bf.compute import run_compute
@@ -51,7 +52,7 @@ def _filter_of(case, ds):
 
 
 # ---------------------------------------------------------------------------
-# multivector_token_budget
+# multivector_budget_mib
 # ---------------------------------------------------------------------------
 
 
@@ -97,23 +98,25 @@ def _assert_the_budget_split_something(seen, budget):
 @pytest.mark.parametrize("budget", [16, 64, 256, 4096])
 @pytest.mark.parametrize("case", MV_PROBES, ids=MV_IDS)
 def test_a_token_budget_does_not_change_the_answer(budget, case, ds, oracle, device,
-                                                   budget_spy):
+                                                   budget_spy, monkeypatch):
     """Splitting the MaxSim tile must be invisible.
 
+    `budget` is in score ELEMENTS (converted to `multivector_budget_mib`).
     The budget caps `n_query_tokens x n_doc_tokens` per tile, so a small one
     turns each slice into many blocks and the per-query MaxSim is assembled
     from several partial reductions instead of one. `8` is small enough that
     the parity corpus (ragged token counts, some documents with none at all)
     splits on nearly every slice.
     """
+    # The derived item caps would otherwise bind before the token budget does
+    # (the even split gives each axis ~sqrt(elements) tokens, and with 8
+    # short queries the doc axis is then capped by ITEMS) -- precisely why
+    # these tests were once one-sided. So the shape is pinned (test-only) to
+    # 64 docs per slice and all queries in one tile, giving the budget room to
+    # be the constraint that splits.
+    mv_tiles.pin(monkeypatch, 64, 10**6)
     got = run(ds, [case.spec()], out_tag=f"tb{budget}_{case.name}", device=device,
-              params={"multivector_token_budget": budget,
-                      # The harness defaults `multivector_batch_size` to 2, and
-                      # 2 rows of this corpus hold at most 12 tokens -- so the
-                      # ROW batch dominates and the token budget never binds.
-                      # That is precisely why these tests were one-sided. Give
-                      # the budget room to be the constraint that splits.
-                      "multivector_batch_size": 64})[case.name]
+              params={"multivector_budget_mib": mv_tiles.mib(budget)})[case.name]
     _assert_the_budget_split_something(budget_spy, budget)
     want = oracle.topk(vector_type=case.vector_type, metric=case.metric,
                        k=case.k, filt=_filter_of(case, ds))
@@ -123,8 +126,10 @@ def test_a_token_budget_does_not_change_the_answer(budget, case, ds, oracle, dev
             label=f"[{device}] token_budget={budget} {case.id} q{qi}")
 
 
+@pytest.mark.parametrize("queries_per_tile", [1, 2, 4, 10**6])
 @pytest.mark.parametrize("case", MV_PROBES, ids=MV_IDS)
-def test_a_tiny_token_budget_equals_an_unbudgeted_run(case, ds, device, budget_spy):
+def test_a_tiny_token_budget_equals_an_unbudgeted_run(case, ds, device, budget_spy,
+                                                     monkeypatch, queries_per_tile):
     """Exact hit-for-hit, not merely oracle-tolerable.
 
     A tile split changes the ORDER the per-token maxima are reduced in, so
@@ -135,13 +140,20 @@ def test_a_tiny_token_budget_equals_an_unbudgeted_run(case, ds, device, budget_s
     # 64, not 8: at budget 8 `max_doc_tokens` is 1 on this corpus, so every
     # tile is a single row and a tile-BOUNDARY bug cannot show up. 64 gives
     # ~12 tokens per tile, which really blocks.
-    small = run(ds, [case.spec()], out_tag=f"tbsmall_{case.name}", device=device,
-                params={"multivector_token_budget": 16,
-                        "multivector_batch_size": 64})[case.name]
+    # queries_per_tile < all: the small run ALSO tiles the query axis (1 / 2 /
+    # 4 queries per tile, what the old budget-derived query block gave at
+    # budgets 16 / 64 / 256), so query-tile boundaries are checked hit-for-hit
+    # against the all-queries reference too.
+    mv_tiles.pin(monkeypatch, 64, queries_per_tile)   # see the test above
+    small = run(ds, [case.spec()], out_tag=f"tbsmall{queries_per_tile}_{case.name}",
+                device=device,
+                params={"multivector_budget_mib": mv_tiles.mib(16)})[case.name]
     _assert_the_budget_split_something(budget_spy, 16)
-    # Same row batching, no token budget: the ONLY difference is the split.
+    # Same row batching, every query in one tile, default budget (never binds
+    # here): the only differences are the token split and the query tiling.
+    mv_tiles.pin(monkeypatch, 64, 10**6)
     none = run(ds, [case.spec()], out_tag=f"tbnone_{case.name}", device=device,
-               params={"multivector_batch_size": 64})[case.name]
+               params={})[case.name]
     for qi in range(len(ds.queries)):
         assert [r for r, _ in small[qi]] == [r for r, _ in none[qi]], (
             f"[{device}] {case.id} q{qi}: a token budget changed the ranking")

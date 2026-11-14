@@ -17,7 +17,7 @@ import pytest
 
 from . import cases as cases_mod
 from . import compare, qdrant_ref
-from .runner import run, spec
+from .runner import MV_17_DOCS_MIB, MV_23_DOCS_MIB, run, spec
 
 # A spread across modalities and filter kinds — static, per-query, text, date —
 # small enough to re-run several times per device.
@@ -31,7 +31,7 @@ PROBES = [
 PROBE_IDS = [c.id for c in PROBES]
 
 MATRIX_PARAMS = {"dense_batch_size": 37, "sparse_batch_size": 29,
-                 "multivector_batch_size": 23}
+                 "multivector_budget_mib": MV_23_DOCS_MIB}
 
 
 @pytest.fixture(scope="session")
@@ -48,8 +48,10 @@ def tiny_batch_run(ds, device):
     many slices and each search's top-K is assembled from a long chain of
     per-slice merges rather than one shot."""
     return run(ds, [c.spec() for c in PROBES], out_tag="tiny", device=device,
-               params={"dense_batch_size": 5, "sparse_batch_size": 5,
-                       "multivector_batch_size": 3, "multivector_query_block": 2})
+               params={"dense_batch_size": 5, "sparse_batch_size": 5},
+               # 3 docs per slice x 2 queries per tile: independent shapes a
+               # single budget cannot give, so pinned (test-only).
+               mv_tiles=(3, 2))
 
 
 @pytest.mark.parametrize("case", PROBES, ids=PROBE_IDS)
@@ -184,3 +186,27 @@ def _filter_of(case, ds):
     from .test_parity_matrix import _filter_from_dict
 
     return _filter_from_dict(ds, case.filter_dict)
+
+
+@pytest.mark.parametrize("mib,docs", [(MV_23_DOCS_MIB, 23), (MV_17_DOCS_MIB, 17)])
+def test_the_matrix_budget_derives_the_slicing_it_claims(ds, mib, docs):
+    """`runner.MV_23_DOCS_MIB` / `MV_17_DOCS_MIB` stand in for the old fixed
+    multivector docs-per-slice (23 / 17): pin that the production even split
+    really derives that on the shared corpus, with every query in one tile, so
+    the harness-wide params keep the slicing their comments describe."""
+    import glob
+    import json
+
+    from nova_bf.compute import run_compute
+
+    from .runner import build_config, pinned_device
+
+    tag = f"mvbudget{docs}"
+    cfg = build_config(ds, [spec("mv", vector_type="multivector", metric="dot", k=5)],
+                       out_tag=tag, params={"multivector_budget_mib": mib})
+    with pinned_device("cpu"):
+        run_compute(cfg)
+    (path,) = glob.glob(f"{cfg.output.path}/*_compute.json")
+    params = json.load(open(path))["params"]
+    assert params["multivector_derived_docs_per_slice"] == docs
+    assert params["multivector_derived_queries_per_tile"] >= len(ds.queries)
