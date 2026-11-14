@@ -654,7 +654,7 @@ def test_run_compute_refuses_duplicate_cuda_libraries_before_any_read(ds, tmp_pa
 def _clear_switches(monkeypatch):
     for var in ("NOVA_BF_NO_PRUNE", "NOVA_BF_NO_FOLD_KERNEL",
                 "NOVA_BF_NO_TOPK_KERNEL", "NOVA_BF_NO_TWOPASS",
-                "NOVA_BF_NO_FUSED_ROWMAX"):
+                "NOVA_BF_NO_FUSED_ROWMAX", "NOVA_BF_NO_SPARSE_POSTING"):
         monkeypatch.delenv(var, raising=False)
 
 
@@ -663,14 +663,16 @@ def test_kernel_usage_reports_the_resolved_switches(monkeypatch):
     got = run_manifest.kernel_usage(0)
     assert {k: v["permitted"] for k, v in got.items()} == {
         "prune": True, "fold_kernel": True, "topk_kernel": True,
-        "twopass": True, "fused_rowmax_kernel": True}
+        "twopass": True, "fused_rowmax_kernel": True,
+        "sparse_posting_kernel": True}
 
     monkeypatch.setenv("NOVA_BF_NO_PRUNE", "1")
     monkeypatch.setenv("NOVA_BF_NO_FOLD_KERNEL", "1")
     got = run_manifest.kernel_usage(0)
     assert {k: v["permitted"] for k, v in got.items()} == {
         "prune": False, "fold_kernel": False, "topk_kernel": True,
-        "twopass": True, "fused_rowmax_kernel": True}
+        "twopass": True, "fused_rowmax_kernel": True,
+        "sparse_posting_kernel": True}
 
     # `""` is unset-shaped and must not read as "disabled"
     monkeypatch.setenv("NOVA_BF_NO_PRUNE", "")
@@ -922,13 +924,21 @@ def test_sparse_branches_are_counted_and_reset_per_run(tmp_path):
     from test_prune_search_paths import _sparse_cfg, _sparse_corpus
 
     cdir, qpath = _sparse_corpus(tmp_path, n_files=3, per_file=60, seed=4)
-    run_compute(_sparse_cfg(cdir, qpath, tmp_path / "r1", k=5))
+
+    def cfg(out):
+        c = _sparse_cfg(cdir, qpath, out, k=5)
+        # These are the cuSPARSE-path buckets; on CUDA "auto" would take the
+        # posting-list kernel instead (it books `scored_posting`).
+        c.params.sparse_kernel = "cusparse"
+        return c
+
+    run_compute(cfg(tmp_path / "r1"))
     first = dict(C._SPARSE_BRANCHES)
     assert sum(first.values()) > 0, "no sparse branch was recorded"
     # positive-weight fixture -> the cheap gate, never the structural one
     assert first["gate_zero"] > 0 and first["gate_structural"] == 0
 
-    run_compute(_sparse_cfg(cdir, qpath, tmp_path / "r2", k=5))
+    run_compute(cfg(tmp_path / "r2"))
     second = dict(C._SPARSE_BRANCHES)
     assert second == first, f"counters accumulated across runs: {first} -> {second}"
 
@@ -988,6 +998,7 @@ def test_sparse_chunk_config_and_branch_reach_the_manifest(tmp_path, monkeypatch
     cdir, qpath = _sparse_corpus(tmp_path, n_files=2, per_file=50, seed=9)
     cfg = _sparse_cfg(cdir, qpath, out, k=4, batch=17)
     cfg.params.sparse_chunk = True
+    cfg.params.sparse_kernel = "cusparse"   # the chunked bucket is a cuSPARSE-path bucket
     # Fixture-scale budget: force the "does not fit whole" branch so
     # scored_chunked actually increments rather than staying at zero.
     monkeypatch.setattr(C, "_SPARSE_SWAP_MAX_DENSE_BYTES", 64)
@@ -1023,7 +1034,7 @@ def test_kernel_usage_counters_actually_MOVE_in_a_real_run(tmp_path):
     doc = json.loads(next(out.rglob("*manifest*.json")).read_text())
     kernels = doc["params"]["kernels"]
     assert set(kernels) == {"prune", "fold_kernel", "topk_kernel",
-                            "fused_rowmax_kernel",
+                            "fused_rowmax_kernel", "sparse_posting_kernel",
                             "twopass"}, kernels
     base = {"permitted", "launches", "unavailable"}
     for name, entry in kernels.items():

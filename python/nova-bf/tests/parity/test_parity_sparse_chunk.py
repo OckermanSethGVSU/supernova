@@ -70,7 +70,8 @@ def _forced_budget(nbytes):
 def _run(ds, *, chunk: bool):
     with _forced_budget(TINY_BUDGET):
         return run(ds, _specs(), out_tag=f"sparsechunk_{chunk}", device="cpu",
-                   params={"sparse_batch_size": 17, "sparse_chunk": chunk})
+                   params={"sparse_batch_size": 17, "sparse_chunk": chunk,
+                           "sparse_kernel": "cusparse"})
 
 
 @pytest.fixture(scope="session")
@@ -90,7 +91,8 @@ def test_the_budget_actually_forced_the_branch(ds):
     compute_mod._reset_sparse_branches()
     with _forced_budget(TINY_BUDGET):
         run(ds, _specs(), out_tag="sparsechunk_probe", device="cpu",
-            params={"sparse_batch_size": 17, "sparse_chunk": True})
+            params={"sparse_batch_size": 17, "sparse_chunk": True,
+                    "sparse_kernel": "cusparse"})
     assert compute_mod._SPARSE_BRANCHES["scored_chunked"] > 0, \
         "forced budget did not starve the whole-slice fast path"
     assert compute_mod._SPARSE_BRANCHES["scored_swapped"] == 0

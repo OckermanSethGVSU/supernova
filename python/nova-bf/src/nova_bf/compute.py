@@ -1483,6 +1483,7 @@ _SPARSE_BRANCHES = {
     "scored_fallback": 0,     # too big to fit whole; CSR transpose path (sparse_chunk: false)
     "gate_zero": 0,           # cheap `raw == 0` no-overlap gate
     "gate_structural": 0,     # signed/stored-zero data: indicator spmm
+    "scored_posting": 0,      # posting-list Triton kernel (scores + structural gate in one pass)
 }
 
 
@@ -1723,6 +1724,12 @@ class _SparseQueryCache:
         self.batch_size = batch_size
         # Default to the production chunked sparse path; callers can explicitly opt out.
         self.sparse_chunk = sparse_chunk
+        # `params.sparse_kernel`: "auto" uses the posting-list kernel wherever it
+        # can run (CUDA + Triton), "posting" requires it, "cusparse" never uses it.
+        # The class default is "cusparse" so code that builds slices directly
+        # (tests, harnesses) keeps the established path; `run_compute` applies
+        # the config's choice (default "auto").
+        self.kernel = "cusparse"
 
     def _csr(self, Q, vals_from_pattern):
         """Build CSR from `Q`'s nonzero pattern in row blocks.
@@ -1844,7 +1851,58 @@ class SparseBatchSlice:
                  for sub in _iter_csr_row_chunks(self.Cb, per, ones)]
         return torch.cat(parts, dim=1)
 
+    def _posting_raw(self, Q, cache):
+        """Return dot-product scores with excluded entries masked to -inf.
+        Fall back to cuSPARSE if the posting-list kernel is unavailable or
+        fails. Raise instead if the posting-list kernel is explicitly required."""
+        if cache.kernel == "cusparse":
+            return None
+        from nova_bf import sparse_posting_triton
+        from nova_bf.twopass import is_oom
+
+        oom = False
+        try:
+            q_csr = cache.values(Q)
+            why = sparse_posting_triton.decline_reason(q_csr, self.Cb)
+            if why is not None:
+                if cache.kernel == "posting":
+                    raise RuntimeError(
+                        f"params.sparse_kernel='posting' but the posting-list "
+                        f"kernel cannot run: {why}")
+                return None
+            raw = sparse_posting_triton.scores(q_csr, self.Cb)
+            sparse_posting_triton.note_kernel_slice()
+            return raw
+        except Exception as exc:
+            if cache.kernel == "posting":
+                raise
+            if is_oom(exc):
+                # Not a kernel fault: this slice goes to the cuSPARSE path
+                # (its densified operand is chunked under a byte budget); the
+                # cache is emptied below, once the failed attempt's tensors
+                # (held by this traceback) are released.
+                oom = True
+            else:
+                # Off for the rest of the run (idempotent: `scores` has
+                # already disabled it for a mismatch, a failed check or a
+                # failed launch; this also covers any other failure).
+                sparse_posting_triton.kernel_disable(f"{type(exc).__name__}: {exc}")
+                sparse_posting_triton.note_decline("kernel failure")
+        if oom:
+            import torch
+
+            sparse_posting_triton.note_oom()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        return None
+
     def score(self, Q, metric: str, q_norms=None, scale_in_packer: bool = False):
+        if self._masked_raw is None:
+            cache = self.q_cache = self.q_cache or _SparseQueryCache()
+            raw = self._posting_raw(Q, cache)
+            if raw is not None:
+                _SPARSE_BRANCHES["scored_posting"] += 1
+                self._masked_raw = raw
         if self._masked_raw is None:
             _SPARSE_BRANCHES["gate_zero" if self.zero_gate_ok
                              else "gate_structural"] += 1
@@ -6372,6 +6430,8 @@ def run_compute(
     from nova_bf import topk_triton as _tt
     _mt.reset_usage()
     _tt.reset_usage()
+    from nova_bf import sparse_posting_triton as _sp
+    _sp.reset()
 
     # Size pools before any Parquet reads: query loading and token sampling run
     # before the corpus scan and should not inherit a launcher's thread default.
@@ -7143,6 +7203,9 @@ def run_compute(
     # Keep the sparse dense-swap decision fixed for the run using the resolved batch size.
     sparse_q_cache.batch_size = vt_batch_size.get("sparse")
     sparse_q_cache.sparse_chunk = cfg.params.sparse_chunk
+    sparse_q_cache.kernel = cfg.params.sparse_kernel
+    from nova_bf import sparse_posting_triton as _sp_policy
+    _sp_policy.set_policy(cfg.params.sparse_kernel)
     # Only a filter that actually appears in SOME vt's union ever reaches
     # _union_keep (a filter whose vt has has_baseline=True never does) — so
     # only these need the per-file row-level union computed at all (Front B).

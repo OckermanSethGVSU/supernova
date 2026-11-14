@@ -250,7 +250,7 @@ REGIMES = ("nofilter", "static", "static_narrow", "perquery", "chunked")
 TINY_BUDGET = 4 * 60 * 5     # ~5 rows of a <=60-wide query vocab per chunk
 
 
-def _run(ds, regime, device):
+def _run(ds, regime, device, kernel="cusparse"):
     f = _filter_for(regime)
     specs = [dict(s, filter=f) if f else dict(s) for s in SPECS]
     log: list = []
@@ -259,8 +259,8 @@ def _run(ds, regime, device):
         with _gate_spy(mp, log):
             if regime == "chunked":
                 mp.setattr(compute_mod, "_SPARSE_SWAP_MAX_DENSE_BYTES", TINY_BUDGET)
-            hits = layouts.run(ds, specs, tag=f"gate_{regime}", device=device,
-                               params={"sparse_batch_size": 20})
+            hits = layouts.run(ds, specs, tag=f"gate_{regime}_{kernel}", device=device,
+                               params={"sparse_batch_size": 20, "sparse_kernel": kernel})
             branches = dict(compute_mod._SPARSE_BRANCHES)
     finally:
         mp.undo()
@@ -269,7 +269,17 @@ def _run(ds, regime, device):
 
 @pytest.fixture(scope="module")
 def gate_runs(sp_ds, device):
+    # Pinned to the cuSPARSE path: the gate/branch assertions below are about
+    # it, and on CUDA `auto` would take the posting-list kernel instead.
     return {(v, r): _run(sp_ds[v], r, device) for v in VARIANTS for r in REGIMES}
+
+
+@pytest.fixture(scope="module")
+def posting_runs(sp_ds, device):
+    """The same runs under `sparse_kernel: auto` (the posting-list kernel on
+    CUDA, or under TRITON_INTERPRET; the cuSPARSE path elsewhere)."""
+    return {(v, r): _run(sp_ds[v], r, device, kernel="auto")
+            for v in VARIANTS for r in REGIMES}
 
 
 # ------------------------------------------------------------ reachability
@@ -345,6 +355,25 @@ def test_gate_agrees_with_the_naive_oracle(variant, regime, metric, sfx, sp_ds,
                               keep=_keep_for(regime))
     layouts.assert_all(hits[f"sp_{metric}{sfx}"], want, metric=metric,
                        label=f"[{device}] {variant}/{regime}/{metric}{sfx} vs naive")
+
+
+@pytest.mark.parametrize("sfx", list(TOPKS))
+@pytest.mark.parametrize("metric", METRICS)
+@pytest.mark.parametrize("regime", REGIMES)
+@pytest.mark.parametrize("variant", VARIANTS)
+def test_posting_kernel_agrees_with_the_naive_oracle(variant, regime, metric, sfx, sp_ds,
+                                                     posting_runs, device):
+    """The `auto` arm: stored zeros, underflow, empty rows and queries, filters
+    and coalescing through the posting-list kernel, against the same oracle."""
+    ds = sp_ds[variant]
+    hits, branches, _ = posting_runs[(variant, regime)]
+    import os as _os
+    if device == "cuda" or _os.environ.get("TRITON_INTERPRET"):
+        assert branches["scored_posting"] > 0, (variant, regime, branches)
+    want = layouts.naive_topk(ds, vector_type="sparse", metric=metric, k=TOPKS[sfx],
+                              keep=_keep_for(regime))
+    layouts.assert_all(hits[f"sp_{metric}{sfx}"], want, metric=metric,
+                       label=f"[{device}/auto] {variant}/{regime}/{metric}{sfx} vs naive")
 
 
 def test_the_fixture_really_has_zero_score_candidates(sp_ds):

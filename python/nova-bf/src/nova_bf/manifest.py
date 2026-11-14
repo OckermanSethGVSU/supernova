@@ -298,7 +298,15 @@ def kernel_usage(
         "topk_kernel": topk_triton.usage(),
         "twopass": tp,
         "fused_rowmax_kernel": twopass.fuse_usage(),
+        "sparse_posting_kernel": _sparse_posting_usage(),
     }
+
+
+def _sparse_posting_usage() -> dict:
+    """The sparse posting-list kernel: launches, self-checks, why unavailable."""
+    from nova_bf import sparse_posting_triton
+
+    return sparse_posting_triton.usage()
 
 
 def _tile_rescore_usage() -> dict:

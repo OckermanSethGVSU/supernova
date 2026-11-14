@@ -211,6 +211,10 @@ class ParamsConfig(BaseModel):
     # budget, chunk rows and stay on the faster, more reproducible dense GEMM path.
     # Set False to use the legacy sparse-CSR transpose fallback.
     sparse_chunk: bool = True
+    # Sparse scoring backend. "auto" uses the Triton posting-list kernel when
+    # available and falls back to cuSPARSE. "posting" requires the Triton kernel;
+    # "cusparse" always uses the densify + cuSPARSE path.
+    sparse_kernel: Literal["auto", "posting", "cusparse"] = "auto"
     # Memory budget (MiB) for the FP32 MaxSim score block, not total GPU memory.
     # Tile sizes are estimated by splitting the budget evenly across query and
     # document tokens, using their average token counts.
