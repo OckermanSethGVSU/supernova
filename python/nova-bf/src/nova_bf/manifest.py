@@ -533,8 +533,7 @@ def gpu_peak(device: str | None) -> dict:
         return {}
 
 
-# The CUDA library families the paper stack pins (benchmarks/streaming/
-# paper_results/env/versions.env), each with its own version call (None: no
+# The CUDA library families the paper stack pins, each with its own version call (None: no
 # version API). Duplicated, not shared, in the streaming harness's cudalibs.py.
 #   *GetProperty(MAJOR_VERSION=0 / MINOR_VERSION=1 / PATCH_LEVEL=2, int*) -> "M.m.p"
 #   cudaRuntimeGetVersion(int*) -> "M.m"; nvrtcVersion / nvJitLinkVersion(M*, m*) -> "M.m"

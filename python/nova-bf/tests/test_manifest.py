@@ -254,7 +254,7 @@ def test_single_node_manifest_describes_the_run(ds, tmp_path, monkeypatch, caplo
     assert abs(t["search_seconds"] - (t["scan_seconds"] + t["result_sort_seconds"])) <= 0.011
     assert t["search_seconds"] <= t["elapsed_seconds"] + 0.011
     # ...and the same figure is in the log, where benchmark scripts read it
-    # (coyo_parity/parity_summary.py, the filtered run.sh / realfile.sh): one
+    # (runs/dense/parity_summary.py, the filtered run.sh / realfile.sh): one
     # line per run, after the bf-bench line, equal to the manifest's values
     lines = [r.getMessage() for r in caplog.records
              if r.getMessage().startswith(("bf-bench-search ", "bf-bench io_workers"))]
