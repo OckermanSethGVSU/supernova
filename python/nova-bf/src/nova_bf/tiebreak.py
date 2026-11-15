@@ -209,7 +209,9 @@ def pack_topk(scores, ordinal, k, scale=None, thr=None, encoded=None,
     
     Rows are chunked on the portable path to bound packed-key memory. With `thr`, 
     `live` marks rows that may improve the running state; outputs for dead rows 
-    are undefined on the Triton path and must not be consumed. 
+    are undefined on the Triton path and must not be consumed. Live rows on
+    the Triton path may end in NEUTRAL_KEY padding (fewer than k candidates
+    at or above `thr`); they are fold inputs, not a true slice top-k.
     """
     import torch
 

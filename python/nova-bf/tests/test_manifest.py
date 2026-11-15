@@ -1046,8 +1046,9 @@ def test_kernel_usage_counters_actually_MOVE_in_a_real_run(tmp_path):
     assert set(kernels["prune"]) == base | {
         "live_query_slice_rows", "query_slice_rows", "live_fraction",
         "by_search"}, kernels["prune"]
-    for name in ("fold_kernel", "topk_kernel"):
-        assert set(kernels[name]) == base, (name, kernels[name])
+    assert set(kernels["fold_kernel"]) == base, kernels["fold_kernel"]
+    # topk also counts launches compiled with the threshold-select fast path
+    assert set(kernels["topk_kernel"]) == base | {"select_launches"}, kernels["topk_kernel"]
     # `twopass` carries what it skipped as well as whether it ran: the live
     # fraction it measured, and the padded fraction the GEMM actually scored
     # (the gap between them is what keeping cuBLAS on one kernel costs).

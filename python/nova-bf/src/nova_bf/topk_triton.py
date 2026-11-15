@@ -50,7 +50,8 @@ try:
     def _cutfill(S, NRM, CNRM, RANK, ORD, ENC, OUTK, OUTI, THR, LIVE, stride_s, n_cols, k,
                  BLOCK: _tl.constexpr, RBITS: _tl.constexpr,
                  HAS_NRM: _tl.constexpr, HAS_CNRM: _tl.constexpr,
-                 HAS_THR: _tl.constexpr, HAS_ENC: _tl.constexpr):
+                 HAS_THR: _tl.constexpr, HAS_ENC: _tl.constexpr,
+                 HAS_SEL: _tl.constexpr):
         row = _tl.program_id(0)
         offs = _tl.arange(0, BLOCK)
         m = offs < n_cols
@@ -100,12 +101,40 @@ try:
             # "any lane >= thr_u" == "row max >= thr_u", using the same
             # masked-compare-and-sum idiom as the descents below. Pad lanes
             # sit at u == 0 and are excluded by `m` regardless.
-            alive = _tl.sum((m & (u >= thr_u)).to(_tl.int32)) > 0
+            ge = m & (u >= thr_u)
+            n_ge = _tl.sum(ge.to(_tl.int32))
+            alive = n_ge > 0
             _tl.store(LIVE + row, alive.to(_tl.uint8))
             if alive == 0:
                 # Dead rows write nothing; their outputs are undefined. Downstream folds
                 # gate on `live` and never read them; dead-row poisoning tests enforce this.
                 return
+            if HAS_SEL:
+                if n_ge <= k:
+                    # Keep only candidates at or above the running top-k threshold
+                    # (or a stronger peer threshold). Lower scores cannot reach the
+                    # final top-k, so skip full selection and pad with NEUTRAL_KEY.
+                    # Peer thresholds may leave fewer than k local results, but the
+                    # final merged top-k is unchanged.
+                    pos = _tl.cumsum(ge.to(_tl.int32)) - 1
+                    ordv = _tl.load(ORD + offs, mask=m, other=0)
+                    key32 = (u ^ 0x80000000).to(_tl.int32, bitcast=True)
+                    packed = key32.to(_tl.int64) * 4294967296 + (0xFFFFFFFF - ordv)
+                    _tl.store(OUTK + row * k + pos, packed, mask=ge)
+                    pad = (offs >= n_ge) & (offs < k)
+                    _tl.store(OUTK + row * k + offs,
+                              _tl.full([BLOCK], -9223372036854775807, _tl.int64) - 1,
+                              mask=pad)
+                    if HAS_ENC:
+                        _tl.store(OUTI + row * k + pos,
+                                  _tl.load(ENC + offs, mask=m, other=0), mask=ge)
+                        _tl.store(OUTI + row * k + offs,
+                                  _tl.zeros([BLOCK], dtype=_tl.int64), mask=pad)
+                    else:
+                        _tl.store(OUTI + row * k + pos, offs.to(_tl.int32), mask=ge)
+                        _tl.store(OUTI + row * k + offs,
+                                  _tl.zeros([BLOCK], dtype=_tl.int32), mask=pad)
+                    return
 
         prefix = _tl.zeros([], dtype=_tl.uint32)
         for i in _tl.static_range(32):
@@ -212,12 +241,15 @@ def usage() -> dict:
         "permitted": not os.environ.get("NOVA_BF_NO_TOPK_KERNEL"),
         "launches": _LAUNCHES,
         "unavailable": _UNAVAILABLE,
+        # launches compiled with the threshold-select fast path
+        "select_launches": _SEL_LAUNCHES,
     }
 
 
 def reset_usage() -> None:
-    global _LAUNCHES
+    global _LAUNCHES, _SEL_LAUNCHES
     _LAUNCHES = 0
+    _SEL_LAUNCHES = 0
 
 
 _INT32_MAX = (1 << 31) - 1
@@ -454,6 +486,15 @@ def rank_of(ordinal):
     return rank
 
 
+_SEL_LAUNCHES = 0
+
+
+def _select_on() -> bool:
+    """Threshold select (live rows with at most k lanes at or above their
+    threshold skip the radix descents). `NOVA_BF_NO_TOPK_SELECT` turns it off."""
+    return not os.environ.get("NOVA_BF_NO_TOPK_SELECT")
+
+
 def topk(scores, ordinal, k, scale=None, thr=None, enc=None, rank=None, cscale=None):
     """Select top-K packed `(score, ordinal)` keys per query row.
 
@@ -463,6 +504,10 @@ def topk(scores, ordinal, k, scale=None, thr=None, enc=None, rank=None, cscale=N
     `thr` enables pruning.
 
     Dead rows have undefined outputs when pruning; callers must gate on `live`.
+    With pruning, a live row may hold fewer than k real candidates followed by
+    NEUTRAL_KEY padding (id/column 0): the threshold-select fast path writes
+    only candidates at or above the threshold. Folding is unaffected (the
+    padding never wins a slot); do not read part rows as a true slice top-k.
     `rank` may provide a precomputed `rank_of(ordinal)` for reuse.
 
     `rank` is `rank_of(ordinal)`; pass it to share one computation across the
@@ -495,8 +540,10 @@ def topk(scores, ordinal, k, scale=None, thr=None, enc=None, rank=None, cscale=N
         outk.fill_(POISON_KEY)
         outi.fill_(POISON_ID if enc is not None else 0x7FFFFFFF)
 
+    use_sel = thr is not None and _select_on()
+
     # Launch on the tensors' CUDA device, not the process's current device.
-    global _LAUNCHES
+    global _LAUNCHES, _SEL_LAUNCHES
     _LAUNCHES += 1
     with torch.cuda.device(scores.device):
         _cutfill[(n_q,)](
@@ -517,6 +564,8 @@ def topk(scores, ordinal, k, scale=None, thr=None, enc=None, rank=None, cscale=N
             HAS_CNRM=cscale is not None,
             HAS_THR=thr is not None,
             HAS_ENC=enc is not None,
+            HAS_SEL=use_sel,
             num_warps=_warps_for(_block),  # 4 spills at BLOCK=8192; 8 does not.
         )
+    _SEL_LAUNCHES += int(use_sel)
     return outk, outi if enc is not None else outi.to(torch.int64), live

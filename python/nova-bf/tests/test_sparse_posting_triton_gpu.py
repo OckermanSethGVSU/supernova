@@ -216,3 +216,197 @@ def test_device_mismatch_declines():
     q = _zipf_csr(5, 50, 3, g).cpu()
     c = _zipf_csr(20, 50, 5, g)
     assert "different devices" in sp.decline_reason(q, c)
+
+
+
+def test_hot_path_on_gpu(monkeypatch):
+    monkeypatch.setattr(sp, "HOT_TOKENS", 64)
+    sp._HOT_PLAN.clear()
+    g = torch.Generator().manual_seed(20)
+    q = _zipf_csr(1500, 4000, 8, g)
+    c = _zipf_csr(8192, 4000, 60, g)
+    got = sp.scores(q, c, cmin=float(c.values().min()))
+    assert sp.usage()["hot_launches"] == 1
+    ref = sp.reference(q, c)
+    assert torch.equal(torch.isneginf(got), torch.isneginf(ref))
+    assert _within_order_bound(got, ref, q, c)
+    again = sp.scores(q, c, cmin=float(c.values().min()))
+    assert torch.equal(got.view(torch.int32), again.view(torch.int32))
+
+
+def test_threshold_select_identical_state_on_gpu(monkeypatch):
+    """pack_topk + the merge fold with the select fast path on and off: the
+    running state after the fold must be bit-identical, and some rows must
+    really take the select path (n_ge <= k) while others take the full one."""
+    from nova_bf import compute as cm
+    from nova_bf import topk_triton as tt
+    from nova_bf.tiebreak import pack, pack_topk
+
+    g = torch.Generator().manual_seed(21)
+    n_q, n_cols, k = 3000, 8192, 1000
+    # ordinal != column, so a select path that writes ordinals is caught
+    ordinal = torch.arange(n_cols, dtype=torch.int64, device=DEV) * 3 + 1000
+    scores = torch.randn(n_q, n_cols, generator=g).to(DEV)
+    srt = scores.sort(dim=1, descending=True).values
+    # row i's state k-th sits at the slice's r_i-th best score, r_i in [1, 2k]
+    r = (torch.arange(n_q, device=DEV) % (2 * k)) + 1
+    kth = srt[torch.arange(n_q, device=DEV), r - 1]
+    base = torch.linspace(5.0, 0.0, k, device=DEV)
+    state = pack(kth[:, None] + base[None, :], torch.arange(10**6, 10**6 + k, device=DEV))
+    enc0 = torch.zeros_like(state)
+    results = []
+    for env in ("", "1"):
+        if env:
+            monkeypatch.setenv("NOVA_BF_NO_TOPK_SELECT", "1")
+        else:
+            monkeypatch.delenv("NOVA_BF_NO_TOPK_SELECT", raising=False)
+        tt.reset_usage()
+        thr = state.min(dim=1).values.contiguous().clone()
+        pk, pe, live = pack_topk(scores, ordinal, k, thr=thr)
+        st, se = cm._merge_topk(state.clone(), enc0.clone(), [(pk, pe, live)], k, thr)
+        results.append((st, se, live, tt.usage()["select_launches"]))
+    assert results[0][3] == 1 and results[1][3] == 0      # select compiled only when on
+    assert torch.equal(results[0][2], results[1][2])
+    assert torch.equal(results[0][0], results[1][0]) and torch.equal(results[0][1], results[1][1])
+    n_ge = (scores >= kth[:, None]).sum(dim=1)
+    assert bool(((n_ge > 0) & (n_ge <= k)).any()) and bool((n_ge > k).any())
+
+
+def test_select_launch_counter_needs_a_threshold():
+    from nova_bf import topk_triton as tt
+    from nova_bf.tiebreak import pack_topk
+
+    s_ = torch.randn(8, 4096, device=DEV)
+    o = torch.arange(4096, dtype=torch.int64, device=DEV)
+    tt.reset_usage()
+    pack_topk(s_, o, 16)
+    assert tt.usage()["select_launches"] == 0
+
+
+def test_hot_path_subnormal_weights_are_present(monkeypatch):
+    monkeypatch.setattr(sp, "HOT_TOKENS", 4)
+    sp._HOT_PLAN.clear()
+    q = torch.sparse_csr_tensor(torch.tensor([0, 1]), torch.tensor([0]),
+                                torch.tensor([1.0]), size=(1, 2)).to(DEV)
+    tiny = 1e-40                                       # float32 subnormal
+    c = torch.sparse_csr_tensor(torch.tensor([0, 1, 2]), torch.tensor([0, 1]),
+                                torch.tensor([tiny, 1.0]), size=(2, 2)).to(DEV)
+    out = sp.scores(q, c, cmin=tiny)
+    assert sp.usage()["hot_launches"] == 1
+    assert out[0, 0].item() > 0.0 and torch.isneginf(out[0, 1])
+
+
+def _assert_staged():
+    from nova_bf import compute as cm
+    ring = cm._sparse_staging(torch.device(DEV))
+    assert isinstance(ring, cm._PinnedStagingRing) and any(ring._slots)
+
+
+def test_pinned_staging_ring():
+    import numpy as np
+
+    from nova_bf import compute as cm
+
+    ring = cm._PinnedStagingRing()
+    arrs = [np.arange(n, dtype=np.int64) * 3 for n in (100, 5000, 70, 9000, 9000)]
+    outs = [ring.upload({"a": a, "b": a.astype(np.float32)}, DEV) for a in arrs]
+    torch.cuda.synchronize()
+    for a, o in zip(arrs, outs):
+        assert torch.equal(o["a"].cpu(), torch.from_numpy(a))
+        assert torch.equal(o["b"].cpu(), torch.from_numpy(a.astype(np.float32)))
+
+
+def test_staged_transfer_matches_pageable(monkeypatch):
+    import numpy as np
+
+    from nova_bf.compute import SparseCorpusBatch
+
+    rng = np.random.default_rng(0)
+    n = 3000
+    counts = rng.integers(1, 20, size=n)
+    offs = np.concatenate(([0], np.cumsum(counts))).astype(np.int64)
+    idx = np.concatenate([np.sort(rng.choice(500, size=c, replace=False)) for c in counts]).astype(np.int64)
+    val = rng.random(int(offs[-1])).astype(np.float32) + 0.01
+    import nova_bf.compute as _cm
+    monkeypatch.setattr(_cm, "_SPARSE_STAGING", None)   # fresh ring: _assert_staged proves this test staged
+    b = SparseCorpusBatch(offs, idx, val, None, np.arange(500), False)
+    a = b.transfer(100, 2900, DEV).Cb
+    _assert_staged()
+    monkeypatch.setenv("NOVA_BF_NO_SPARSE_PINNED", "1")
+    p = b.transfer(100, 2900, DEV).Cb
+    assert a.shape == p.shape
+    assert torch.equal(a.crow_indices(), p.crow_indices())
+    assert torch.equal(a.col_indices(), p.col_indices())
+    assert torch.equal(a.values(), p.values())
+
+
+def test_staged_transfer_and_scoring_make_no_host_syncs(monkeypatch):
+    import numpy as np
+
+    from nova_bf.compute import SparseBatchSlice, SparseCorpusBatch, _SparseQueryCache
+
+    rng = np.random.default_rng(1)
+    n, vocab = 8192, 2000
+    counts = rng.integers(5, 60, size=n)
+    offs = np.concatenate(([0], np.cumsum(counts))).astype(np.int64)
+    idx = np.concatenate([np.sort(rng.choice(vocab, size=c, replace=False)) for c in counts]).astype(np.int64)
+    val = rng.random(int(offs[-1])).astype(np.float32) + 0.01
+    cache = _SparseQueryCache()
+    cache.kernel = "posting"
+    b = SparseCorpusBatch(offs, idx, val, None, np.arange(vocab), False,
+                          zero_gate_ok=True, q_cache=cache)
+    g = torch.Generator().manual_seed(22)
+    Q = _zipf_csr(400, vocab, 8, g).to_dense()
+    import nova_bf.compute as _cm
+    monkeypatch.setattr(_cm, "_SPARSE_STAGING", None)   # fresh ring: _assert_staged proves this test staged
+    b.transfer(0, n, DEV).score(Q, "dot")          # warm: query caches, compile, self-check
+    torch.cuda.synchronize()
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        sl = b.transfer(0, n, DEV)
+        sl.score(Q, "dot")
+    finally:
+        torch.cuda.set_sync_debug_mode("default")
+    _assert_staged()
+
+
+
+def test_pinned_ring_never_overwrites_a_pending_copy():
+    """Delay the stream, then upload A, B and C: C reuses A's slot and must
+    wait for A's copy, so A's device data stays intact."""
+    import numpy as np
+
+    from nova_bf import compute as cm
+
+    ring = cm._PinnedStagingRing()
+    a = np.arange(4_000_000, dtype=np.int64)
+    b_ = a * 2
+    c = a * 3
+    torch.cuda._sleep(int(1e9))
+    da = ring.upload({"x": a}, DEV)["x"]
+    ring.upload({"x": b_}, DEV)
+    ring.upload({"x": c}, DEV)
+    torch.cuda.synchronize()
+    assert torch.equal(da.cpu(), torch.from_numpy(a))
+
+
+def test_cutfill_register_report(capsys):
+    """Not an assertion on speed: record registers/spills of every compiled
+    `_cutfill` variant (the select branch sits near the register limit)."""
+    import gc
+
+    from nova_bf.tiebreak import pack_topk
+
+    s_ = torch.randn(64, 8192, device=DEV)
+    o = torch.arange(8192, dtype=torch.int64, device=DEV)
+    thr = torch.full((64,), -(1 << 62), dtype=torch.int64, device=DEV)
+    enc = torch.arange(8192, dtype=torch.int64, device=DEV)
+    pack_topk(s_, o, 1000, thr=thr.clone(), encoded=enc)
+    pack_topk(s_, o, 1000, thr=thr.clone())
+    rows = []
+    for obj in gc.get_objects():
+        if type(obj).__name__ == "CompiledKernel" and "cutfill" in str(getattr(obj, "name", "")):
+            rows.append((getattr(obj, "n_regs", None), getattr(obj, "n_spills", None)))
+    with capsys.disabled():
+        print("\n_cutfill compiled variants (n_regs, n_spills):", rows)
+    assert rows, "no compiled _cutfill found"

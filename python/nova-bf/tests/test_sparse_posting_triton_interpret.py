@@ -24,7 +24,7 @@ import numpy as np
 import pytest
 
 _CHILD = os.environ.get("NOVA_BF_SPARSE_POSTING_INTERPRET_CHILD") == "1"
-_MIN_CHILD_TESTS = 120
+_MIN_CHILD_TESTS = 171
 
 
 def test_the_interpreted_suite_passes():
@@ -999,7 +999,7 @@ if _CHILD:
 
         q = _kcsr([([0], [1.0])], 4)
         c = _kcsr([([0], [2.0]), ([1], [3.0])], 4)
-        monkeypatch.setattr(sp, "scores", lambda qc, cb: torch.full((1, 2), 7.0))
+        monkeypatch.setattr(sp, "scores", lambda qc, cb, cmin=None: torch.full((1, 2), 7.0))
         cache = _SparseQueryCache()
         cache.kernel = "auto"
         assert SparseBatchSlice(c, None, True, cache).score(q.to_dense(), "dot").tolist() \
@@ -1226,3 +1226,523 @@ if _CHILD:
         q = _kcsr([([0], [1.0])], 2)
         c = _kcsr([([0], [1.0])], 2)
         assert sp.decline_reason(q, c) == "not a CUDA slice"
+
+
+if _CHILD:
+    # --- dense hot-token path ------------------------------------------------------
+
+    def _pos_csr(n, vocab, lo, hi, g, hot=()):
+        return _rand_csr(n, vocab, lo, hi, g, False, hot=hot)
+
+    def _hot(monkeypatch, n):
+        monkeypatch.setattr(sp, "HOT_TOKENS", n)
+        sp._HOT_PLAN.clear()
+
+    @pytest.mark.parametrize("db", [16, 512])
+    @pytest.mark.parametrize("n_hot", [1, 4, 64, 1000])
+    @pytest.mark.parametrize("seed", [0, 1])
+    def test_hot_path_matches_float64_truth(db, n_hot, seed, monkeypatch):
+        _layout(monkeypatch, db)
+        _hot(monkeypatch, n_hot)
+        g = torch.Generator().manual_seed(60 + seed)
+        q = _pos_csr(37, 60, 0, 9, g)                  # includes empty queries
+        c = _pos_csr(700, 60, 0, 25, g, hot=(3, 7))    # long postings, n_rows % db != 0
+        before = sp.usage()["hot_launches"]
+        out = sp.scores(q, c, cmin=float(c.values().min()))
+        assert sp.usage()["hot_launches"] == before + 1
+        _check(out, q, c)
+
+    def test_hot_path_all_hot_and_all_cold_queries(monkeypatch):
+        _layout(monkeypatch, 64)
+        _hot(monkeypatch, 3)
+        # tokens 0,1,2 are the most frequent (hot); 5,6 are cold
+        q = _kcsr([([0, 1, 2], [1.0, 2.0, 3.0]), ([5, 6], [1.0, 1.0]),
+                   ([0], [1.0]), ([0], [1.0]), ([1], [1.0]), ([2], [1.0]), ([], [])], 8)
+        g = torch.Generator().manual_seed(61)
+        c = _pos_csr(150, 8, 1, 6, g)
+        _check(sp.scores(q, c, cmin=float(c.values().min())), q, c)
+        hotidx, n_hot = sp.hot_plan(q)
+        assert n_hot == 3 and sorted(int(i) for i in (hotidx >= 0).nonzero().flatten()) == [0, 1, 2]
+
+    def test_hot_path_is_deterministic(monkeypatch):
+        _layout(monkeypatch, 64)
+        _hot(monkeypatch, 8)
+        g = torch.Generator().manual_seed(62)
+        q = _pos_csr(20, 40, 2, 8, g)
+        c = _pos_csr(300, 40, 2, 12, g)
+        a = sp.scores(q, c, cmin=1e-3)
+        b = sp.scores(q, c, cmin=1e-3)
+        assert torch.equal(a.view(torch.int32), b.view(torch.int32))
+
+    @pytest.mark.parametrize("cmin", [None, 0.0, -1.0])
+    def test_hot_path_needs_a_positive_slice_minimum(cmin, monkeypatch):
+        _hot(monkeypatch, 8)
+        g = torch.Generator().manual_seed(63)
+        q = _pos_csr(10, 30, 2, 5, g)
+        c = _pos_csr(80, 30, 2, 6, g)
+        sp.scores(q, c, cmin=cmin)
+        assert sp.usage()["hot_launches"] == 0
+
+    def test_hot_plan_rules(monkeypatch):
+        _layout(monkeypatch, 512)
+        _hot(monkeypatch, 2)
+        q = _kcsr([([1, 2, 3], [1.0, 1.0, 1.0]), ([2, 3], [1.0, 1.0]), ([3], [1.0])], 5)
+        hotidx, n = sp.hot_plan(q)
+        assert n == 2 and hotidx.tolist() == [-1, -1, 1, 0, -1]      # by frequency
+        qt = _kcsr([([0, 1], [1.0, 1.0]), ([0, 1], [1.0, 1.0])], 3)  # tie -> lower id first
+        sp._HOT_PLAN.clear()
+        assert sp.hot_plan(qt)[0].tolist() == [0, 1, -1]
+        neg = _kcsr([([0, 1], [1.0, -1.0])], 3)                       # a negative query weight
+        sp._HOT_PLAN.clear()
+        assert sp.hot_plan(neg) == (None, 0)
+        monkeypatch.setattr(sp, "DOC_BLOCK", 0)                        # row layout: no hot path
+        sp._HOT_PLAN.clear()
+        assert sp.hot_plan(q) == (None, 0)
+        monkeypatch.setattr(sp, "DOC_BLOCK", 512)
+        _hot(monkeypatch, 0)                                            # disabled
+        assert sp.hot_plan(q) == (None, 0)
+
+    def test_hot_plan_cache_follows_config(monkeypatch):
+        _layout(monkeypatch, 512)
+        _hot(monkeypatch, 1)
+        q = _kcsr([([0, 1], [1.0, 1.0]), ([1], [1.0])], 3)
+        assert sp.hot_plan(q)[1] == 1
+        monkeypatch.setattr(sp, "HOT_TOKENS", 2)       # no explicit clear: key must change
+        assert sp.hot_plan(q)[1] == 2
+
+    def test_hot_table_contents():
+        c = _kcsr([([0, 2], [1.5, 2.5]), ([2], [4.0]), ([1], [9.0])], 3)
+        ptr, prow, pval = sp.corpus_postings(c)
+        hotidx = torch.tensor([-1, -1, 0], dtype=torch.int32)
+        t = sp.hot_table(ptr, prow, pval, hotidx, 1, 3, 3).view(2, 3)
+        assert t[0].tolist() == [2.5, 4.0, 0.0]          # token 2 (hot row 0) per doc
+
+    def test_selfcheck_catches_a_bad_hot_table(monkeypatch):
+        _layout(monkeypatch, 64)
+        _hot(monkeypatch, 4)
+        g = torch.Generator().manual_seed(64)
+        q = _pos_csr(12, 30, 2, 5, g)
+        c = _pos_csr(120, 30, 2, 6, g)
+        real = sp.hot_table
+        monkeypatch.setattr(sp, "hot_table", lambda *a, **k: real(*a, **k) * 1.5)
+        with pytest.raises(sp.KernelMismatch):
+            sp.scores(q, c, cmin=1e-3)
+
+    def test_hot_and_cold_configurations_are_checked_separately(monkeypatch):
+        _layout(monkeypatch, 64)
+        _hot(monkeypatch, 4)
+        g = torch.Generator().manual_seed(65)
+        q = _pos_csr(12, 30, 2, 5, g)
+        c = _pos_csr(128, 30, 2, 6, g)
+        sp.scores(q, c, cmin=None)
+        sp.scores(q, c, cmin=1e-3)
+        assert sp.usage()["selfchecks"] == 2
+
+    @pytest.mark.parametrize("signed", [False, True])
+    def test_run_compute_takes_the_hot_path_only_on_positive_data(tmp_path, signed, monkeypatch):
+        from nova_bf.compute import run_compute
+        from nova_bf.config import SearchSpec
+
+        _hot(monkeypatch, 8)
+        cdir, qpath = _dataset(tmp_path, signed)
+        run_compute(_cfg(cdir, qpath, tmp_path / "o", "auto",
+                         [SearchSpec(name="d", k=5, metric="dot", vector_type="sparse")], batch=150))
+        assert (sp.usage()["hot_launches"] > 0) == (not signed)
+
+    # --- threshold select in _cutfill ------------------------------------------------
+
+    def _cutfill_launch(scores, thr, k, sel, enc=None):
+        from nova_bf import topk_triton as tt
+
+        n_q, n_cols = scores.shape
+        ordinal = torch.arange(n_cols, dtype=torch.int64)
+        rank = tt.rank_of(ordinal)
+        block = tt._triton.next_power_of_2(n_cols)
+        outk = torch.full((n_q, k), 777, dtype=torch.int64)
+        outi = torch.full((n_q, k), 777, dtype=torch.int64 if enc is not None else torch.int32)
+        live = torch.full((n_q,), 9, dtype=torch.uint8)
+        tt._cutfill[(n_q,)](
+            scores, scores, scores, rank, ordinal, enc if enc is not None else scores,
+            outk, outi, thr, live, scores.stride(0), n_cols, k,
+            BLOCK=block, RBITS=max(1, int(n_cols).bit_length()),
+            HAS_NRM=False, HAS_CNRM=False, HAS_THR=True, HAS_ENC=enc is not None,
+            HAS_SEL=sel)
+        return outk, outi, live
+
+    def _fold_ref(state, part, live, k):
+        """Reference fold: top-k of state ∪ part for live rows; dead rows keep state."""
+        out = state.clone()
+        for r in range(state.shape[0]):
+            if live[r]:
+                out[r] = torch.cat([state[r], part[r]]).sort(descending=True).values[:k]
+        return out
+
+    def _state_and_thr(n_q, k, kth_scores):
+        from nova_bf.tiebreak import pack
+
+        # a full state whose k-th (smallest) key has the given score
+        st = torch.stack([pack(torch.linspace(float(s_) + 5, float(s_), k)[None, :],
+                               torch.arange(10 ** 6, 10 ** 6 + k))[0] for s_ in kth_scores])
+        return st, st.min(dim=1).values.contiguous()
+
+    @pytest.mark.parametrize("enc", [False, True])
+    @pytest.mark.parametrize("seed", [0, 1, 2])
+    def test_threshold_select_folds_identically(enc, seed):
+        g = torch.Generator().manual_seed(70 + seed)
+        n_q, n_cols, k = 30, 300, 20
+        scores = torch.randn(n_q, n_cols, generator=g) * 2
+        # thresholds spanning dead rows, few survivors (select), many (> k: full path)
+        kth = torch.quantile(scores, torch.linspace(0.6, 1.05, n_q).clamp(max=1.0), dim=1).diagonal()
+        kth[-3:] = scores.max(dim=1).values[-3:] + 1.0                 # dead rows
+        state, thr = _state_and_thr(n_q, k, kth)
+        e = torch.arange(n_cols, dtype=torch.int64) * 7 + 3 if enc else None
+        a = _cutfill_launch(scores, thr, k, False, e)
+        b = _cutfill_launch(scores, thr, k, True, e)
+        assert torch.equal(a[2], b[2])                                  # identical liveness
+        assert torch.equal(_fold_ref(state, a[0], a[2], k), _fold_ref(state, b[0], b[2], k))
+        n_ge = (scores >= kth[:, None]).sum(dim=1)
+        assert ((n_ge > 0) & (n_ge <= k)).any() and (n_ge > k).any()  # both paths ran
+
+    def test_threshold_select_ties_and_boundaries():
+        from nova_bf.tiebreak import NEUTRAL_KEY, pack
+
+        k = 4
+        # row 0: exactly k lanes at/above; row 1: k+1 (full path); row 2: ties at the cut
+        scores = torch.tensor([[5.0, 4.0, 3.0, 2.0, 1.0, 0.0, -1.0, -2.0],
+                               [5.0, 4.0, 3.0, 2.0, 2.0, 0.0, -1.0, -2.0],
+                               [2.0, 2.0, 2.0, 1.0, 0.0, 0.0, -1.0, float("-inf")]])
+        kth = torch.tensor([2.0, 2.0, 2.0])
+        state, thr = _state_and_thr(3, k, kth)
+        a = _cutfill_launch(scores, thr, k, False)
+        b = _cutfill_launch(scores, thr, k, True)
+        assert torch.equal(_fold_ref(state, a[0], a[2], k), _fold_ref(state, b[0], b[2], k))
+        # row 2 took the select path: 3 real keys then NEUTRAL padding
+        assert (b[0][2] == NEUTRAL_KEY).sum() == 1
+
+    def test_threshold_select_skips_rows_whose_state_is_not_full():
+        # an under-filled state carries the -inf sentinel threshold: every lane
+        # counts, so the row must take the full path (no NEUTRAL padding)
+        from nova_bf.tiebreak import NEUTRAL_KEY, SENTINEL_KEY
+
+        scores = torch.tensor([[float("-inf")] * 6 + [1.0, 2.0]])
+        thr = torch.tensor([SENTINEL_KEY], dtype=torch.int64)
+        a = _cutfill_launch(scores, thr, 4, False)
+        b = _cutfill_launch(scores, thr, 4, True)
+        assert torch.equal(a[0], b[0]) and not (b[0] == NEUTRAL_KEY).any()
+
+    def test_threshold_select_kill_switch(monkeypatch):
+        from nova_bf import topk_triton as tt
+
+        assert tt._select_on()
+        monkeypatch.setenv("NOVA_BF_NO_TOPK_SELECT", "1")
+        assert not tt._select_on()
+
+    # --- pinned staging ----------------------------------------------------------------
+
+    def test_pinned_staging_is_off_on_cpu(monkeypatch):
+        from nova_bf import compute as cm
+
+        assert cm._sparse_staging("cpu") is None
+        monkeypatch.setenv("NOVA_BF_NO_SPARSE_PINNED", "1")
+        assert cm._sparse_staging("cuda:0") is None
+
+    def test_transfer_computes_host_value_range():
+        import numpy as np
+
+        from nova_bf.compute import SparseCorpusBatch
+
+        offs = np.array([0, 2, 3, 5], dtype=np.int64)
+        idx = np.array([0, 1, 1, 0, 2], dtype=np.int64)
+        val = np.array([1.0, 7.0, 2.0, 3.0, 0.5], dtype=np.float32)
+        sl = SparseCorpusBatch(offs, idx, val, None, np.arange(3), False).transfer(0, 3, "cpu")
+        assert sl.value_absmax == 7.0 and sl.value_min == 0.5
+        val[1] = -9.0
+        sl = SparseCorpusBatch(offs, idx, val, None, np.arange(3), False).transfer(0, 3, "cpu")
+        assert sl.value_absmax == 9.0 and sl.value_min == -9.0
+        val[1] = np.nan
+        sl = SparseCorpusBatch(offs, idx, val, None, np.arange(3), False).transfer(0, 3, "cpu")
+        assert np.isnan(sl.value_absmax)
+
+    def test_decline_uses_the_host_absmax():
+        q = _kcsr([(list(range(10)), [1e17] * 10)], 10)
+        c = _kcsr([([0], [1.0])], 10)
+        assert sp.decline_reason(q, c) is None
+        assert "overflow" in sp.decline_reason(q, c, cmax=5e18)
+        assert "non-finite" in sp.decline_reason(q, c, cmax=float("nan"))
+
+
+if _CHILD:
+    # --- round-1 mutation killers (select, hot path, host range) ------------------
+    import math
+    import numpy as np
+
+    def _sel_launch(scores, thr, k, sel, enc=None, guard=False):
+        from nova_bf import topk_triton as tt
+        n_q, n_cols = scores.shape
+        ordinal = torch.arange(n_cols, dtype=torch.int64)
+        rank = tt.rank_of(ordinal)
+        block = tt._triton.next_power_of_2(n_cols)
+        big_k = torch.full((n_q + 1, k), 777, dtype=torch.int64)
+        big_i = torch.full((n_q + 1, k), 777, dtype=torch.int64 if enc is not None else torch.int32)
+        outk, outi = big_k[:n_q], big_i[:n_q]
+        live = torch.full((n_q,), 9, dtype=torch.uint8)
+        tt._cutfill[(n_q,)](
+            scores, scores, scores, rank, ordinal, enc if enc is not None else scores,
+            outk, outi, thr, live, scores.stride(0), n_cols, k,
+            BLOCK=block, RBITS=max(1, int(n_cols).bit_length()),
+            HAS_NRM=False, HAS_CNRM=False, HAS_THR=True, HAS_ENC=enc is not None, HAS_SEL=sel)
+        return outk, outi, live, big_k[n_q], big_i[n_q]
+
+
+    def _sel_setup(seed):
+        from nova_bf.tiebreak import pack
+        g = torch.Generator().manual_seed(seed)
+        n_q, n_cols, k = 12, 40, 6
+        scores = torch.randn(n_q, n_cols, generator=g)
+        srt = scores.sort(dim=1, descending=True).values
+        kth = srt[torch.arange(n_q), torch.arange(n_q) % 5]          # n_ge in 1..5 <= k: select
+        st = torch.stack([pack(torch.linspace(float(s) + 5, float(s), k)[None, :],
+                               torch.arange(10 ** 6, 10 ** 6 + k))[0] for s in kth])
+        return scores, st.min(dim=1).values.contiguous(), k
+
+
+    @pytest.mark.parametrize("enc", [False, True])
+    def test_select_ids_match_full_path(enc):
+        scores, thr, k = _sel_setup(5)
+        e = torch.arange(scores.shape[1], dtype=torch.int64) * 7 + 3 if enc else None
+        a = _sel_launch(scores, thr, k, False, e)
+        b = _sel_launch(scores, thr, k, True, e)
+        from nova_bf.tiebreak import NEUTRAL_KEY
+        for r in range(scores.shape[0]):
+            ma = {int(x): int(y) for x, y in zip(a[0][r], a[1][r])}
+            mb = {int(x): int(y) for x, y in zip(b[0][r], b[1][r]) if int(x) != NEUTRAL_KEY}
+            for key, idx in mb.items():
+                assert ma[key] == idx, (r, key, idx, ma.get(key))
+
+
+    def test_select_never_writes_past_its_row():
+        scores, thr, k = _sel_setup(6)
+        for e in (None, torch.arange(scores.shape[1], dtype=torch.int64)):
+            o = _sel_launch(scores, thr, k, True, e)
+            assert (o[3] == 777).all() and (o[4] == 777).all()
+
+
+    def test_select_writes_liveness():
+        scores, thr, k = _sel_setup(7)
+        live = _sel_launch(scores, thr, k, True)[2]
+        assert set(live.tolist()) <= {0, 1}
+
+
+    def test_slice_passes_host_absmax_to_decline():
+        from nova_bf.compute import SparseBatchSlice, _SparseQueryCache
+        q = _kcsr([([0], [1.0])], 4)
+        c = _kcsr([([0], [2.0]), ([1], [3.0])], 4)
+        cache = _SparseQueryCache()
+        cache.kernel = "posting"
+        with pytest.raises(RuntimeError, match="non-finite"):
+            SparseBatchSlice(c, None, True, cache, value_absmax=float("nan")).score(q.to_dense(), "dot")
+
+
+    def test_hot_plan_not_reused_for_another_query_csr(monkeypatch):
+        _layout(monkeypatch, 16)
+        monkeypatch.setattr(sp, "HOT_TOKENS", 2)
+        sp._HOT_PLAN.clear()
+        q1 = _kcsr([([0, 1], [1.0, 1.0])], 3)
+        c1 = _kcsr([([0, 1], [1.0, 2.0])], 3)
+        sp.scores(q1, c1, cmin=1.0)
+        q2 = _kcsr([([5, 50], [1.0, 2.0])], 60)
+        c2 = _kcsr([([5, 50], [1.0, 2.0]), ([7], [1.0])], 60)
+        out = sp.scores(q2, c2, cmin=1.0)
+        _check(out, q2, c2)
+        h, n = sp.hot_plan(q2)
+        assert h.numel() == 60 and int(h[5]) >= 0 and int(h[50]) >= 0
+
+
+    def test_hot_underflow_product_is_zero_not_untouched(monkeypatch):
+        _layout(monkeypatch, 16)
+        monkeypatch.setattr(sp, "HOT_TOKENS", 4)
+        sp._HOT_PLAN.clear()
+        q = _kcsr([([0], [1e-30])], 2)
+        c = _kcsr([([0], [1e-30]), ([1], [1.0])], 2)
+        out = sp.scores(q, c, cmin=1e-30)
+        assert sp.usage()["hot_launches"] == 1
+        assert out[0, 0].item() == 0.0 and math.isinf(out[0, 1].item())
+
+
+    def test_transfer_range_is_the_slice_only():
+        from nova_bf.compute import SparseCorpusBatch
+        offs = np.array([0, 2, 3, 5], dtype=np.int64)
+        idx = np.array([0, 1, 1, 0, 2], dtype=np.int64)
+        val = np.array([-9.0, 7.0, 2.0, 3.0, 0.5], dtype=np.float32)
+        sl = SparseCorpusBatch(offs, idx, val, None, np.arange(3), False).transfer(1, 2, "cpu")
+        assert sl.value_absmax == 2.0 and sl.value_min == 2.0
+
+
+    def test_transfer_skips_range_for_cusparse_and_empty():
+        from nova_bf.compute import SparseCorpusBatch, _SparseQueryCache
+        offs = np.array([0, 0, 1], dtype=np.int64)
+        idx = np.array([0], dtype=np.int64)
+        val = np.array([1.0], dtype=np.float32)
+        b = SparseCorpusBatch(offs, idx, val, None, np.arange(3), False)
+        sl = b.transfer(0, 1, "cpu")
+        assert sl.value_absmax is None and sl.value_min is None
+        cache = _SparseQueryCache()
+        cache.kernel = "cusparse"
+        sl = SparseCorpusBatch(offs, idx, val, None, np.arange(3), False, q_cache=cache).transfer(0, 2, "cpu")
+        assert sl.value_absmax is None
+
+
+    def test_nan_slice_min_propagates():
+        from nova_bf.compute import SparseCorpusBatch
+        offs = np.array([0, 2], dtype=np.int64)
+        idx = np.array([0, 1], dtype=np.int64)
+        val = np.array([np.nan, 1.0], dtype=np.float32)
+        sl = SparseCorpusBatch(offs, idx, val, None, np.arange(2), False).transfer(0, 1, "cpu")
+        assert np.isnan(sl.value_min)
+
+
+    def test_select_kplus1_lanes_take_the_full_path():
+        from nova_bf.tiebreak import pack
+        k = 2
+        # flat state at score 1.0: three lanes >= thr (k+1); the best lane is last in column order
+        st = pack(torch.tensor([[1.0, 1.0]]), torch.tensor([10 ** 6, 10 ** 6 + 1]))
+        thr = st.min(dim=1).values.contiguous()
+        scores = torch.tensor([[1.5, 2.0, 0.0, 3.0]])
+        o = _sel_launch(scores, thr, k, True)
+        full = _sel_launch(scores, thr, k, False)
+        assert sorted(o[0][0].tolist()) == sorted(full[0][0].tolist())
+        assert (o[3] == 777).all()
+
+
+    def test_liveness_is_exact():
+        from nova_bf.tiebreak import pack
+        k = 2
+        st = pack(torch.tensor([[1.0, 1.0], [5.0, 5.0]]), torch.tensor([10 ** 6, 10 ** 6 + 1]))
+        thr = st.min(dim=1).values.contiguous()
+        scores = torch.tensor([[1.5, 2.0, 0.0, 3.0], [1.5, 2.0, 0.0, 3.0]])
+        for sel in (False, True):
+            assert _sel_launch(scores, thr, k, sel)[2].tolist() == [1, 0]
+
+
+    def test_stored_zero_slice_never_takes_the_hot_path(monkeypatch):
+        from nova_bf.compute import SparseCorpusBatch, _SparseQueryCache
+        _layout(monkeypatch, 16)
+        monkeypatch.setattr(sp, "HOT_TOKENS", 4)
+        sp._HOT_PLAN.clear()
+        offs = np.array([0, 1, 2], dtype=np.int64)
+        idx = np.array([0, 1], dtype=np.int64)
+        val = np.array([0.0, 2.0], dtype=np.float32)          # row 0: a stored zero
+        cache = _SparseQueryCache()
+        cache.kernel = "posting"
+        sl = SparseCorpusBatch(offs, idx, val, None, np.arange(3), False, q_cache=cache).transfer(0, 2, "cpu")
+        raw = sl._posting_raw(torch.tensor([[1.0, 1.0, 0.0]]), cache)
+        assert sp.usage()["hot_launches"] == 0
+        assert raw[0].tolist() == [0.0, 2.0]                  # stored zero is a candidate (0.0, not -inf)
+
+    def test_threshold_select_under_an_exchange_threshold():
+        # A rank's state not yet full (sentinel slots) but a finite peer bound:
+        # the select path drops lanes below the bound; folding must still give
+        # the same entries at or above the bound as the full path.
+        from nova_bf.tiebreak import SENTINEL_KEY, pack
+
+        k = 4
+        state = torch.full((1, k), SENTINEL_KEY, dtype=torch.int64)
+        state[0, :2] = pack(torch.tensor([[9.0, 8.0]]), torch.tensor([10**6, 10**6 + 1]))[0]
+        peer = pack(torch.tensor([[2.0]]), torch.tensor([0]))[:, 0]       # peer's k-th
+        thr = torch.maximum(state.min(dim=1).values, peer).contiguous()
+        scores = torch.tensor([[5.0, 1.0, 3.0, 0.5, 2.5, 1.5, -1.0, 0.0]])
+        a = _sel_launch(scores, thr, k, False)
+        b = _sel_launch(scores, thr, k, True)
+        fa = torch.cat([state[0], a[0][0]]).sort(descending=True).values[:k]
+        fb = torch.cat([state[0], b[0][0]]).sort(descending=True).values[:k]
+        bound = int(thr[0])
+        assert fa[fa >= bound].tolist() == fb[fb >= bound].tolist()
+
+
+if _CHILD:
+    # --- round-2 mutation killers ------------------------------------------------
+
+    def _sel_launch_ord(scores, thr, k, sel, ordinal):
+        from nova_bf import topk_triton as tt
+        n_q, n_cols = scores.shape
+        rank = tt.rank_of(ordinal)
+        outk = torch.full((n_q, k), 777, dtype=torch.int64)
+        outi = torch.full((n_q, k), 777, dtype=torch.int32)
+        live = torch.full((n_q,), 9, dtype=torch.uint8)
+        tt._cutfill[(n_q,)](
+            scores, scores, scores, rank, ordinal, scores,
+            outk, outi, thr, live, scores.stride(0), n_cols, k,
+            BLOCK=tt._triton.next_power_of_2(n_cols), RBITS=max(1, int(n_cols).bit_length()),
+            HAS_NRM=False, HAS_CNRM=False, HAS_THR=True, HAS_ENC=False, HAS_SEL=sel)
+        return outk, outi, live
+
+    def test_select_ids_are_columns_not_ordinals():
+        # Without `encoded`, OUTI holds the winning COLUMN (the caller maps it to
+        # an ordinal); ordinals != columns here, unlike every other select test.
+        from nova_bf.tiebreak import NEUTRAL_KEY, pack
+        g = torch.Generator().manual_seed(9)
+        n_q, n_cols, k = 12, 40, 6
+        scores = torch.randn(n_q, n_cols, generator=g)
+        ordinal = torch.arange(n_cols, dtype=torch.int64) * 3 + 1000
+        kth = scores.sort(dim=1, descending=True).values[torch.arange(n_q), torch.arange(n_q) % 5]
+        st = torch.stack([pack(torch.linspace(float(s) + 5, float(s), k)[None, :],
+                               torch.arange(10 ** 6, 10 ** 6 + k))[0] for s in kth])
+        thr = st.min(dim=1).values.contiguous()
+        a = _sel_launch_ord(scores, thr, k, False, ordinal)
+        b = _sel_launch_ord(scores, thr, k, True, ordinal)
+        for r in range(n_q):
+            ma = {int(x): int(y) for x, y in zip(a[0][r], a[1][r])}
+            got = [(int(x), int(y)) for x, y in zip(b[0][r], b[1][r]) if int(x) != NEUTRAL_KEY]
+            assert got
+            for key, idx in got:
+                assert 0 <= idx < n_cols and ma[key] == idx, (r, key, idx)
+
+    def test_staging_fits_is_per_array_and_inclusive(monkeypatch):
+        from nova_bf import compute as cm
+        monkeypatch.setattr(cm._PinnedStagingRing, "MAX_ELEMS", 4)
+        r = cm._PinnedStagingRing()
+        assert r.fits({"a": np.zeros(4), "b": np.zeros(1)})            # == MAX fits
+        assert not r.fits({"a": np.zeros(5), "b": np.zeros(1)})
+        assert not r.fits({"a": np.zeros(1), "b": np.zeros(5)})        # every array
+
+    class _FakeRing:
+        def __init__(self, ok):
+            self.ok, self.calls = ok, 0
+
+        def fits(self, parts):
+            return self.ok
+
+        def upload(self, parts, device):
+            self.calls += 1
+            return {n: torch.from_numpy(np.ascontiguousarray(v)).clone() for n, v in parts.items()}
+
+    @pytest.mark.parametrize("idx_dtype", [np.int32, np.int64])
+    def test_staged_csr_branch_matches_pageable_on_cpu(idx_dtype, monkeypatch):
+        from nova_bf import compute as cm
+        offs = np.array([0, 2, 3, 3, 6, 7], dtype=np.int64)
+        idx = np.array([0, 3, 1, 0, 2, 4, 3], dtype=idx_dtype)
+        val = np.arange(1, 8, dtype=np.float32)
+        vocab = np.arange(5)
+        ref = cm._sparse_batch_to_csr(offs, idx, val, 1, 5, vocab, "cpu").to_dense()
+        for ok in (True, False):
+            ring = _FakeRing(ok)
+            monkeypatch.setattr(cm, "_sparse_staging", lambda d, ring=ring: ring)
+            got = cm._sparse_batch_to_csr(offs, idx, val, 1, 5, vocab, "cpu")
+            assert ring.calls == int(ok)                     # oversize slice: pageable
+            assert got.shape == (4, 5) and torch.equal(got.to_dense(), ref)
+
+    def test_reset_drops_the_hot_plan(monkeypatch):
+        _hot(monkeypatch, 2)
+        q = _kcsr([([0, 1], [1.0, 1.0])], 3)
+        sp.hot_plan(q)
+        assert sp._HOT_PLAN
+        sp.reset()
+        assert not sp._HOT_PLAN
+
+    def test_hot_path_with_a_stored_zero_query_weight(monkeypatch):
+        # probe for S09 (positivity check v>0 -> v>=0): correctness only
+        _layout(monkeypatch, 16)
+        _hot(monkeypatch, 4)
+        q = _kcsr([([0, 1], [0.0, 1.0]), ([0], [0.0])], 3)
+        c = _kcsr([([0], [2.0]), ([1], [3.0]), ([2], [1.0])], 3)
+        _check(sp.scores(q, c, cmin=1.0), q, c)

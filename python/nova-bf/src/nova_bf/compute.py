@@ -794,6 +794,70 @@ def _remap_sparse_file(
     return np.concatenate(([0], np.cumsum(counts))).astype(np.int64), m_idx, m_val
 
 
+class _PinnedStagingRing:
+    """Use two reusable pinned host buffers per array type for asynchronous
+    GPU transfers. Wait for each buffer's previous copy before reusing it.
+
+    Buffers grow as needed and are reused across slices. Arrays exceeding
+    MAX_ELEMS use pageable memory instead to limit pinned memory usage.
+    NOVA_BF_NO_SPARSE_PINNED disables pinned staging."""
+
+    # Per array: 16M elements = 64 MiB at 4 bytes, 128 MiB at 8.
+    MAX_ELEMS = 16 << 20
+
+    def __init__(self):
+        import threading
+
+        self._slots = [dict(), dict()]
+        self._events = [None, None]
+        self._next = 0
+        self._lock = threading.Lock()
+
+    def fits(self, arrays: dict) -> bool:
+        return all(int(np.asarray(a).size) <= self.MAX_ELEMS for a in arrays.values())
+
+    def upload(self, arrays: dict, device: str) -> dict:
+        """Copy host numpy arrays to `device` through one pinned slot; returns
+        the device tensors. The copies, and the event that guards the slot,
+        are ordered on `device`'s current stream."""
+        import torch
+
+        with self._lock, torch.cuda.device(torch.device(device)):
+            i = self._next
+            self._next = 1 - i
+            ev = self._events[i]
+            if ev is not None:
+                ev.synchronize()      # that slot's copy (two slices ago) is done
+            slot = self._slots[i]
+            out = {}
+            for name, arr in arrays.items():
+                src = torch.from_numpy(np.ascontiguousarray(arr))
+                buf = slot.get(name)
+                if buf is None or buf.dtype != src.dtype or buf.numel() < src.numel():
+                    cap = max(1, int(src.numel() * 1.25))
+                    buf = torch.empty(cap, dtype=src.dtype, pin_memory=True)
+                    slot[name] = buf
+                stage = buf[: src.numel()]
+                stage.copy_(src)
+                out[name] = stage.to(device, non_blocking=True)
+            ev = torch.cuda.Event()
+            ev.record()
+            self._events[i] = ev
+            return out
+
+
+_SPARSE_STAGING: _PinnedStagingRing | None = None
+
+
+def _sparse_staging(device: str) -> _PinnedStagingRing | None:
+    global _SPARSE_STAGING
+    if not str(device).startswith("cuda") or os.environ.get("NOVA_BF_NO_SPARSE_PINNED"):
+        return None
+    if _SPARSE_STAGING is None:
+        _SPARSE_STAGING = _PinnedStagingRing()
+    return _SPARSE_STAGING
+
+
 def _sparse_batch_to_csr(
     row_offsets: np.ndarray, indices: np.ndarray, values: np.ndarray,
     r0: int, r1: int, vocab: np.ndarray, device: str,
@@ -815,6 +879,12 @@ def _sparse_batch_to_csr(
         )
     crow = (row_offsets[r0 : r1 + 1] - lo).astype(idx_dtype, copy=False)
     indices = indices.astype(idx_dtype, copy=False)
+    staging = _sparse_staging(device)
+    parts = {"crow": crow, "col": indices[lo:hi], "val": values[lo:hi]}
+    if staging is not None and staging.fits(parts):
+        d = staging.upload(parts, device)
+        return torch.sparse_csr_tensor(d["crow"], d["col"], d["val"],
+                                       size=(r1 - r0, len(vocab)), check_invariants=False)
     Cb = torch.sparse_csr_tensor(
         torch.from_numpy(crow),
         torch.from_numpy(indices[lo:hi]),
@@ -1343,7 +1413,18 @@ class SparseCorpusBatch:
             torch.from_numpy(self.norms[r0:r1]).to(device, non_blocking=True)
             if self.need_row_norms else None
         )
-        return SparseBatchSlice(Cb, row_norms, self.zero_gate_ok, self.q_cache)
+        # Host-side weight range for the posting-list kernel (its overflow
+        # check and the dense hot-token path's positivity requirement), so
+        # neither needs a device reduction and sync. NaN propagates. Skipped
+        # when the run never uses the kernel.
+        vmax = vmin = None
+        if self.q_cache is None or self.q_cache.kernel != "cusparse":
+            v = self.values[int(self.row_offsets[r0]):int(self.row_offsets[r1])]
+            if v.size:
+                vmax, vmin = v.max(), v.min()
+                vmax, vmin = float(np.maximum(vmax, -vmin)), float(vmin)
+        return SparseBatchSlice(Cb, row_norms, self.zero_gate_ok, self.q_cache,
+                                value_absmax=vmax, value_min=vmin)
 
 
 # The zero-score no-overlap gate (`raw == 0` in `SparseBatchSlice.score`) is
@@ -1824,6 +1905,10 @@ class SparseBatchSlice:
     row_norms: object  # torch.Tensor | None
     zero_gate_ok: bool = False  # may `raw == 0` stand in for the structural gate?
     q_cache: object = None  # run-wide _SparseQueryCache; lazy local if None
+    # Host-computed max |weight| and min weight of this slice (None: unknown;
+    # the posting-list kernel then reduces on the device or skips the hot path)
+    value_absmax: float | None = None
+    value_min: float | None = None
     _masked_raw: object = None  # lazy dot-scale masked (n_q, n_rows) — see docstring
 
     @property
@@ -1863,14 +1948,14 @@ class SparseBatchSlice:
         oom = False
         try:
             q_csr = cache.values(Q)
-            why = sparse_posting_triton.decline_reason(q_csr, self.Cb)
+            why = sparse_posting_triton.decline_reason(q_csr, self.Cb, self.value_absmax)
             if why is not None:
                 if cache.kernel == "posting":
                     raise RuntimeError(
                         f"params.sparse_kernel='posting' but the posting-list "
                         f"kernel cannot run: {why}")
                 return None
-            raw = sparse_posting_triton.scores(q_csr, self.Cb)
+            raw = sparse_posting_triton.scores(q_csr, self.Cb, cmin=self.value_min)
             sparse_posting_triton.note_kernel_slice()
             return raw
         except Exception as exc:
