@@ -1910,6 +1910,19 @@ class SparseBatchSlice:
     value_absmax: float | None = None
     value_min: float | None = None
     _masked_raw: object = None  # lazy dot-scale masked (n_q, n_rows) — see docstring
+    # Block-max skipping (prototype, `params.sparse_block_skip`): the single
+    # consumer's running k-th packed key per query, set by `_process_batch_group`
+    # only when `_sparse_skip_member` proves this slice's raw matrix has exactly
+    # one reader (one unfiltered dot search, no query subset, no scaling).
+    # With it, `_masked_raw` may hold -inf for cells proven below that
+    # threshold, so it is NOT a general raw matrix any more.
+    skip_thr: object = None
+    # The slice's `sparse_block_skip.SkipMask` when skipping ran. If it is
+    # `elided`, dead cells of `_masked_raw` are UNWRITTEN until
+    # `skip_mask.materialize()`; only the single consumer may read the raw
+    # without materializing, and only through a mask-aware top-k.
+    skip_mask: object = None
+    _raw_served: bool = False
 
     @property
     def n_rows(self) -> int:
@@ -1955,7 +1968,12 @@ class SparseBatchSlice:
                         f"params.sparse_kernel='posting' but the posting-list "
                         f"kernel cannot run: {why}")
                 return None
-            raw = sparse_posting_triton.scores(q_csr, self.Cb, cmin=self.value_min)
+            if self.skip_thr is None:
+                raw = sparse_posting_triton.scores(q_csr, self.Cb, cmin=self.value_min)
+            else:
+                raw, self.skip_mask = sparse_posting_triton.scores(
+                    q_csr, self.Cb, cmin=self.value_min, skip_thr=self.skip_thr,
+                    return_skip=True)
             sparse_posting_triton.note_kernel_slice()
             return raw
         except Exception as exc:
@@ -2006,6 +2024,10 @@ class SparseBatchSlice:
                 raw = _sparse_scores(Q, self.Cb, cache)
                 no_overlap = (raw == 0) if self.zero_gate_ok else self._structural_no_overlap(Q)
             self._masked_raw = raw.masked_fill_(no_overlap, float("-inf"))
+        if self.skip_mask is not None and (self._raw_served or metric != "dot"):
+            # Defensive: only the first dot read may see unwritten dead cells.
+            self.skip_mask.materialize()
+        self._raw_served = True
         if metric == "dot":
             return self._masked_raw
 
@@ -5050,6 +5072,11 @@ def _process_batch_group(
         two_pass=two_pass,
     )
 
+    # Block-max sub-block skipping in the sparse posting kernel (prototype).
+    skip_member = _sparse_skip_member(batch, member_idxs, specs, spec_qsel,
+                                      spec_cos_scale, prune)
+    from nova_bf import sparse_block_skip as _sbs
+
     twopass._STATS["groups_seen"] += 1
     if not tp_groups:
         twopass._STATS["groups_refused"] += 1
@@ -5153,6 +5180,15 @@ def _process_batch_group(
         sf = (None if slice_filters is None
               else slice_filters(rows, true_rows, sl.n_rows))
 
+        if skip_member is not None and isinstance(sl, SparseBatchSlice):
+            # Use the search's own top-k threshold, not the cross-worker threshold.
+            # Older thresholds are safe because the threshold only increases.
+            # Enable skipping only after at least k rows have been processed.
+            if _sbs.rows_seen(skip_member) >= specs[skip_member].k:
+                sl.skip_thr = spec_thr[skip_member]
+            else:
+                _sbs.decline("state cannot be full yet")
+
         score_cache: dict[tuple, object] = {}
         # keyed by whatever the plain `select` memoizes on; unused with `sf`
         cache: dict[object, object] | None = {} if sf is None else None
@@ -5255,6 +5291,18 @@ def _process_batch_group(
                 continue
             
             qsel = spec_qsel[m]
+            # Only mask-aware Triton top-k can use scores with skipped cells.
+            # All other paths must fill skipped cells with -inf before reading scores.
+            lmask = None
+            smask = getattr(sl, "skip_mask", None) if m == skip_member else None
+            if smask is not None and smask.elided:
+                if (prune and plan is None and scores is not None
+                        and sel_cols is None and qsel is None and cell_mask is None
+                        and spec_cos_scale[m] is None and not fuse_cn
+                        and scores.shape[1] > s.k):
+                    lmask = smask
+                else:
+                    smask.materialize()
             if plan is None:
                 sel_scores = scores if sel_cols is None else scores[:, sel_cols]
                 if qsel is not None:
@@ -5321,7 +5369,8 @@ def _process_batch_group(
                     sel_scores, sel_ordinals, s.k, cos_scale,
                     thr=thr_m if prune else None,
                     encoded=sel_encoded, rank=sel_rank,
-                    **({"cscale": cscale} if cscale is not None else {}))
+                    **({"cscale": cscale} if cscale is not None else {}),
+                    **({"lmask": lmask} if lmask is not None else {}))
             else:
                 part_key = (pack(sel_scores, sel_ordinals, cos_scale, cscale)
                             if cscale is not None
@@ -5353,6 +5402,9 @@ def _process_batch_group(
             pending_cols[m] += part_key.shape[1]
             if pending_cols[m] >= s.k:
                 _flush_pending(m)
+
+        if skip_member is not None:
+            _sbs.add_rows(skip_member, sl.n_rows)
 
         if mv_prune is not None and mv_tally[1]:
             mv_prune.note_pruned(mv_tally[0], mv_tally[1])
@@ -5566,6 +5618,45 @@ def _process_batch_group(
                 sl, ready = prefetch(index + 1, *ranges[index + 1])
     _flush_all_pending()
     return time.perf_counter() - t0
+
+
+def _sparse_skip_member(batch, member_idxs, specs, spec_qsel, spec_cos_scale,
+                        prune) -> int | None:
+    """Select the search whose top-k threshold can safely drive block-max
+    skipping, or return None.
+
+    Raw sparse scores are shared across searches, so skipping is only safe
+    if a block cannot contribute to any reader's top-k. For now, require a
+    single unfiltered dot-product search with pruning enabled, no query
+    subset, and no per-query scaling.
+
+    Otherwise, use the kernel without skipping. Record the decision in
+    the manifest (`block_skip.gates`)."""
+    from nova_bf import sparse_block_skip as sp
+
+    if sp.mode() == "off" or not isinstance(batch, SparseCorpusBatch):
+        return None
+    if not prune:
+        why = "pruning off"
+    elif len(member_idxs) != 1:
+        why = "several searches share the raw matrix"
+    else:
+        m = member_idxs[0]
+        if specs[m].metric != "dot":
+            why = f"metric {specs[m].metric}"
+        elif not _is_unfiltered(specs[m].filter):
+            why = "filtered search"
+        elif spec_qsel[m] is not None:
+            why = "query subset"
+        elif spec_cos_scale[m] is not None:
+            why = "query scaling"
+        elif not sp.active():
+            why = "skipping disabled for the run"
+        else:
+            sp.note_gate("enabled")
+            return m
+    sp.note_gate(why)
+    return None
 
 
 def _is_unfiltered(f: Filter | None) -> bool:
@@ -6517,6 +6608,12 @@ def run_compute(
     _tt.reset_usage()
     from nova_bf import sparse_posting_triton as _sp
     _sp.reset()
+    # Sparse block skip: parse and validate its config and environment NOW,
+    # before any query load or corpus listing, so a bad value fails fast with
+    # the variable named.
+    from nova_bf import sparse_block_skip as _sbs_cfg
+    _sbs_cfg.configure(cfg.params.sparse_block_skip, cfg.params.sparse_block_skip_sub,
+                       cfg.params.sparse_block_skip_elide)
 
     # Size pools before any Parquet reads: query loading and token sampling run
     # before the corpus scan and should not inherit a launcher's thread default.

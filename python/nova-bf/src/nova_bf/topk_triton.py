@@ -51,12 +51,30 @@ try:
                  BLOCK: _tl.constexpr, RBITS: _tl.constexpr,
                  HAS_NRM: _tl.constexpr, HAS_CNRM: _tl.constexpr,
                  HAS_THR: _tl.constexpr, HAS_ENC: _tl.constexpr,
-                 HAS_SEL: _tl.constexpr):
+                 HAS_SEL: _tl.constexpr, HAS_LM: _tl.constexpr = False,
+                 LSUB: _tl.constexpr = 1, LMASK=None, ROWANY=None, n_sub_l=1):
+        # LMASK / ROWANY / n_sub_l / HAS_LM / LSUB: sparse block skip only
+        # (see `topk(lmask=)`); every other caller leaves them at their
+        # defaults and runs the original code path.
         row = _tl.program_id(0)
         offs = _tl.arange(0, BLOCK)
         m = offs < n_cols
 
-        s = _tl.load(S + row * stride_s + offs, mask=m, other=float("-inf"))
+        if HAS_LM:
+            # Sparse block skip (`sparse_block_skip`, requires HAS_THR): lanes of
+            # sub-blocks the bound proved dead were never written; they load as
+            # -inf, exactly the value an unelided skip kernel stores there, so
+            # every later step sees the same row. A row with no live sub-block
+            # issues no score load at all (and is then dead below: thr > -inf
+            # whenever anything was proven dead).
+            # Explicit booleans throughout (an int8 flag never feeds a mask
+            # directly; triton 3.9's interpreter rejects that).
+            ra_live = _tl.broadcast_to(_tl.load(ROWANY + row) != 0, [BLOCK])
+            lm = m & (_tl.load(LMASK + row * n_sub_l + offs // LSUB,
+                               mask=m & ra_live, other=0) != 0)
+            s = _tl.load(S + row * stride_s + offs, mask=lm, other=float("-inf"))
+        else:
+            s = _tl.load(S + row * stride_s + offs, mask=m, other=float("-inf"))
         if HAS_CNRM:
             # Fuse cosine's per-CORPUS-ROW norm divide into the score load.
             #
@@ -495,7 +513,23 @@ def _select_on() -> bool:
     return not os.environ.get("NOVA_BF_NO_TOPK_SELECT")
 
 
-def topk(scores, ordinal, k, scale=None, thr=None, enc=None, rank=None, cscale=None):
+def _check_lmask(lmask, scores, thr, scale, cscale) -> None:
+    """The skip mask's contract with `_cutfill` (see `sparse_block_skip`)."""
+    import torch
+
+    n_q, n_cols = scores.shape
+    lv = lmask.klive
+    if not (thr is not None and scale is None and cscale is None
+            and lv.dtype is torch.int8 and lv.ndim == 2 and lv.shape[0] == n_q
+            and lv.is_contiguous() and lv.device == scores.device
+            and lv.shape[1] * lmask.sub >= n_cols and lmask.n_rows == n_cols
+            and lmask.rowany.numel() == n_q and lmask.rowany.dtype is torch.int8
+            and n_q * lv.shape[1] <= _INT32_MAX):
+        raise ValueError("block-skip mask does not fit this top-k call")
+
+
+def topk(scores, ordinal, k, scale=None, thr=None, enc=None, rank=None, cscale=None,
+         lmask=None):
     """Select top-K packed `(score, ordinal)` keys per query row.
 
     Returns `(keys, values, live)`. `values` contains `enc[column]` when
@@ -541,11 +575,17 @@ def topk(scores, ordinal, k, scale=None, thr=None, enc=None, rank=None, cscale=N
         outi.fill_(POISON_ID if enc is not None else 0x7FFFFFFF)
 
     use_sel = thr is not None and _select_on()
+    if lmask is not None:
+        _check_lmask(lmask, scores, thr, scale, cscale)
 
     # Launch on the tensors' CUDA device, not the process's current device.
     global _LAUNCHES, _SEL_LAUNCHES
     _LAUNCHES += 1
-    with torch.cuda.device(scores.device):
+    import contextlib
+
+    # (CPU tensors only reach here under the Triton interpreter, in tests.)
+    with (torch.cuda.device(scores.device) if scores.is_cuda
+          else contextlib.nullcontext()):
         _cutfill[(n_q,)](
             # `scores` doubles as the NRM placeholder when unscaled, as the
             # THR/LIVE placeholders when unpruned, and as ENC when the caller
@@ -565,7 +605,12 @@ def topk(scores, ordinal, k, scale=None, thr=None, enc=None, rank=None, cscale=N
             HAS_THR=thr is not None,
             HAS_ENC=enc is not None,
             HAS_SEL=use_sel,
+            **({"HAS_LM": True, "LSUB": lmask.sub, "LMASK": lmask.klive,
+                "ROWANY": lmask.rowany, "n_sub_l": lmask.klive.shape[1]}
+               if lmask is not None else {}),
             num_warps=_warps_for(_block),  # 4 spills at BLOCK=8192; 8 does not.
         )
     _SEL_LAUNCHES += int(use_sel)
+    if lmask is not None:
+        lmask.note_masked()          # counted only once the masked launch succeeded
     return outk, outi if enc is not None else outi.to(torch.int64), live

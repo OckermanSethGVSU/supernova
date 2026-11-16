@@ -365,6 +365,24 @@ if _CHILD:
         assert sp.usage()["declines"] == {"values are not float32": 1,
                                           "query and corpus vocabularies differ": 1}
 
+    def test_declines_four_byte_non_float_values():
+        """itemsize == 4 is not float32: int32 (both sides) must decline."""
+        g = torch.Generator().manual_seed(13)
+        q = _rand_csr(3, 10, 1, 3, g, False)
+        c = _rand_csr(4, 10, 1, 3, g, False)
+        qi = torch.sparse_csr_tensor(q.crow_indices(), q.col_indices(),
+                                     q.values().to(torch.int32), size=tuple(q.shape))
+        ci = torch.sparse_csr_tensor(c.crow_indices(), c.col_indices(),
+                                     c.values().to(torch.int32), size=tuple(c.shape))
+        assert sp.decline_reason(qi, ci) == "values are not float32"
+
+    def test_skip_thr_requires_return_skip():
+        g = torch.Generator().manual_seed(14)
+        q = _rand_csr(3, 10, 1, 3, g, False)
+        c = _rand_csr(4, 10, 1, 3, g, False)
+        with pytest.raises(ValueError, match="return_skip"):
+            sp.scores(q, c, skip_thr=torch.zeros(3, dtype=torch.int64))
+
     def test_overflow_scale_declines():
         # q = {t0: 1e20, t1: 1}, doc = {t0: -1e20, t1: 2}: the first partial sum
         # overflows to -inf, which would read as "untouched". Must decline.
@@ -1314,8 +1332,26 @@ if _CHILD:
         c = _kcsr([([0, 2], [1.5, 2.5]), ([2], [4.0]), ([1], [9.0])], 3)
         ptr, prow, pval = sp.corpus_postings(c)
         hotidx = torch.tensor([-1, -1, 0], dtype=torch.int32)
-        t = sp.hot_table(ptr, prow, pval, hotidx, 1, 3, 3).view(2, 3)
-        assert t[0].tolist() == [2.5, 4.0, 0.0]          # token 2 (hot row 0) per doc
+        t = sp.hot_table(ptr, prow, pval, hotidx, 1, 3, 3)
+        assert t[:3].tolist() == [2.5, 4.0, 0.0]         # token 2 (hot row 0) per doc
+        assert t.numel() == 1 * 3 + int(prow.numel())    # + one scratch slot per posting
+
+    def test_hot_table_destinations_are_distinct():
+        """No two postings may share an index_put_ destination (unspecified
+        winner), even when many cold postings hit the same doc."""
+        g = torch.Generator().manual_seed(5)
+        c = _pos_csr(40, 30, 6, 12, g)
+        ptr, prow, pval = sp.corpus_postings(c)
+        hotidx = torch.full((30,), -1, dtype=torch.int32)
+        hotidx[torch.tensor([3, 7, 11])] = torch.tensor([0, 1, 2], dtype=torch.int32)
+        t = sp.hot_table(ptr, prow, pval, hotidx, 3, 40, 30)
+        dense = c.to_dense()
+        for tok, h in ((3, 0), (7, 1), (11, 2)):
+            assert torch.equal(t[h * 40:(h + 1) * 40], dense[:, tok])
+        # scratch region holds each cold posting exactly once
+        cold = hotidx.index_select(0, torch.repeat_interleave(
+            torch.arange(30), ptr.diff())) < 0
+        assert torch.equal(t[3 * 40:][cold], pval[cold])
 
     def test_selfcheck_catches_a_bad_hot_table(monkeypatch):
         _layout(monkeypatch, 64)

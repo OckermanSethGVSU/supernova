@@ -215,6 +215,35 @@ class ParamsConfig(BaseModel):
     # available and falls back to cuSPARSE. "posting" requires the Triton kernel;
     # "cusparse" always uses the densify + cuSPARSE path.
     sparse_kernel: Literal["auto", "posting", "cusparse"] = "auto"
+    # Sparse block-max skipping for the sparse posting kernel's hot path.
+    # "on" (default) enables it; "off" disables skipping; "overhead" builds bounds
+    # without skipping to measure overhead. Results are unchanged.
+    # Requires a single unfiltered dot-product search.
+    # Environment overrides take precedence; the effective mode is recorded
+    # in the manifest. Each kernel variant is checked on first use (an
+    # adversarial fp-model probe, then sampled rows against cuSPARSE).
+    sparse_block_skip: Literal["off", "on", "overhead"] = "on"
+    # Documents per sub-block (tuning knob; 64 is the measured default). A
+    # power of two up to 512, so it divides the kernel's 512-document block;
+    # widths below 16 (more than 32 sub-blocks per block) are declined at run time.
+    sparse_block_skip_sub: int = Field(default=64, ge=1, le=512, strict=True)
+    # Leave dead sub-blocks' cells unwritten and let the top-k kernel mask them
+    # out (True), or store -inf there (False; A/B of the elision itself).
+    sparse_block_skip_elide: bool = True
+
+    @field_validator("sparse_block_skip", mode="before")
+    @classmethod
+    def _block_skip_bool(cls, v):
+        if isinstance(v, bool):
+            return "on" if v else "off"
+        return v
+
+    @field_validator("sparse_block_skip_sub")
+    @classmethod
+    def _block_skip_sub_pow2(cls, v):
+        if v & (v - 1):
+            raise ValueError("sparse_block_skip_sub must be a power of two")
+        return v
     # Memory budget (MiB) for the FP32 MaxSim score block, not total GPU memory.
     # Tile sizes are estimated by splitting the budget evenly across query and
     # document tokens, using their average token counts.

@@ -215,6 +215,9 @@ def reset() -> None:
     _POLICY = "auto"          # run_compute sets the run's policy after reset()
     _HOT_LAUNCHES = 0
     _HOT_PLAN.clear()
+    from nova_bf import sparse_block_skip
+
+    sparse_block_skip.reset()
 
 
 def note_oom() -> None:
@@ -274,7 +277,14 @@ def usage() -> dict:
             "selfcheck_failures": _SELFCHECK_FAILURES,
             "hot_launches": _HOT_LAUNCHES,
             "hot_tokens": HOT_TOKENS,
-            "declines": dict(_DECLINES)}
+            "declines": dict(_DECLINES),
+            "block_skip": _block_skip_usage()}
+
+
+def _block_skip_usage() -> dict:
+    from nova_bf import sparse_block_skip
+
+    return sparse_block_skip.usage()
 
 
 def note_decline(reason: str) -> None:
@@ -300,7 +310,10 @@ def _decline_reason(q_csr, Cb, cmax: float | None = None) -> str | None:
         return "query and corpus on different devices"
     if Cb.device.type != "cuda" and not _INTERPRETED:
         return "not a CUDA slice"
-    if q_csr.values().dtype != Cb.values().dtype or Cb.values().dtype.itemsize != 4:
+    import torch
+
+    # Explicit dtype, not itemsize: int32 / other 4-byte types must decline.
+    if q_csr.values().dtype != torch.float32 or Cb.values().dtype != torch.float32:
         return "values are not float32"
     if int(q_csr.shape[1]) != int(Cb.shape[1]):
         return "query and corpus vocabularies differ"
@@ -437,9 +450,16 @@ def hot_plan(q_csr):
 
 
 def hot_table(ptr, prow, pval, hotidx, n_hot: int, n_rows: int, vocab: int):
-    """Dense `(n_hot + 1, n_rows)` float32 table of the hot tokens' weights in
-    this slice (0 = absent; the extra last row absorbs every cold posting so
-    the build needs no masking or sync)."""
+    """Flat float32 table whose first `n_hot * n_rows` entries are the dense
+    `(n_hot, n_rows)` hot-token weights of this slice (0 = absent). Readers
+    only ever index rows `< n_hot`.
+
+    Every cold posting is written to its OWN slot in a trailing scratch region
+    (`n_hot * n_rows + posting index`), so all `index_put_` destinations are
+    distinct -- duplicate destinations would be an unspecified-winner write
+    -- while the build still needs no masking, compaction or host sync. Hot
+    destinations are distinct because (token, row) postings are unique
+    (`_remap_sparse_file` coalesces every corpus file)."""
     import torch
 
     nnz = int(prow.numel())
@@ -447,9 +467,11 @@ def hot_table(ptr, prow, pval, hotidx, n_hot: int, n_rows: int, vocab: int):
         torch.arange(vocab, device=ptr.device, dtype=torch.int64), ptr.diff(),
         output_size=nnz)
     h = hotidx.index_select(0, tok).to(torch.int64)
-    h = torch.where(h >= 0, h, n_hot)
-    table = torch.zeros((n_hot + 1) * n_rows, dtype=torch.float32, device=ptr.device)
-    table.index_put_((h * n_rows + prow.to(torch.int64),), pval)
+    base = n_hot * n_rows
+    dest = torch.where(h >= 0, h * n_rows + prow.to(torch.int64),
+                       base + torch.arange(nnz, device=ptr.device, dtype=torch.int64))
+    table = torch.zeros(base + nnz, dtype=torch.float32, device=ptr.device)
+    table.index_put_((dest,), pval)
     return table
 
 
@@ -487,22 +509,33 @@ def _launch(q_csr, ptr, prow, pval, n_rows, out, bptr=None, hot=None):
     )
 
 
-def scores(q_csr, Cb, cmin: float | None = None):
+def scores(q_csr, Cb, cmin: float | None = None, skip_thr=None,
+           return_skip: bool = False):
     """Return FP32 dot-product scores of shape (n_q, n_rows), with -inf
     for pairs sharing no tokens. Callers must check decline_reason first.
+    Raise KernelMismatch if the first-launch check fails.
 
-    Raise KernelMismatch if the first-launch check fails. Use the dense
-    hot-token path only when cmin (the minimum corpus weight) is positive."""
+    The dense hot-token path requires a positive minimum corpus weight.
+    skip_thr enables block-max skipping using a single search's top-k threshold.
+
+    With return_skip=True, return (scores, mask). Skipped cells may be
+    unwritten, so callers must use the mask or materialize it before reading.
+    """
     import torch
 
-    global _LAUNCHES
+    global _LAUNCHES, _HOT_LAUNCHES
 
+    if skip_thr is not None and not return_skip:
+        # Skipped cells may be left unwritten; without the mask the caller
+        # could read uninitialised memory as scores.
+        raise ValueError("scores(skip_thr=...) requires return_skip=True")
     n_q, n_rows = int(q_csr.shape[0]), int(Cb.shape[0])
     from nova_bf.profiling import slice_mark
 
     out = torch.empty((n_q, n_rows), dtype=torch.float32, device=Cb.device)
     if n_q == 0 or n_rows == 0:
-        return out            # nothing to score: no launch, nothing to check
+        # nothing to score: no launch, nothing to check
+        return (out, None) if return_skip else out
     with slice_mark("bf_sparse_postings"):
         ptr, prow, pval = corpus_postings(Cb)
         bptr = (block_ptr(ptr, prow, int(Cb.shape[1]), n_rows, DOC_BLOCK)
@@ -516,6 +549,40 @@ def scores(q_csr, Cb, cmin: float | None = None):
             if hotidx is not None:
                 hot = (hotidx, hot_table(ptr, prow, pval, hotidx, n_hot, n_rows,
                                          int(Cb.shape[1])))
+    mask = None
+    if skip_thr is not None:
+        from nova_bf import sparse_block_skip
+
+        if sparse_block_skip.active():
+            # Never raises for skip-side failures: it switches skipping off
+            # (or declines this slice) and returns None, and the slice is
+            # scored below exactly as without skipping.
+            mask = sparse_block_skip.try_skip(q_csr, Cb, ptr, prow, pval, bptr, hot,
+                                              n_rows, out, skip_thr, cmin)
+            if mask is not None:
+                def _rescore(q_csr=q_csr, Cb=Cb, ptr=ptr, prow=prow, pval=pval,
+                             n_rows=n_rows, out=out, bptr=bptr, hot=hot):
+                    # Same first-launch check per compile key as the
+                    # ordinary path: a never-seen variant is self-checked.
+                    _launch_checked(q_csr, Cb, ptr, prow, pval, n_rows, out, bptr, hot)
+                mask.rescore = _rescore
+                _LAUNCHES += 1
+                _HOT_LAUNCHES += 1
+                return (out, mask) if return_skip else out
+        elif sparse_block_skip.mode() != "off":
+            sparse_block_skip.decline("disabled")
+    _launch_checked(q_csr, Cb, ptr, prow, pval, n_rows, out, bptr, hot)
+    _LAUNCHES += 1                # slices actually scored by the kernel
+    _HOT_LAUNCHES += int(hot is not None)
+    return (out, None) if return_skip else out
+
+
+def _launch_checked(q_csr, Cb, ptr, prow, pval, n_rows, out, bptr, hot) -> None:
+    """Launch the unskipped kernel into `out` and, on the first launch of
+    its compile key, check it against cuSPARSE (`_self_check`). Used by the
+    ordinary path and by the block-skip `rescore` fallback alike."""
+    from nova_bf.profiling import slice_mark
+
     try:
         with slice_mark("bf_sparse_posting_kernel"):
             _launch(q_csr, ptr, prow, pval, n_rows, out, bptr, hot)
@@ -531,8 +598,9 @@ def scores(q_csr, Cb, cmin: float | None = None):
                        (q_csr.crow_indices(), q_csr.col_indices(), q_csr.values(),
                         bptr[0] if bptr is not None else ptr, prow, pval, out)
                        + ((hot[0], hot[1]) if hot is not None else ()),
-                       _launch_config() + (("hot", hot[1].numel() // max(1, n_rows))
-                                           if hot is not None else ("cold",)))
+                       # the hot table's size varies per slice (scratch region)
+                       # and is not a compile parameter: key only hot vs cold
+                       _launch_config() + (("hot",) if hot is not None else ("cold",)))
     if key not in _CHECKED:
         try:
             _self_check(q_csr, Cb, out)
@@ -548,10 +616,6 @@ def scores(q_csr, Cb, cmin: float | None = None):
                 kernel_disable(f"self-check could not run: {type(exc).__name__}: {exc}")
             raise
         _CHECKED.add(key)
-    _LAUNCHES += 1                # slices actually scored by the kernel
-    global _HOT_LAUNCHES
-    _HOT_LAUNCHES += int(hot is not None)
-    return out
 
 
 def _launch_config() -> tuple:

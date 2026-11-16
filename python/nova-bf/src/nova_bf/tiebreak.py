@@ -201,17 +201,18 @@ PACK_TARGET_SLOTS = 1 << 28
 
 
 def pack_topk(scores, ordinal, k, scale=None, thr=None, encoded=None,
-              rank=None, cscale=None):
-    """Top-K over packed `(score, ordinal)` keys. 
-    
-    `encoded` replaces winning column indices with their payload values.
-    `rank` may supply a precomputed ordinal rank for the Triton path. 
-    
-    Rows are chunked on the portable path to bound packed-key memory. With `thr`, 
-    `live` marks rows that may improve the running state; outputs for dead rows 
-    are undefined on the Triton path and must not be consumed. Live rows on
-    the Triton path may end in NEUTRAL_KEY padding (fewer than k candidates
-    at or above `thr`); they are fold inputs, not a true slice top-k.
+              rank=None, cscale=None, lmask=None):
+    """Top-k over packed (score, ordinal) keys.
+
+    encoded maps winning column indices to payload values.
+    rank optionally provides precomputed ordinal ranks for Triton.
+    lmask marks skipped cells, which Triton ignores and other paths
+    fill with -inf before reading.
+
+    The portable path chunks rows to limit memory usage. With thr,
+    live marks rows that may improve the running top-k. Dead Triton
+    rows have undefined outputs. Live rows may contain NEUTRAL_KEY
+    padding and are intended for merging, not standalone top-k results.
     """
     import torch
 
@@ -221,6 +222,17 @@ def pack_topk(scores, ordinal, k, scale=None, thr=None, encoded=None,
         # Use the optimized Triton path when available; fall back permanently if
         # compilation or launch fails.
         try:
+            if lmask is not None:
+                try:
+                    return topk_triton.topk(scores, ordinal, k, scale, thr, encoded,
+                                            rank=rank, cscale=cscale, lmask=lmask)
+                except Exception as exc:
+                    if _is_oom(exc):
+                        raise
+                    # The mask-aware variant failed (e.g. did not compile):
+                    # turn off SKIPPING (not the Triton top-k), materialize the
+                    # dead cells, and take the plain kernel below.
+                    lmask.fail(f"masked top-k failed: {type(exc).__name__}: {exc}")
             return topk_triton.topk(scores, ordinal, k, scale, thr, encoded,
                                     rank=rank, cscale=cscale)
         except Exception as exc:
@@ -239,6 +251,8 @@ def pack_topk(scores, ordinal, k, scale=None, thr=None, encoded=None,
             # recompute through the portable path.
             topk_triton.disable(exc)
 
+    if lmask is not None:
+        lmask.materialize()      # the portable path reads every cell
     n_rows, n_cols = scores.shape
     chunk = max(1, min(n_rows, PACK_TARGET_SLOTS // max(1, n_cols)))
     if chunk >= n_rows:
