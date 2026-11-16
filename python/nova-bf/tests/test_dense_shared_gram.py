@@ -88,6 +88,61 @@ def test_dot_is_bit_identical_under_sharing(n_q, rows):
     assert torch.equal(unshared, shared)
 
 
+@pytest.mark.parametrize("scale_in_packer", [False, True])
+@pytest.mark.parametrize("n_q,rows,dim", [(3, 40, DIM), (30, 7, DIM),
+                                          (64, 256, 64), (128, 64, 768)])
+def test_cosine_is_bit_identical_under_sharing(n_q, rows, dim, scale_in_packer):
+    """A multi-metric batch group now two-passes cosine with `_scores` while
+    one-pass slices derive it from the shared Gram. The two must be the SAME
+    bits, or a run's cosine output would depend on which slices pruned."""
+    rng = np.random.default_rng(303)
+    C = rng.standard_normal((rows, dim)).astype(np.float32)
+    C[0] = 0.0                       # the 1e-12 clamp
+    Q = torch.tensor(rng.standard_normal((n_q, dim)).astype(np.float32))
+    qn = Q.norm(dim=1).clamp_min(1e-12)
+    b = DenseCorpusBatch(np.ascontiguousarray(C))
+    b.share_gram = True
+    sl = b.transfer(0, rows, "cpu")
+    sl.score(Q, "dot", qn)           # the Gram already built by another metric
+    shared = sl.score(Q, "cosine", qn, scale_in_packer=scale_in_packer)
+    from nova_bf.compute import _scores
+
+    direct = _scores(Q, torch.from_numpy(C), "cosine", qn,
+                     scale_in_packer=scale_in_packer)
+    assert torch.equal(shared, direct)
+
+
+def test_query_cache_holds_dot_and_cosine_states_of_one_matrix_apart():
+    """A dot group (no row scale) and a cosine group (1/|q|) two-passing the
+    SAME query matrix must each hit their own `query_side` entry instead of
+    evicting the other's on every alternation (losing the eps cache)."""
+    from nova_bf import twopass
+
+    twopass.reset()
+    Q = torch.randn(16, 64)
+    rs = Q.norm(dim=1).reciprocal()
+    a = twopass.query_side(Q, None)
+    b = twopass.query_side(Q, rs)
+    assert a is not b and b["row_scale"] is rs and a["row_scale"] is None
+    assert twopass.query_side(Q, None) is a
+    assert twopass.query_side(Q, rs) is b
+    twopass.reset()
+
+
+def test_query_cache_is_bounded():
+    from nova_bf import twopass
+
+    twopass.reset()
+    Q = torch.randn(4, 64)
+    keep = [Q.norm(dim=1).reciprocal() for _ in range(3 * twopass._QCACHE_MAX)]
+    for rs in keep:
+        twopass.query_side(Q, rs)
+    assert len(twopass._QCACHE) <= twopass._QCACHE_MAX
+    # the most recent survives
+    assert twopass.query_side(Q, keep[-1])["row_scale"] is keep[-1]
+    twopass.reset()
+
+
 @pytest.mark.parametrize("metric", METRICS)
 @pytest.mark.parametrize("n_q,rows", [(3, 40), (30, 7), (64, 256)])
 def test_shared_matches_unshared_and_float64_truth(metric, n_q, rows):

@@ -1256,6 +1256,12 @@ class DenseBatchSlice:
     cache. A batch scored by a SINGLE metric keeps the unshared `_scores` path
     untouched, so the common case pays neither the extra matrix nor any change
     in output.
+
+    The Gram is a lazy cache read only by `score`, i.e. by members scored in
+    one pass. A two-pass plan (`_twopass_prepare`) scores its narrowed rows
+    with `_scores` directly and never builds or reads it, so the two coexist:
+    dot and cosine derived here are bit-identical to `_scores` (same GEMM,
+    then the same divides in the same order).
     """
 
     Cb: object  # torch.Tensor, (n_rows, dim)
@@ -3168,6 +3174,7 @@ def _reset_twopass_hints() -> None:
 
     _TP_LIVE_HINT.clear()
     _ROW_SCALE.clear()
+    _SHARE_GRAM_LOGGED.clear()
     # Warn-once state is per run, not per process.
     _TP_TF32_WARNED = False
     _TILES_FALLBACK_WARNED = False
@@ -3438,10 +3445,9 @@ def _twopass_groups(batch, score_groups, spec_Q, spec_q_norms,
     on_cuda = str(device).startswith("cuda")
     if not (on_cuda or os.environ.get("NOVA_BF_TWOPASS_ON_CPU")):
         return {}
-    # The shared-Gram derivation caches one raw `Q @ Cbᵀ` across metrics; the
-    # two-pass narrows the query axis, so the two cannot share a matrix.
-    if getattr(batch, "share_gram", False):
-        return {}
+    # Allow share_gram batches: two-pass searches compute exact scores directly
+    # without using the shared Gram matrix. Both paths produce identical scores.
+    # Searches that remain one-pass continue sharing the Gram as before.
     # TF32 changes CUDA exact-path arithmetic and is not covered by the bound.
     if on_cuda and torch.backends.cuda.matmul.allow_tf32:
         global _TP_TF32_WARNED
@@ -3828,6 +3834,12 @@ def _twopass_prepare(tp_groups, sl, spec_thr, spec_qsel, device,
     force = twopass.force_engage()
 
     for score_key, g in tp_groups.items():
+        if not twopass.enabled():
+            # An earlier group's live audit just disabled the two-pass: its
+            # bound was violated on this device, so no plan built on it (or
+            # on a pass one still to come) may be used. Score the slice in
+            # one pass.
+            return _tp_abandon(notes)
         # Left in `launched` once consumed (consumption is idempotent), so an
         # exception anywhere below still has the caller release it.
         pre = launched.get(score_key) if launched else None
@@ -3905,7 +3917,7 @@ def _twopass_prepare(tp_groups, sl, spec_thr, spec_qsel, device,
                     # a group-specific guard would otherwise discard a healthy
                     # sibling's plan -- including the pass-two scores already
                     # computed -- and re-score it full height on every slice.
-                    return {}
+                    return _tp_abandon(notes)
                 continue
             # A verdict either way -- PASS or refusal -- proves certification
             # can judge this configuration, so the streak starts over.
@@ -3918,7 +3930,7 @@ def _twopass_prepare(tp_groups, sl, spec_thr, spec_qsel, device,
                     "the same results, without the speedup.", why,
                 )
                 twopass.disable(why)
-                return {}
+                return _tp_abandon(notes)
             logger.info(
                 "two-pass: the error bound is certified for %s at d=%d, "
                 "%d queries x %d columns — no row of this slice exceeded its "
@@ -4067,7 +4079,7 @@ def _twopass_prepare(tp_groups, sl, spec_thr, spec_qsel, device,
                 twopass._STATS["slices_plain"] += 1
                 if ran_pass_one:
                     twopass._STATS["slices_discarded"] += 1
-                return {}
+                return _tp_abandon(notes)
 
         # Fetch all host-side counts in one D2H transfer; build live indices
         # afterward without another synchronization.
@@ -4192,13 +4204,13 @@ def _twopass_prepare(tp_groups, sl, spec_thr, spec_qsel, device,
                         f"this is no longer plausibly transient. No height "
                         f"was found to disagree — none could be measured."
                     )
-                return {}
+                return _tp_abandon(notes)
             # Every candidate height was checked and disagreed. Disable the 2 pass approach
             twopass.disable(
                 f"no padded GEMM height in {twopass.pad_candidates(n_live, n_full)} "
                 f"is bit-identical to the full {n_full}-row one on this device"
             )
-            return {}
+            return _tp_abandon(notes)
 
         twopass.note_checked_slice()
 
@@ -4232,6 +4244,9 @@ def _twopass_prepare(tp_groups, sl, spec_thr, spec_qsel, device,
         plans[score_key] = _TwoPassPlan(scores, span, dst, height, n_live, n_full)
         notes.append((n_live, n_full, M, None))
 
+    if not twopass.enabled():
+        # The LAST group's live audit disabled it (see the loop head).
+        return _tp_abandon(notes)
     # Count only two-pass plans whose results are actually returned.
     for note in notes:
         _tp_note(*note)
@@ -4316,6 +4331,19 @@ def _tp_live_index(live, n_live: int, n_full: int):
             f"two-pass: {int(idx.numel())} live rows, but {n_live} were "
             f"counted from the same mask; it changed between the two reads")
     return idx
+
+
+def _tp_abandon(notes) -> dict:
+    """`_twopass_prepare` gives up on the whole slice (a refusal or disable in
+    a LATER score group) after earlier groups already ran pass one and built
+    plans. Those plans are dropped unbooked, so book each as a plain slice
+    whose pass one was discarded -- keeping the manifest's counter identity
+    (fused + unfused == twopass + discarded) -- and return no plans."""
+    st = twopass._STATS
+    st["slices_plain"] += len(notes)
+    st["slices_discarded"] += len(notes)
+    notes.clear()
+    return {}
 
 
 def _tp_note(n_live: int, n_full: int, M: int, tile=None) -> None:
@@ -4986,6 +5014,66 @@ def _mv_prune_usage(policy: str, mv_prune, inherited_disable=None) -> dict:
     )
     return usage
 
+# (vector_type, metrics, two-pass score keys) combinations already logged this
+# run; see `_note_share_gram`.
+_SHARE_GRAM_LOGGED: set = set()
+
+
+def _tp_all_engage(tp_groups) -> bool:
+    """Decide whether shared-Gram searches should use two-pass scoring.
+
+    Each group must qualify individually, and their combined work must
+    meet the threshold. Two-pass scores each group's live rows separately,
+    while one-pass shares a single GEMM across all groups.
+    """
+    thresh = twopass.threshold()
+    force = twopass.force_engage()
+    total = 0.0
+    for g in tp_groups.values():
+        hint = _TP_LIVE_HINT.get(g["key"])
+        if hint is None and force:
+            hint = 0.0
+        if hint is None or hint > thresh:
+            return False
+        total += hint
+    return total <= thresh
+
+
+def _note_share_gram(specs, member_idxs, tp_groups, gram_refusal=None) -> None:
+    """Record and log how multi-metric dense searches are scored.
+
+    One-pass searches share a Gram matrix, while eligible two-pass groups
+    prune and score independently. Both produce near-identical results.
+    Record the approach in the manifest's twopass counters.
+    """
+    st = twopass._STATS
+    st["groups_shared_gram"] += 1
+    if tp_groups:
+        st["groups_shared_gram_twopass"] += 1
+    if gram_refusal:
+        st["groups_shared_gram_kept"] += 1
+    vts = tuple(sorted({str(getattr(specs[m], "vector_type", "")) for m in member_idxs}))
+    metrics = tuple(sorted({specs[m].metric for m in member_idxs}))
+    tp_keys = tuple(sorted(tp_groups))
+    sig = (vts, metrics, tp_keys, gram_refusal)
+    if sig in _SHARE_GRAM_LOGGED:
+        return
+    _SHARE_GRAM_LOGGED.add(sig)
+    logger.info(
+        "dense %s: metrics %s share one raw Gram for one-pass scoring; "
+        "two-pass pruning %s.",
+        "/".join(vts) or "vectors", list(metrics),
+        ("ELIGIBLE for score group(s) " + ", ".join(
+            f"{mt}{' (scaled)' if sc else ''}" for mt, sc in tp_keys)
+         + " (each with its own pass one; it never reads the shared Gram)")
+        if tp_keys else (
+            f"kept off: {gram_refusal} must be scored from the full shared "
+            f"Gram on every slice, and the other groups derive from it for one "
+            f"divide, so pruning them would only add work"
+            if gram_refusal else "not eligible for any of them"),
+    )
+
+
 def _process_batch_group(
     batch, member_idxs: list[int], specs: list[SearchSpec], spec_Q, spec_q_norms,
     spec_top_key, spec_top_enc, spec_thr,
@@ -5040,7 +5128,10 @@ def _process_batch_group(
         (specs[m].metric, spec_cos_scale[m] is not None) for m in member_idxs
     )
 
-    # Multiple dense metrics share one raw Gram matrix.
+    # Multiple dense metrics share one raw Gram matrix for their ONE-pass
+    # scoring. This does not refuse the two-pass: an eligible score group
+    # prunes with its own pass one and never reads the shared Gram (see
+    # `_twopass_groups`, `_note_share_gram`).
     if isinstance(batch, DenseCorpusBatch):
         batch.share_gram = len({specs[m].metric for m in member_idxs}) > 1
 
@@ -5072,6 +5163,16 @@ def _process_batch_group(
         batch, score_groups, spec_Q, spec_q_norms, spec_qsel, device, prune,
         two_pass=two_pass,
     )
+    # Use two-pass with a shared Gram only if every score group qualifies.
+    # Otherwise, one-pass groups already require the full Gram, so pruning
+    # the others would add work without avoiding that computation.
+    share_gram = bool(getattr(batch, "share_gram", False))
+    gram_refusal = None
+    if share_gram and tp_groups and set(tp_groups) != set(score_groups):
+        gram_refusal = ", ".join(
+            f"{mt}{' (scaled)' if sc else ''}"
+            for mt, sc in sorted(set(score_groups) - set(tp_groups)))
+        tp_groups = {}
 
     # Block-max sub-block skipping in the sparse posting kernel.
     skip_readers = _sparse_skip_readers(batch, member_idxs, specs, spec_qsel,
@@ -5082,6 +5183,8 @@ def _process_batch_group(
     twopass._STATS["groups_seen"] += 1
     if not tp_groups:
         twopass._STATS["groups_refused"] += 1
+    if share_gram:
+        _note_share_gram(specs, member_idxs, tp_groups, gram_refusal)
     
     # Probe one ordinary slice to seed two-pass profitability.
     tp_probe = [bool(tp_groups)]
@@ -5140,7 +5243,7 @@ def _process_batch_group(
 
     def launch_pass_one(sl):
         """Phase A of a pipelined slice (see `_twopass_launch`)."""
-        if not tp_groups:
+        if not tp_groups or (share_gram and not _tp_all_engage(tp_groups)):
             return None
         with profiling.slice_mark("bf_pass_one_launch"):
             return _twopass_launch(tp_groups, sl, device, step)
@@ -5205,7 +5308,13 @@ def _process_batch_group(
 
         tp_plan = {}
         # Two-pass runs only on full-width slices to avoid verifying tail shapes.
-        if tp_groups and sl.n_rows == step:
+        if (tp_groups and sl.n_rows == step and share_gram
+                and not _tp_all_engage(tp_groups)):
+            # Shared Gram, all or nothing per slice: a group going plain
+            # builds the full Gram, from which the others derive for one
+            # divide, so no group two-passes this slice (and it is probed).
+            twopass._STATS["slices_plain"] += len(tp_groups)
+        elif tp_groups and sl.n_rows == step:
             unfiltered = {m for m in range(len(specs))
                           if _is_unfiltered(specs[m].filter)}
             with profiling.slice_mark("bf_twopass_decide"):
@@ -5218,7 +5327,10 @@ def _process_batch_group(
         # Launches no decision used: groups an early return skipped, or a
         # two-pass disabled since they were issued. Booked, then released.
         _tp_discard_all(launched)
-        probe = tp_probe[0] and not tp_plan
+        # Probe the groups this slice scored in ONE pass (per group: a group
+        # whose sibling engaged must still have its hint re-measured, or it
+        # stays frozen in one pass for the rest of the run).
+        probe = tp_probe[0] and len(tp_plan) < len(tp_groups)
         probe_live: dict[tuple, list] = {}
         # One prune-rate measurement per SLICE, summed over its members.
         mv_tally = [0, 0]
@@ -5402,7 +5514,7 @@ def _process_batch_group(
                     part_key, part_enc, live, dst, full_height)
             if live is not None:
                 _live_stats_add(m, live, live.shape[0])
-                if probe and score_key in tp_groups:
+                if probe and score_key in tp_groups and score_key not in tp_plan:
                     if twopass.tiles_mode():
                         # Tiles mode hints a TILE-pair fraction, so the probe
                         # measures one, from this member's unfiltered scores.
@@ -6464,11 +6576,177 @@ def _row_selector(idx: np.ndarray | None, device: str):
     """
     if idx is None:
         return None
-    if len(idx) and idx[-1] - idx[0] == len(idx) - 1:
+    # Unit-step ascending, checked element-wise: with `_vt_row_layout` an index
+    # array need not be sorted, and `[0, 2, 1, 3]` passes the endpoint test.
+    if len(idx) and bool(np.all(np.diff(idx) == 1)):
         return slice(int(idx[0]), int(idx[-1]) + 1)
     import torch
 
-    return torch.from_numpy(np.ascontiguousarray(idx)).to(device)
+    return torch.from_numpy(np.ascontiguousarray(idx, dtype=np.int64)).to(device)
+
+
+def _positions_in(rows: np.ndarray, order: np.ndarray | None, n_q: int) -> np.ndarray:
+    """Find each row's position in order, or use its original position
+    if order is None. Raise an error if any row is missing."""
+    rows = np.asarray(rows, dtype=np.int64)
+    if order is None:
+        return rows
+    inv = np.full(n_q, -1, dtype=np.int64)
+    inv[order] = np.arange(len(order), dtype=np.int64)
+    pos = inv[rows]
+    if len(pos) and int(pos.min()) < 0:
+        raise RuntimeError("query row layout: a search's row is missing from "
+                           "the matrix it indexes")
+    return pos
+
+
+def _contiguous_order(sets: list[np.ndarray], universe: np.ndarray):
+    """Find a deterministic row order that keeps every subset contiguous,
+    or return (None, reason).
+
+    Supports disjoint and nested subsets, including whole-file searches.
+    Uses a depth-first ordering that preserves file order when possible.
+
+    Overlapping subsets that are not nested are unsupported, even if a
+    valid ordering exists. In that case, the caller keeps file order.
+    """
+    # Distinct sets, largest first (ties: smallest first row, then content).
+    uniq: dict[bytes, np.ndarray] = {}
+    for s in sets:
+        uniq.setdefault(np.asarray(s, dtype=np.int64).tobytes(),
+                        np.asarray(s, dtype=np.int64))
+    uniq.setdefault(universe.astype(np.int64).tobytes(), universe.astype(np.int64))
+    nodes = sorted(uniq.values(),
+                   key=lambda a: (-len(a), int(a[0]) if len(a) else -1, a.tobytes()))
+    for i in range(len(nodes)):
+        for j in range(i + 1, len(nodes)):
+            a, b = nodes[i], nodes[j]
+            n_in = len(np.intersect1d(a, b, assume_unique=True))
+            if n_in not in (0, len(b)):
+                return None, (
+                    f"two searches' row subsets properly overlap ({n_in} shared "
+                    f"of {len(a)} and {len(b)} rows): not laminar")
+    # Parent = the smallest earlier (hence not smaller) node containing it.
+    children: list[list[int]] = [[] for _ in nodes]
+    for j in range(1, len(nodes)):
+        parent = 0
+        for i in range(j - 1, -1, -1):
+            if len(np.intersect1d(nodes[i], nodes[j], assume_unique=True)) == len(nodes[j]):
+                parent = i
+                break
+        children[parent].append(j)
+
+    out: list[np.ndarray] = []
+
+    def walk(i: int) -> None:
+        kids = children[i]
+        covered = (np.concatenate([nodes[k] for k in kids]) if kids
+                   else np.zeros(0, dtype=np.int64))
+        leftover = np.setdiff1d(nodes[i], covered, assume_unique=True)
+        # Children by first row; each is placed before the first leftover row
+        # greater than its own first row (children are disjoint from leftover).
+        kids = sorted((k for k in kids if len(nodes[k])), key=lambda k: int(nodes[k][0]))
+        at = 0
+        for k in kids:
+            cut = int(np.searchsorted(leftover, nodes[k][0]))
+            if cut > at:
+                out.append(leftover[at:cut])
+                at = cut
+            walk(k)
+        if at < len(leftover):
+            out.append(leftover[at:])
+
+    walk(0)
+    order = np.concatenate(out) if out else np.zeros(0, dtype=np.int64)
+    # Post-conditions, cheap next to the query matrix: a permutation of the
+    # universe in which every set is one block.
+    if not np.array_equal(np.sort(order), universe):
+        raise RuntimeError("query row layout: order is not a permutation of the rows")
+    inv = np.full(int(universe[-1]) + 1 if len(universe) else 0, -1, dtype=np.int64)
+    inv[order] = np.arange(len(order), dtype=np.int64)
+    for s in sets:
+        p = np.sort(inv[np.asarray(s, dtype=np.int64)])
+        if len(p) and int(p[-1]) - int(p[0]) != len(p) - 1:
+            raise RuntimeError("query row layout: a set is not contiguous")
+    return order, None
+
+
+def _vt_row_layout(vt_specs: list[int], spec_rows: list, vt_union, n_q: int):
+    """Choose the query row order for one vector type.
+
+    Return (order, status, reason). order is the reordered file rows,
+    or None to keep the current layout.
+
+    status is "file_order" if searches are already contiguous,
+    "reordered" if rows were rearranged, or "fallback" if no valid
+    order was found. Non-contiguous searches then use gathers
+    and cannot use two-pass scoring.
+    """
+    universe = (np.arange(n_q, dtype=np.int64) if vt_union is None
+                else np.asarray(vt_union, dtype=np.int64))
+    sets = [universe if spec_rows[m] is None else np.asarray(spec_rows[m], dtype=np.int64)
+            for m in vt_specs]
+    pos = np.full(n_q, -1, dtype=np.int64)
+    pos[universe] = np.arange(len(universe), dtype=np.int64)
+    if all(len(s) == 0 or bool(np.all(np.diff(pos[s]) == 1)) for s in sets):
+        return None, "file_order", None
+    if os.environ.get("NOVA_BF_NO_ROW_REORDER"):
+        return None, "fallback", "NOVA_BF_NO_ROW_REORDER is set"
+    order, why = _contiguous_order(sets, universe)
+    if order is None:
+        return None, "fallback", why
+    return order, "reordered", None
+
+
+# Check widths 1–64 and two larger slices using the actual query shape.
+# CPU GEMM results can depend on row order at certain widths, so the
+# self-check catches cases where reordering would change scores.
+_REORDER_CHECK_WIDTHS = tuple(range(1, 65)) + (128, 512)
+
+
+def _reorder_bit_check(Q_file, Q_perm, order, vt_union) -> str | None:
+    """Check whether reordering query rows preserves identical score and norm
+    bits on this device. Return None if it does, or a reason if not.
+
+    Uses fixed-seed synthetic corpus data, so this is a sampled check,
+    not a proof."""
+    import torch
+
+    src = (np.asarray(order, dtype=np.int64) if vt_union is None
+           else np.searchsorted(np.asarray(vt_union), order).astype(np.int64))
+    src_t = torch.from_numpy(src).to(Q_file.device)
+    if not torch.equal(Q_file.index_select(0, src_t), Q_perm):
+        return "reorder self-check: permuted matrix is not a row permutation"
+    if not torch.equal(Q_file.norm(dim=1).index_select(0, src_t),
+                       Q_perm.norm(dim=1)):
+        return "reorder self-check: query norms depend on row position on this device"
+    g = torch.Generator(device="cpu").manual_seed(0x5EED)
+    d = int(Q_file.shape[1])
+    for w in _REORDER_CHECK_WIDTHS:
+        C = torch.randn((w, d), generator=g, dtype=torch.float32).to(Q_file.device)
+        same = torch.equal((Q_file @ C.T).index_select(0, src_t), Q_perm @ C.T)
+        del C
+        if not same:
+            return (f"reorder self-check: GEMM bits depend on row position on "
+                    f"this device (d={d}, width={w})")
+    return None
+
+
+def _permuted_query_matrix(Q_np: np.ndarray, order: np.ndarray, vt_union, device):
+    """Move Q_np to the device as FP32, with rows arranged in order.
+    Copy in chunks to avoid a second full-size host matrix.
+    Sparse queries are densified before transfer."""
+    import torch
+
+    src = (np.asarray(order, dtype=np.int64) if vt_union is None
+           else np.searchsorted(np.asarray(vt_union), order).astype(np.int64))
+    n, d = len(src), (Q_np.shape[1] if Q_np.ndim == 2 else 0)
+    out = torch.empty((n, d), dtype=torch.float32, device=device)
+    step = max(1, (64 << 20) // max(1, d * 4))
+    for i in range(0, n, step):
+        out[i:i + step] = torch.from_numpy(
+            np.ascontiguousarray(Q_np[src[i:i + step]], dtype=np.float32))
+    return out
 
 
 def _validate_query_filter_cols(
@@ -6929,17 +7207,71 @@ def run_compute(
             mean_doc_tok,
         )
 
-    # 3. per-spec GPU state: each spec gets its own running (top_scores, top_enc)
-    #    pair, but every spec of the same vector_type shares ONE raw query
-    #    matrix regardless of metric. A cosine spec divides its score matrix
-    #    by each query's norm inside `score()` (a per-query scalar, `q_norms`
-    #    below) — holding a pre-normalized second copy of Q instead would
-    #    double the biggest resident tensor on the GPU (n_q × vocab floats:
-    #    7.2 GiB at 100k queries × 18k vocab, which is what OOM'd the
-    #    dot+cosine fineweb run on a 24 GB A10G).
+    # Each search has its own top-k state, but searches of the same vector
+    # type share one query matrix. Cosine uses query norms during scoring
+    # rather than storing a second normalized matrix, saving GPU memory.
+    #
+    # Reorder GPU query rows when needed to make each search's rows contiguous
+    # and eligible for two-pass scoring. Keep the original file order on the
+    # host and restore top-k results to that order after scanning.
+    # Threshold exchange handles the row mapping during the scan.
+    vt_order: dict[str, np.ndarray | None] = {}
+    row_layout: dict[str, dict] = {}
+    for vt in vts_needed:
+        vt_specs = [m for m, s in enumerate(specs) if s.vector_type == vt]
+        if vt == "multivector" or all(spec_rows[m] is None for m in vt_specs):
+            vt_order[vt], status, why = None, "file_order", None
+        else:
+            vt_order[vt], status, why = _vt_row_layout(
+                vt_specs, spec_rows, vt_rows.get(vt), n_q)
+            if status == "reordered" and vt != "dense":
+                # Only the dense two-pass gains from contiguity; sparse would
+                # trade a gather for a view while moving each query's
+                # nonzeros to another position in the query CSR, whose
+                # summation order on GPU (cuSPARSE) is not verified to be
+                # position-independent. Keep file order.
+                vt_order[vt], status, why = (
+                    None, "fallback",
+                    f"{vt}: reordering is dense-only (no two-pass to gain)")
+            elif status == "reordered" and all(
+                    specs[m].metric == "euclidean" for m in vt_specs):
+                # Euclidean-only scores with `cdist`: never two-pass eligible,
+                # and its bits depend on a row's position.
+                vt_order[vt], status, why = (
+                    None, "fallback",
+                    "euclidean-only: no two-pass to gain, and cdist is "
+                    "row-position dependent")
+        row_layout[vt] = {"status": status, "reason": why}
     Q_gpu_by_vt: dict[str, object] = {}
     for vt in vts_needed:
-        flat = torch.tensor(Q_np_by_vt[vt], dtype=torch.float32, device=device)
+        if vt_order.get(vt) is None:
+            flat = torch.tensor(Q_np_by_vt[vt], dtype=torch.float32, device=device)
+        else:
+            flat = _permuted_query_matrix(
+                Q_np_by_vt[vt], vt_order[vt], vt_rows.get(vt), device)
+            # Permuting is output-neutral only if a row's GEMM / norm bits do
+            # not depend on its position (false e.g. for MKL CPU kernels at
+            # many (d, n_q) shapes). Checked once on this device; a mismatch keeps file
+            # order.
+            ref = torch.tensor(Q_np_by_vt[vt], dtype=torch.float32, device=device)
+            why = _reorder_bit_check(ref, flat, vt_order[vt], vt_rows.get(vt))
+            if why is None:
+                del ref
+            else:
+                flat, vt_order[vt] = ref, None
+                row_layout[vt] = {"status": "fallback", "reason": why}
+        st_ = row_layout[vt]
+        if st_["status"] == "reordered":
+            logger.info(
+                "query rows (%s): matrix rows permuted so every search's row "
+                "subset is one contiguous block (%s); results are written in "
+                "file order", vt,
+                ", ".join(s.name for s in specs if s.vector_type == vt))
+        elif st_["status"] == "fallback":
+            logger.warning(
+                "query rows (%s): kept file order (%s); non-contiguous subsets "
+                "index the query matrix with a gather and get no two-pass "
+                "pruning", vt, st_["reason"])
         if vt == "multivector":
             # The token matrix + offsets (device for reductions, host for the
             # block-loop bounds) + tile size, wrapped so a spec's `Q` carries
@@ -7135,6 +7467,21 @@ def run_compute(
         except Exception:  # noqa: BLE001 — unexpected query layout: minimum allowance
             return None
 
+    def _canonicalize_state() -> None:
+        """Restore reordered top-k results and thresholds to file row order.
+        Remove row mappings so later readers see the original layout.
+        Row gathers preserve values exactly."""
+        for m in range(len(specs)):
+            c = spec_to_canon[m]
+            if c is None:
+                continue
+            spec_top_key[m] = spec_top_key[m].index_select(0, c)
+            spec_top_enc[m] = spec_top_enc[m].index_select(0, c)
+            spec_thr[m] = spec_thr[m].index_select(0, c)
+            if spec_thr_ext[m] is not None:
+                spec_thr_ext[m] = spec_thr_ext[m].index_select(0, c)
+            spec_to_canon[m] = spec_to_state[m] = None
+
     def _own_top_lists() -> list:
         """This worker's current top-m scores per search, (h, m) float32 on
         the device, non-finite entries (NaN/inf corpus rows, empty slots)
@@ -7142,7 +7489,11 @@ def run_compute(
         out = []
         for m in range(len(specs)):
             w = thr_exchange.sizes[specs[m].name][1]
-            sc = unpack_score(spec_top_key[m])                      # (h, k)
+            key = spec_top_key[m]
+            if spec_to_canon[m] is not None:
+                # Published (and unioned) in FILE row order on every rank.
+                key = key.index_select(0, spec_to_canon[m])
+            sc = unpack_score(key)                                  # (h, k)
             sc = torch.where(torch.isfinite(sc), sc, torch.full_like(sc, float("-inf")))
             out.append(torch.topk(sc, w, dim=1, sorted=True).values if w < sc.shape[1] else sc)
         return out
@@ -7205,6 +7556,9 @@ def run_compute(
             for m in range(len(specs)):
                 thr = _thresholds.union_kth(own[m], lists[specs[m].name], specs[m].k, device)
                 new_key = _thresholds.keys_from_scores(thr.cpu().numpy(), device, dim=_spec_dim(m))
+                if spec_to_state[m] is not None:
+                    # File order (the union above) -> this rank's state order.
+                    new_key = new_key.index_select(0, spec_to_state[m])
                 # Never lower: the recorded applied value must be >= every key
                 # this worker ever pruned against (the lowering rounds 1-2 ulp
                 # near zero, and a peer list can be replaced by a shorter one).
@@ -7245,14 +7599,42 @@ def run_compute(
         thr_exchange.publish(out)
 
 
-    # Per-spec query selectors, built once per run:
-    # `spec_qsel` indexes the vector-type score matrix; `spec_qrows` indexes the
-    # corresponding per-query filter mask. `None` means all rows; contiguous
-    # selections use slices to avoid gathers.
-    spec_qsel = [
-        _row_selector(_local_positions(spec_rows[m], vt_rows.get(specs[m].vector_type)), device)
-        for m in range(len(specs))
-    ]
+    # Build query selectors once per run. spec_qsel selects score rows,
+    # while spec_qrows selects filter rows. None means all rows;
+    # contiguous selections use slices to avoid gathers.
+    #
+    # For reordered queries, track each search's state row order and the
+    # mappings between that order and file order. No mapping is needed
+    # when the state is already in file order.
+    spec_state_rows: list = [None] * len(specs)
+    spec_to_canon: list = [None] * len(specs)
+    spec_to_state: list = [None] * len(specs)
+    spec_qsel = []
+    for m in range(len(specs)):
+        vt = specs[m].vector_type
+        order = vt_order.get(vt)
+        if order is None:
+            spec_qsel.append(_row_selector(
+                _local_positions(spec_rows[m], vt_rows.get(vt)), device))
+            continue
+        # A whole-file search means the matrix is full height (its union is
+        # every row), so its canonical rows are all of them.
+        canon = (np.arange(n_q, dtype=np.int64) if spec_rows[m] is None
+                 else np.asarray(spec_rows[m], dtype=np.int64))
+        pos = _positions_in(canon, order, n_q)
+        to_state = np.argsort(pos, kind="stable")
+        spec_state_rows[m] = canon[to_state]
+        if not np.array_equal(to_state, np.arange(len(to_state))):
+            spec_to_state[m] = torch.from_numpy(to_state).to(device)
+            spec_to_canon[m] = torch.from_numpy(
+                np.argsort(to_state, kind="stable")).to(device)
+        # A whole-matrix search keeps `None` (no indexing at all), as today.
+        spec_qsel.append(None if spec_rows[m] is None
+                         else _row_selector(pos[to_state], device))
+        if spec_rows[m] is not None and not isinstance(spec_qsel[m], slice):
+            raise RuntimeError(
+                f"search {specs[m].name!r}: the reordered query layout did not "
+                f"give it a contiguous block")
     # Dense cosine's per-query divisor, restricted to each spec's OWN rows so it
     # lines up with the score matrix after `spec_qsel`.
     spec_cos_scale = [
@@ -7370,6 +7752,19 @@ def run_compute(
     for f in list(filter_rows):
         if f is None or not filter_is_per_query[f]:
             filter_rows[f] = None
+    # Build filters used by one reordered vector type in its query row order,
+    # keeping each search's mask rows contiguous. Shared filters stay in
+    # file order, so reordered searches gather their mask rows.
+    for f in list(filter_rows):
+        if f is None or not filter_is_per_query[f]:
+            continue
+        f_vts = {s.vector_type for s in specs if s.filter == f}
+        order = vt_order.get(next(iter(f_vts))) if len(f_vts) == 1 else None
+        if order is None:
+            continue
+        base = filter_rows[f]
+        filter_rows[f] = (order if base is None
+                          else order[np.isin(order, np.asarray(base))])
 
     # Query-axis height of each filter mask.
     filter_n_q: dict[Filter | None, int] = {
@@ -7412,8 +7807,25 @@ def run_compute(
     # Map each spec's query rows into its filter mask's local row numbering
     spec_qrows = [
         _row_selector(_local_positions(spec_rows[m], filter_rows[specs[m].filter]), device)
+        if spec_state_rows[m] is None
+        else _row_selector(_positions_in(spec_state_rows[m],
+                                         filter_rows[specs[m].filter], n_q), device)
         for m in range(len(specs))
     ]
+    # The scoring loop maps a per-query mask into a member's rows only when the
+    # member has a query selector (`cell_mask[spec_qrows[m]]` under
+    # `qsel is not None`). A whole-matrix search on a reordered vector_type
+    # whose filter mask is NOT in that matrix's order (a filter shared with
+    # another vector_type) would have its mask applied unmapped, so give it an
+    # explicit full-height selector to force the mapping.
+    for m in range(len(specs)):
+        if (spec_state_rows[m] is None or spec_qsel[m] is not None
+                or not (filter_is_per_query.get(specs[m].filter)
+                        or filter_is_gpu_eligible.get(specs[m].filter))):
+            continue
+        q = spec_qrows[m]
+        if not (isinstance(q, slice) and q.start == 0 and q.stop == n_q):
+            spec_qsel[m] = slice(0, n_q)
     if any(r is not None for r in filter_rows.values()):
         logger.info(
             "per-query filter mask height: %s (file has %d queries)",
@@ -8365,6 +8777,10 @@ def run_compute(
         for vt in coalesce_eligible_vts:
             tail_gpu += _flush_coalesce_group(vt)
         gpu_secs += tail_gpu
+        # The last scoring is done: put every reordered search's state back in
+        # file row order, ONCE. From here on (final publish/apply, the applied
+        # threshold, trim, sort, write) everything is file order, as before.
+        _canonicalize_state()
         if thr_exchange is not None:
             # Final publish (so late-starting peers inherit this worker's fully
             # converged thresholds) and stop the exchange threads.
@@ -8928,6 +9344,10 @@ def run_compute(
         # RESOLVED, not configured
         "cpu_thread_count": cpu_n,
         "batch_size_by_vector_type": vt_batch_size,
+        # Per vector type, record whether query rows kept file order, were
+        # reordered to make each search contiguous, or fell back with a reason.
+        # Results are always written in file order.
+        "query_row_layout": row_layout,
         # Multivector: the configured MiB is recorded with `params` above;
         # these are what it RESOLVED to (all null without a multivector
         # search). Docs/queries are the even split's item caps, not settings.

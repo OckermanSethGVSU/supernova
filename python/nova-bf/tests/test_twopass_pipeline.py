@@ -652,18 +652,15 @@ def test_every_distinct_execution_configuration_is_certified_separately(
         _same(pq.read_table(x[0]), pq.read_table(y[0]), name)
 
 
-def test_a_dense_batch_can_never_have_two_eligible_score_groups(ds, tmp_path):
+def test_each_eligible_score_group_is_certified_on_its_own(ds, tmp_path):
     """Why certifying per configuration is enough on the score-group axis.
 
-    Two facts combine. A score key is `(metric, scale_in_packer)`, so a batch
-    scored by one metric collapses to ONE key. And a dense batch scored by two
-    or more DISTINCT metrics has `share_gram` set — the two metrics are derived
-    from a single shared raw Gram — which the two-pass refuses outright,
-    because it narrows the query axis and the two cannot then share a matrix.
-
-    So a dense batch either has one eligible group or none. If a future change
-    lets two eligible groups coexist, this test fails and the coverage
-    argument needs revisiting.
+    A score key is `(metric, scale_in_packer)`, so a batch scored by one metric
+    collapses to ONE key and ONE certified configuration. A dense batch scored
+    by two DISTINCT metrics (`share_gram`) used to be refused outright; it now
+    has two eligible groups, and `_tp_cert_key` carries the group's member key,
+    so each is certified as its own configuration -- neither prunes on the
+    other's evidence.
     """
     def build(out, searches):
         out.mkdir()
@@ -687,8 +684,7 @@ def test_a_dense_batch_can_never_have_two_eligible_score_groups(ds, tmp_path):
         f"one metric produced {st_one['certified_configs']} configurations; "
         f"the score key was expected to collapse to one: {st_one}")
 
-    # Two metrics: `share_gram`, refused wholesale — so the two-pass never
-    # sees two groups, and never prunes one on another's evidence.
+    # Two metrics: `share_gram`, two eligible groups, two certifications.
     two = tmp_path / "two_metrics"
     twopass.reset()
     run_compute(build(two, [SearchSpec(name="cos", metric="cosine", k=K),
@@ -696,11 +692,249 @@ def test_a_dense_batch_can_never_have_two_eligible_score_groups(ds, tmp_path):
                 num_jobs=1, job_rank=0)
     st_two = twopass.stats()
     assert st_two["groups_seen"] > 0
-    assert st_two["groups_refused"] == st_two["groups_seen"], (
-        f"a batch with two distinct metrics was admitted; `share_gram` was "
-        f"expected to refuse every one: {st_two}")
-    assert st_two["slices_twopass"] == 0
-    assert st_two["certified_configs"] == 0
+    assert st_two["groups_refused"] == 0, st_two
+    assert st_two["groups_shared_gram"] == st_two["groups_seen"], st_two
+    assert st_two["slices_twopass"] > 0
+    assert st_two["certified_configs"] == 2, (
+        f"two score groups produced {st_two['certified_configs']} certified "
+        f"configurations: {st_two}")
+
+
+def _multi_cfg(ds, out, metrics, **params):
+    """One search per entry of `metrics` over one dense column, plus (for the
+    first metric) a contiguous row-subset member, so a multi-metric dense batch
+    group sets `share_gram`."""
+    out.mkdir(parents=True, exist_ok=True)
+    searches = [SearchSpec(name=mt[:3], metric=mt, k=K) for mt in metrics]
+    searches.append(SearchSpec(name=f"{metrics[0][:3]}half", metric=metrics[0],
+                               k=K, rows={"column": "qset", "isin": ["b"]}))
+    return BruteForceConfig(
+        corpus=CorpusConfig(path=ds["cdir"], id_column="id"),
+        queries=QueriesConfig(path=ds["qpath"], id_column="qid",
+                              payload_fields=["qset"]),
+        output=OutputConfig(path=str(out)),
+        params=ParamsConfig(io_workers=1, dense_batch_size=BATCH, **params),
+        searches=searches)
+
+
+def _multi_tables(out, cfg):
+    return _tables(out, names=[s.name for s in cfg.searches])
+
+
+def _spy_plans(monkeypatch):
+    """Count the score keys `_twopass_prepare` returned a plan for."""
+    from collections import Counter
+
+    from nova_bf import compute as compute_mod
+
+    planned = Counter()
+    real = compute_mod._twopass_prepare
+
+    def spy(*a, **kw):
+        got = real(*a, **kw)
+        planned.update(got.keys())
+        return got
+
+    monkeypatch.setattr(compute_mod, "_twopass_prepare", spy)
+    return planned
+
+
+@pytest.mark.parametrize("metrics", [("cosine", "dot"), ("dot", "cosine")])
+def test_multi_metric_dense_engages_two_pass_for_every_eligible_group(
+    ds, tmp_path, monkeypatch, metrics
+):
+    """A dense batch group with >1 distinct metric (`share_gram`) used to be
+    refused wholesale, silently turning the fp16 two-pass off for every search
+    on that vector. Now each eligible (metric, scaling) score group gets its
+    own pass one; a slice on which any group goes plain is scored entirely
+    from the one shared Gram.
+
+    Outputs equal the two-pass-off run (itself the shared-Gram run), byte for
+    byte in slice mode.
+    """
+    planned = _spy_plans(monkeypatch)
+    cfg_on = _multi_cfg(ds, tmp_path / "on", metrics)
+    twopass.reset()
+    run_compute(cfg_on, num_jobs=1, job_rank=0)
+    st = twopass.stats()
+
+    eligible = {(mt, mt == "cosine") for mt in metrics}
+    assert st["groups_shared_gram"] > 0, f"share_gram never set: {st}"
+    assert st["groups_shared_gram_twopass"] == st["groups_shared_gram"], st
+    assert st["groups_refused"] == 0, st
+    assert set(planned) == eligible, (
+        f"two-pass planned {sorted(planned)}, expected every eligible group "
+        f"{sorted(eligible)}")
+    assert st["certified_configs"] >= len(eligible), st
+    assert st["rows_live"] < st["rows_full"], f"nothing pruned: {st}"
+
+    cfg_off = _multi_cfg(ds, tmp_path / "off", metrics)
+    monkeypatch.setenv("NOVA_BF_NO_TWOPASS", "1")
+    twopass.reset()
+    run_compute(cfg_off, num_jobs=1, job_rank=0)
+    monkeypatch.delenv("NOVA_BF_NO_TWOPASS")
+    assert twopass.stats()["slices_twopass"] == 0
+
+    got = _multi_tables(tmp_path / "on", cfg_on)
+    want = _multi_tables(tmp_path / "off", cfg_off)
+    for name in want:
+        _same(got[name], want[name], f"{metrics}/{name}")
+
+
+def test_multi_metric_two_pass_matches_single_metric_runs(ds, tmp_path,
+                                                          monkeypatch):
+    """Dot and cosine through the shared batch group equal their SOLO runs
+    (unshared `_scores`, two-pass off), byte for byte in slice mode: the
+    shared derivation and the two-pass both reproduce `_scores` exactly."""
+    cfg = _multi_cfg(ds, tmp_path / "multi", ("cosine", "dot"))
+    twopass.reset()
+    run_compute(cfg, num_jobs=1, job_rank=0)
+    assert twopass.stats()["slices_twopass"] > 0
+    got = _multi_tables(tmp_path / "multi", cfg)
+
+    monkeypatch.setenv("NOVA_BF_NO_TWOPASS", "1")
+    for mt in ("cosine", "dot"):
+        solo = _multi_cfg(ds, tmp_path / f"solo_{mt}", (mt,))
+        twopass.reset()
+        run_compute(solo, num_jobs=1, job_rank=0)
+        assert twopass.stats()["groups_shared_gram"] == 0
+        want = _multi_tables(tmp_path / f"solo_{mt}", solo)
+        _same(got[mt[:3]], want[mt[:3]], f"multi vs solo {mt}")
+        if mt == "cosine":
+            _same(got["coshalf"], want["coshalf"], "multi vs solo coshalf")
+
+
+@pytest.mark.parametrize("how", ["cpu_without_debug_env", "no_twopass_env",
+                                 "config_off", "too_few_query_rows"])
+def test_shared_gram_is_kept_where_no_group_can_two_pass(
+    ds, tmp_path, monkeypatch, how
+):
+    """Where no score group is two-pass eligible, a multi-metric batch group
+    keeps the shared Gram: ONE raw GEMM per slice serves every metric."""
+    from nova_bf import compute as compute_mod
+
+    params = {}
+    if how == "cpu_without_debug_env":
+        monkeypatch.delenv("NOVA_BF_TWOPASS_ON_CPU")
+    elif how == "no_twopass_env":
+        monkeypatch.setenv("NOVA_BF_NO_TWOPASS", "1")
+    elif how == "config_off":
+        params["two_pass"] = "off"
+    else:
+        monkeypatch.setattr(twopass, "MIN_QUERY_ROWS", NQ + 1)
+
+    built = []
+    real_score = compute_mod.DenseBatchSlice.score
+
+    def score(self, Q, metric, *a, **kw):
+        had = self._raw is not None
+        out = real_score(self, Q, metric, *a, **kw)
+        if self.share_gram and not had and self._raw is not None:
+            built.append(metric)
+        return out
+
+    monkeypatch.setattr(compute_mod.DenseBatchSlice, "score", score)
+    cfg = _multi_cfg(ds, tmp_path / how, ("cosine", "dot"), **params)
+    twopass.reset()
+    run_compute(cfg, num_jobs=1, job_rank=0)
+    st = twopass.stats()
+    assert st["groups_shared_gram"] > 0, st
+    assert st["groups_shared_gram_twopass"] == 0, st
+    assert st["slices_twopass"] == 0, st
+    # 8 files x 200 rows at a 64-row step = 4 slices per file.
+    assert len(built) == 8 * 4, (
+        f"{len(built)} shared Grams built, expected one per slice: {built}")
+
+
+@pytest.mark.parametrize("metrics", [("cosine", "euclidean"),
+                                     ("cosine", "dot", "euclidean")])
+def test_a_member_that_needs_the_full_gram_keeps_the_two_pass_off(
+    ds, tmp_path, monkeypatch, metrics
+):
+    """Euclidean is never two-pass eligible and is scored from the full shared
+    Gram on EVERY slice; cosine/dot then derive from that Gram for one divide,
+    so pruning them would only add a pass one and a narrowed exact GEMM. The
+    batch group keeps the two-pass off (recorded as `groups_shared_gram_kept`)
+    and every output, euclidean's Gram-derived bits included, is unchanged."""
+    planned = _spy_plans(monkeypatch)
+    cfg = _multi_cfg(ds, tmp_path / "on", metrics)
+    twopass.reset()
+    run_compute(cfg, num_jobs=1, job_rank=0)
+    st = twopass.stats()
+    assert not planned, planned
+    assert st["slices_twopass"] == 0, st
+    assert st["groups_shared_gram_kept"] == st["groups_shared_gram"] > 0, st
+    got = _multi_tables(tmp_path / "on", cfg)
+
+    monkeypatch.setenv("NOVA_BF_NO_TWOPASS", "1")
+    ref = _multi_cfg(ds, tmp_path / "off", metrics)
+    twopass.reset()
+    run_compute(ref, num_jobs=1, job_rank=0)
+    want = _multi_tables(tmp_path / "off", ref)
+    for name in want:
+        assert got[name].equals(want[name]), name
+
+
+def _identity(st):
+    return (st["slices_fused"] + st["slices_unfused"],
+            st["slices_twopass"] + st["slices_discarded"])
+
+
+@pytest.mark.parametrize("metrics", [("cosine", "dot"), ("dot", "cosine")])
+def test_a_refusal_in_the_second_group_keeps_the_counter_identity(
+    ds, tmp_path, monkeypatch, metrics
+):
+    """`_twopass_prepare` abandons the whole slice when a LATER group's
+    certification refuses; the earlier group's built plan is then dropped and
+    must be booked as discarded, or the manifest's identity breaks."""
+    from nova_bf import compute as compute_mod
+
+    real = compute_mod._certify_two_pass
+
+    def cert(Q, Cb, metric, *a, **kw):
+        got = real(Q, Cb, metric, *a, **kw)
+        if metric == metrics[1] and got is None:
+            return "test: refuse the second group"
+        return got
+
+    monkeypatch.setattr(compute_mod, "_certify_two_pass", cert)
+    cfg = _multi_cfg(ds, tmp_path / "on", metrics)
+    twopass.reset()
+    run_compute(cfg, num_jobs=1, job_rank=0)
+    ran, booked = _identity(twopass.stats())
+    assert ran == booked, (ran, booked)
+    got = _multi_tables(tmp_path / "on", cfg)
+    monkeypatch.setenv("NOVA_BF_NO_TWOPASS", "1")
+    ref = _multi_cfg(ds, tmp_path / "off", metrics)
+    twopass.reset()
+    run_compute(ref, num_jobs=1, job_rank=0)
+    want = _multi_tables(tmp_path / "off", ref)
+    for name in want:
+        _same(got[name], want[name], name)
+
+
+def test_a_disable_in_the_second_groups_audit_keeps_the_counter_identity(
+    ds, tmp_path, monkeypatch
+):
+    monkeypatch.setenv("NOVA_BF_TWOPASS_DEAD_AUDIT", "1")
+    real = twopass.audit_decisions
+    calls = {"n": 0}
+
+    def audit(Q, Cb, metric, *a, **kw):
+        out = real(Q, Cb, metric, *a, **kw)
+        if metric == "dot":
+            calls["n"] += 1
+            if calls["n"] == 3:
+                twopass.disable("test: audit failure on the second group")
+        return out
+
+    monkeypatch.setattr(twopass, "audit_decisions", audit)
+    cfg = _multi_cfg(ds, tmp_path / "on", ("cosine", "dot"))
+    twopass.reset()
+    run_compute(cfg, num_jobs=1, job_rank=0)
+    assert calls["n"] >= 3, "the audit never reached the second group"
+    ran, booked = _identity(twopass.stats())
+    assert ran == booked, (ran, booked)
 
 
 def test_certification_actually_consults_the_accumulator_guard(
@@ -1320,17 +1554,23 @@ def test_a_non_float32_query_matrix_is_refused(_eligible, dtype):
              spec_q_norms=[Q.float().norm(dim=1)])
 
 
-def test_a_shared_gram_batch_is_refused(_eligible):
-    """The shared-Gram derivation caches one raw `Q @ Cb.T` across metrics; the
-    two-pass narrows the query axis, so the two cannot use the same matrix."""
-    args = _groups_args()
-    args["batch"].share_gram = True
+def test_a_shared_gram_batch_is_admitted(_eligible):
+    """The shared raw `Q @ Cb.T` is a lazy cache read only by one-pass
+    members; a two-pass plan never builds or reads it, so `share_gram` no
+    longer refuses an eligible group (dot AND cosine on one query matrix)."""
+    import torch
+
     from nova_bf import compute as compute_mod
 
-    assert compute_mod._twopass_groups(**_groups_args()), "control was refused"
-    assert compute_mod._twopass_groups(**args) == {}, (
-        "a share_gram batch was admitted; the narrowed pass two cannot share "
-        "the cached full-height Gram")
+    Q = torch.randn(64, 64, dtype=torch.float32)
+    n = Q.norm(dim=1)
+    args = _groups_args(score_groups={("cosine", True): [0], ("dot", False): [1],
+                                      ("euclidean", False): [2]},
+                        spec_Q=[Q, Q, Q], spec_q_norms=[n, None, n],
+                        spec_qsel=[None, None, None])
+    args["batch"].share_gram = True
+    got = compute_mod._twopass_groups(**args)
+    assert set(got) == {("cosine", True), ("dot", False)}, got
 
 
 def test_a_non_dense_corpus_batch_is_refused(_eligible):
@@ -2321,3 +2561,152 @@ def test_manifest_fractions_are_the_runs_own_ratios(ds, tmp_path):
         tp["rows_padded"] / tp["rows_full"], 6)
     assert tp["live_fraction"] < tp["padded_fraction"] < 1.0, tp
     assert tp["counters_consistent"] is True, tp
+
+
+
+@pytest.mark.slice_only
+def test_a_plain_sibling_is_still_re_probed(ds, tmp_path, monkeypatch):
+    """Dot seeded above the engage threshold, cosine below, on files that are
+    ONE full-width slice each (no tail slice to probe on). Every slice must
+    then be scored plain from the shared Gram (all or nothing), and dot's
+    hint must be re-measured instead of staying frozen at its seed."""
+    from nova_bf import compute as compute_mod
+
+    monkeypatch.setenv("NOVA_BF_TWOPASS_THRESHOLD", "0.5")
+    seed = {("cosine", True): 0.0, ("dot", False): 0.9}
+    keys = {}
+    real = compute_mod._twopass_groups
+
+    def groups(*a, **kw):
+        got = real(*a, **kw)
+        if not keys:
+            for sk, g in got.items():
+                keys[sk] = g["key"]
+                compute_mod._TP_LIVE_HINT[g["key"]] = seed[sk]
+        return got
+
+    monkeypatch.setattr(compute_mod, "_twopass_groups", groups)
+    planned = _spy_plans(monkeypatch)
+    cfg = _multi_cfg(ds, tmp_path / "on", ("cosine", "dot"))
+    cfg.params.dense_batch_size = 200            # == every file's row count
+    twopass.reset()
+    run_compute(cfg, num_jobs=1, job_rank=0)
+    assert keys, "no two-pass groups were formed"
+    assert compute_mod._TP_LIVE_HINT[keys[("dot", False)]] != 0.9, (
+        "dot's hint was never re-measured")
+    # whatever engaged later engaged for BOTH groups on the same slices
+    assert planned[("cosine", True)] == planned[("dot", False)], planned
+
+
+def test_the_shared_gram_gate_sums_the_groups_hints(monkeypatch):
+    """One shared Gram is ONE GEMM for every group, so the engage threshold
+    bounds the SUM of the groups' live fractions, not each alone."""
+    from nova_bf import compute as compute_mod
+
+    monkeypatch.setenv("NOVA_BF_TWOPASS_THRESHOLD", "0.5")
+    monkeypatch.setenv("NOVA_BF_TWOPASS_TILE_THRESHOLD", "0.5")
+    monkeypatch.delenv("NOVA_BF_TWOPASS_FORCE_ENGAGE", raising=False)
+    groups = {("cosine", True): {"key": ("g1",)}, ("dot", False): {"key": ("g2",)}}
+    monkeypatch.setattr(compute_mod, "_TP_LIVE_HINT", {})
+    assert not compute_mod._tp_all_engage(groups), "no hints yet"
+    compute_mod._TP_LIVE_HINT.update({("g1",): 0.2, ("g2",): 0.2})
+    assert compute_mod._tp_all_engage(groups)
+    compute_mod._TP_LIVE_HINT.update({("g1",): 0.3, ("g2",): 0.3})
+    assert not compute_mod._tp_all_engage(groups), "0.6 total > 0.5"
+    compute_mod._TP_LIVE_HINT.update({("g1",): 0.0, ("g2",): 0.6})
+    assert not compute_mod._tp_all_engage(groups)
+
+
+def test_a_closed_shared_gram_gate_runs_no_pass_one(ds, tmp_path, monkeypatch):
+    """With the gate shut, a dot+cosine batch never reaches `_twopass_prepare`
+    or a pipelined launch on a full-width slice: every slice is scored from the
+    shared Gram, and the outputs are the two-pass-off run's."""
+    from nova_bf import compute as compute_mod
+
+    monkeypatch.setattr(compute_mod, "_tp_all_engage", lambda g: False)
+    calls = {"prepare": 0, "launch": 0}
+    real_p, real_l = compute_mod._twopass_prepare, compute_mod._twopass_launch
+
+    def prep(*a, **kw):
+        calls["prepare"] += 1
+        return real_p(*a, **kw)
+
+    def launch(*a, **kw):
+        calls["launch"] += 1
+        return real_l(*a, **kw)
+
+    monkeypatch.setattr(compute_mod, "_twopass_prepare", prep)
+    monkeypatch.setattr(compute_mod, "_twopass_launch", launch)
+    cfg = _multi_cfg(ds, tmp_path / "on", ("cosine", "dot"))
+    twopass.reset()
+    run_compute(cfg, num_jobs=1, job_rank=0)
+    st = twopass.stats()
+    assert calls == {"prepare": 0, "launch": 0}, calls
+    assert st["slices_twopass"] == 0 and st["groups_shared_gram_twopass"] > 0, st
+    got = _multi_tables(tmp_path / "on", cfg)
+    monkeypatch.setenv("NOVA_BF_NO_TWOPASS", "1")
+    ref = _multi_cfg(ds, tmp_path / "off", ("cosine", "dot"))
+    twopass.reset()
+    run_compute(ref, num_jobs=1, job_rank=0)
+    want = _multi_tables(tmp_path / "off", ref)
+    for name in want:
+        assert got[name].equals(want[name]), name
+
+
+def test_a_live_audit_disable_stops_every_later_group_in_the_slice(
+    ds, tmp_path, monkeypatch
+):
+    """Once a group's live audit disables the two-pass (its bound failed on
+    this device), no plan from that slice may be used -- not the auditing
+    group's, not a later group's, which would otherwise run pass one on the
+    very bound just shown to be wrong."""
+    from nova_bf import compute as compute_mod
+
+    monkeypatch.setenv("NOVA_BF_TWOPASS_AUDIT", "1")
+    real_audit = twopass.audit_live_rows
+    real_tiles = getattr(twopass, "audit_live_tiles", None)
+    state = {"disabled": False, "bounds_after": 0}
+
+    def audit(*a, **kw):
+        out = real_audit(*a, **kw)
+        if not state["disabled"]:
+            state["disabled"] = True
+            twopass.disable("test: live audit failure")
+        return out
+
+    def audit_t(*a, **kw):
+        out = real_tiles(*a, **kw)
+        if not state["disabled"]:
+            state["disabled"] = True
+            twopass.disable("test: live audit failure")
+        return out
+
+    real_ub = twopass.upper_bounds_begin
+
+    def ub(*a, **kw):
+        if state["disabled"]:
+            state["bounds_after"] += 1
+        return real_ub(*a, **kw)
+
+    real_prep = compute_mod._twopass_prepare
+    used = []
+
+    def prep(*a, **kw):
+        got = real_prep(*a, **kw)
+        if state["disabled"] and got:
+            used.append(sorted(got))
+        return got
+
+    monkeypatch.setattr(twopass, "audit_live_rows", audit)
+    if real_tiles is not None:
+        monkeypatch.setattr(twopass, "audit_live_tiles", audit_t)
+    monkeypatch.setattr(twopass, "upper_bounds_begin", ub)
+    monkeypatch.setattr(compute_mod, "_twopass_prepare", prep)
+    cfg = _multi_cfg(ds, tmp_path / "on", ("cosine", "dot"))
+    twopass.reset()
+    run_compute(cfg, num_jobs=1, job_rank=0)
+    st = twopass.stats()
+    assert state["disabled"], "no live audit ran"
+    assert not used, f"plans used after the disable: {used}"
+    ran, booked = _identity(st)
+    assert ran == booked, (ran, booked)

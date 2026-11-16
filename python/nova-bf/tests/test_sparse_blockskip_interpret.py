@@ -1984,6 +1984,154 @@ if _CHILD:
             assert set(b["gates"]) == {"enabled"} and b["slices"] > 0, b
             assert b["check_failures"] == 0 and b["disabled"] is None, b
 
+    # --- dense row reorder + mixed-metric two-pass beside sparse skipping ---
+
+    def _combined_data(root, n_files=4, per_file=200, dim=64, n_q=48, seed=57):
+        """Dense (fp16-representable) + sparse + language corpus; queries
+        whose `query_set` cycles a, b, c row by row, so every `rows` subset is
+        interleaved in file order and only the dense reorder makes them
+        contiguous."""
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+
+        rng = np.random.default_rng(seed)
+        st = pa.struct([pa.field("indices", pa.list_(pa.uint32())),
+                        pa.field("values", pa.list_(pa.float32()))])
+
+        def srow(lo, hi):
+            k = int(rng.integers(lo, hi + 1))
+            idx = sorted(rng.choice(60, size=k, replace=False).tolist())
+            return {"indices": idx,
+                    "values": (rng.random(k).astype(np.float32) + 0.05).tolist()}
+
+        def dense(n):
+            v = rng.standard_normal((n, dim)).astype(np.float16).astype(np.float32)
+            return pa.array(v.tolist(), pa.list_(pa.float32()))
+
+        cdir = root / "corpus"
+        cdir.mkdir()
+        for f in range(n_files):
+            pq.write_table(pa.table({
+                "sparse_embedding": pa.array([srow(1, 12) for _ in range(per_file)], st),
+                "dense_embedding": dense(per_file),
+                "language": pa.array([("eng" if (f + j) % 3 else "fra")
+                                      for j in range(per_file)]),
+                "id": pa.array([f"c{f}_{j:04d}" for j in range(per_file)]),
+            }), str(cdir / f"f{f}.parquet"))
+        pq.write_table(pa.table({
+            "sparse_embedding": pa.array([srow(1, 6) for _ in range(n_q)], st),
+            "dense_embedding": dense(n_q),
+            "query_set": pa.array(["abc"[i % 3] for i in range(n_q)]),
+            "id": pa.array([f"q{i:03d}" for i in range(n_q)]),
+        }), str(root / "q.parquet"))
+        return cdir, root / "q.parquet"
+
+    def _combined_searches():
+        from nova_bf.config import Filter, FilterCondition, RowSelector, SearchSpec
+
+        def rows(*v):
+            return RowSelector(column="query_set", isin=list(v))
+        eng = Filter(must=[FilterCondition(field="language", match="eng")])
+        return [
+            # dense: dot + cosine in one batch (mixed-metric two-pass), on
+            # laminar interleaved subsets (the reorder), plus a filtered one
+            SearchSpec(name="d_dot", k=5, metric="dot", vector_type="dense", rows=rows("a")),
+            SearchSpec(name="d_cos", k=5, metric="cosine", vector_type="dense",
+                       rows=rows("b", "c")),
+            SearchSpec(name="d_cos_eng", k=4, metric="cosine", vector_type="dense",
+                       rows=rows("c"), filter=eng),
+            # sparse: dot readers on the whole matrix (the mask-aware top-k),
+            # a subset and a filtered subset, all different k (min-threshold
+            # skipping)
+            SearchSpec(name="s_all", k=5, metric="dot", vector_type="sparse"),
+            SearchSpec(name="s_dot", k=2, metric="dot", vector_type="sparse", rows=rows("b")),
+            SearchSpec(name="s_dot_eng", k=3, metric="dot", vector_type="sparse",
+                       rows=rows("a", "c"), filter=eng),
+        ]
+
+    def _combined_run(root, monkeypatch, cdir, qpath, tag, on):
+        import glob
+        import json
+
+        import pyarrow.parquet as pq
+
+        from nova_bf import twopass
+        from nova_bf.compute import run_compute
+        from nova_bf.config import (BruteForceConfig, CorpusConfig, OutputConfig,
+                                    ParamsConfig, QueriesConfig)
+
+        if on:
+            monkeypatch.delenv("NOVA_BF_NO_ROW_REORDER", raising=False)
+            monkeypatch.delenv("NOVA_BF_NO_TWOPASS", raising=False)
+        else:
+            monkeypatch.setenv("NOVA_BF_NO_ROW_REORDER", "1")
+            monkeypatch.setenv("NOVA_BF_NO_TWOPASS", "1")
+        out = root / f"{tag}_{'on' if on else 'off'}"
+        cfg = BruteForceConfig(
+            corpus=CorpusConfig(path=str(cdir), id_column="id"),
+            queries=QueriesConfig(path=str(qpath), id_column="id"),
+            output=OutputConfig(path=str(out)),
+            params=ParamsConfig(io_workers=1, dense_batch_size=64, sparse_batch_size=64,
+                                sparse_kernel="posting",
+                                sparse_block_skip="on" if on else "off",
+                                sparse_block_skip_sub=16, threshold_exchange=False),
+            searches=_combined_searches())
+        twopass.reset()
+        paths = run_compute(cfg)
+        st = twopass.stats()
+        tables = {n: pq.read_table(p) for n, p in paths.items()}
+        (mf,) = glob.glob(str(out / "_bf_manifest_*_compute.json"))
+        man = json.loads(open(mf).read())
+        return tables, man, st
+
+    @pytest.mark.parametrize("cpu_topk", [False, True])
+    def test_e2e_row_reorder_and_mixed_metric_twopass_beside_sparse_skip(
+            tmp_path, monkeypatch, cpu_topk):
+        """The merged dense and sparse changes in one run: dense dot + cosine
+        searches on interleaved `rows` subsets (reordered to contiguous blocks
+        and two-passed per metric, slice mode), a filtered dense search, and
+        three sparse dot readers (whole matrix, subset, filtered subset;
+        different k) skipping against
+        their per-row minimum threshold. Every output is byte-identical to the
+        run with the reorder, the two-pass and skipping all off."""
+        from nova_bf import twopass
+
+        monkeypatch.setattr(sp, "DOC_BLOCK", 64)
+        monkeypatch.setenv("NOVA_BF_TWOPASS_RESCORE", "slice")
+        monkeypatch.setenv("NOVA_BF_TWOPASS_THRESHOLD", "1.0")
+        monkeypatch.setenv("NOVA_BF_TWOPASS_ON_CPU", "1")
+        monkeypatch.setattr(twopass, "PAD_QUANTUM", 8)
+        monkeypatch.setattr(twopass, "PAD_FLOOR", 8)
+        monkeypatch.setattr(twopass, "PAD_SMALL", ())
+        monkeypatch.setattr(twopass, "MIN_QUERY_ROWS", 8)
+        if cpu_topk:
+            _cpu_topk(monkeypatch)
+        cdir, qpath = _combined_data(tmp_path)
+        off, m_off, st_off = _combined_run(tmp_path, monkeypatch, cdir, qpath, "c", False)
+        on, m_on, st_on = _combined_run(tmp_path, monkeypatch, cdir, qpath, "c", True)
+        twopass.reset()
+
+        assert set(off) == set(on) == {"d_dot", "d_cos", "d_cos_eng", "s_all", "s_dot",
+                                         "s_dot_eng"}
+        for n in off:
+            assert off[n].equals(on[n], check_metadata=True), n
+        assert m_on["counts"] == m_off["counts"]
+
+        lay = m_on["params"]["query_row_layout"]
+        assert lay["dense"]["status"] == "reordered", lay
+        assert st_off["slices_twopass"] == 0, st_off
+        assert st_on["slices_twopass"] > 0, st_on
+        assert st_on["groups_shared_gram_twopass"] > 0, st_on
+        assert st_on["groups_shared_gram_kept"] == 0, st_on
+
+        b = m_on["params"]["kernels"]["sparse_posting_kernel"]["block_skip"]
+        assert set(b["gates"]) == {"enabled"}, b["gates"]
+        assert b["slices"] > 0 and b["dead"] > 0, b
+        assert b["check_failures"] == 0 and b["disabled"] is None, b
+        assert b["model_probe_failures"] == 0, b
+        if cpu_topk:
+            assert b["masked_topk"] > 0, b
+
 
 if _CHILD:
     def test_dead_program_count_matches_bruteforce(monkeypatch):

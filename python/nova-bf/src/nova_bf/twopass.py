@@ -1869,6 +1869,16 @@ _STATS = {
     # Two-pass eligibility decisions at the score-group level.
     "groups_seen": 0,
     "groups_refused": 0,
+    # Dense batch groups scored by >1 distinct metric (`share_gram`): one raw
+    # Gram serves every member scored in ONE pass. `_twopass` = those of them
+    # in which at least one score group was also two-pass eligible (it then
+    # prunes with its own pass one; the rest still share the Gram).
+    "groups_shared_gram": 0,
+    "groups_shared_gram_twopass": 0,
+    # ...and those where some groups WERE eligible but another group must be
+    # scored from the full Gram (euclidean, an ineligible key), so the
+    # two-pass is kept off for all of them.
+    "groups_shared_gram_kept": 0,
 
     # Certifications that could not obtain a usable verdict and must be retried.
     "certify_inconclusive": 0,
@@ -1996,9 +2006,10 @@ def reset_stats() -> None:
 
 # --- the query side, built once per query matrix ------------------------------
 
-# Keyed by `id(Q)`, with `Q` itself held in the value so the id cannot be
-# recycled while the entry is alive.
-_QCACHE: dict[int, dict] = {}
+# Keyed by `(id(Q), id(row_scale))` (`qcache_key`), with both objects held in
+# the value so neither id can be recycled while the entry is alive.
+_QCACHE: dict[tuple, dict] = {}
+_QCACHE_MAX = 16
 
 def release() -> None:
     """Release cached query tensors while preserving run statistics.
@@ -2077,6 +2088,11 @@ def reset() -> None:
     _CERTIFIED = None
     _CERTIFIED_KEYS.clear()
 
+def qcache_key(Q, row_scale=None) -> tuple:
+    """`_QCACHE`'s key for one query-side state (see `query_side`)."""
+    return (id(Q), id(row_scale))
+
+
 def query_side(Q, row_scale=None) -> dict:
     """Prepare and cache the query-side inputs required by pass one and its bound.
 
@@ -2092,11 +2108,11 @@ def query_side(Q, row_scale=None) -> dict:
         # query tensors and scales immutable.
         return None if t is None else t._version
 
-    # Cache one entry per Q; changing `row_scale` replaces it.
-    # Pass one relies on cache hits to avoid repeated host synchronization.
-    # Mixed scales for the same Q are currently excluded from two-pass.
-    # Use (id(Q), id(row_scale)) if that changes.
-    key = id(Q)
+    # Cache by both query matrix and row scaling so dot and cosine searches
+    # can reuse their separate entries. This preserves cached error bounds
+    # and avoids repeated host synchronization. Keep object references
+    # to prevent ID reuse.
+    key = qcache_key(Q, row_scale)
     got = _QCACHE.get(key)
     if (got is not None and got["Q"] is Q and got["row_scale"] is row_scale
             and got["versions"] == (_ver(Q), _ver(row_scale))):
@@ -2122,6 +2138,12 @@ def query_side(Q, row_scale=None) -> dict:
         # Bound values cached for this query-side state.
         "eps_cache": {},
     }
+    _QCACHE.pop(key, None)
+    # Bounded: a caller handing in a fresh `row_scale` per call would otherwise
+    # grow one entry (and one fp16 query copy) per call. A run's stable
+    # (Q, scale) pairs are a handful; evicting the oldest only costs a rebuild.
+    while len(_QCACHE) >= _QCACHE_MAX:
+        del _QCACHE[next(iter(_QCACHE))]
     _QCACHE[key] = got
     return got
 

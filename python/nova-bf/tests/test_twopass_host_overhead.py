@@ -319,7 +319,7 @@ def test_the_eps_device_copy_is_reused_and_rebuilt_after_a_write(metric):
         return eps
 
     def cached():
-        (entry,) = twopass._QCACHE[id(Q)]["eps_dev"].values()
+        (entry,) = twopass._QCACHE[twopass.qcache_key(Q, rs)]["eps_dev"].values()
         return entry[1]
 
     first = eps_of()

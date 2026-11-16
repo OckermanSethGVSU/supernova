@@ -1244,7 +1244,7 @@ def test_the_dot_scale_reuses_the_bounds_own_query_norms(monkeypatch):
     real = twopass.query_side
 
     def spy(Q_, row_scale=None):
-        before = twopass._QCACHE.get(id(Q_))
+        before = twopass._QCACHE.get(twopass.qcache_key(Q_, row_scale))
         got = real(Q_, row_scale)
         built.append(got is not before)
         return got
@@ -1253,7 +1253,7 @@ def test_the_dot_scale_reuses_the_bounds_own_query_norms(monkeypatch):
     why, _ = _probe_a("dot", Q, C)
     assert why is None, why
     assert built and built[-1] is False, built
-    assert torch.equal(twopass._QCACHE[id(Q)]["qn"], Q.float().norm(dim=1))
+    assert torch.equal(twopass._QCACHE[twopass.qcache_key(Q)]["qn"], Q.float().norm(dim=1))
 
 
 def test_an_oom_in_the_shortfall_diagnostic_still_certifies(monkeypatch):

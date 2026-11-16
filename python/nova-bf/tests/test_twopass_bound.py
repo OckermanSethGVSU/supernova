@@ -1309,7 +1309,7 @@ def test_a_zero_width_matrix_does_not_crash_the_guards():
 
 
 def test_the_query_cache_checks_identity_not_just_the_address():
-    """`_QCACHE` is keyed on `id(Q)`, and CPython reuses addresses.
+    """`_QCACHE` is keyed on `(id(Q), id(row_scale))`, and CPython reuses addresses.
 
     The entry itself holds `Q` alive, though, so the recycle cannot actually
     happen while the entry lives — measured: the cached `Q`'s refcount stays
@@ -1333,7 +1333,7 @@ def test_the_query_cache_checks_identity_not_just_the_address():
     assert first["Q"] is Q1
 
     # As if Q1 had been freed and Q2 landed on its address.
-    twopass._QCACHE[id(Q2)] = first
+    twopass._QCACHE[twopass.qcache_key(Q2)] = first
 
     got = twopass.query_side(Q2)
     assert got["Q"] is Q2, (
@@ -3173,7 +3173,7 @@ def test_the_cache_holds_Q_strongly_so_its_id_cannot_be_recycled():
     Q = torch.randn(8, 128)
     got = twopass.query_side(Q, None)
     assert got["Q"] is Q
-    key = id(Q)
+    key = twopass.qcache_key(Q, None)
     del Q
     # The entry still pins the object, so the id remains live and owned by it.
     assert twopass._QCACHE[key]["Q"] is not None
