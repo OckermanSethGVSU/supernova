@@ -186,11 +186,15 @@ def test_margin_constants():
     bs.reset()
 
 
-def test_skip_member_gate():
-    """`_sparse_skip_member` only admits one unfiltered, unscaled, unsubset
-    dot search over a sparse batch with pruning on."""
+def test_skip_readers_gate():
+    """`_sparse_skip_readers` admits a sparse batch whose readers are ALL
+    unscaled dot searches with pruning on (filters allowed), with one
+    threshold per selected row; any other metric, scaling or a threshold of
+    the wrong height turns skipping off for the group."""
+    import torch
+
     from nova_bf import sparse_block_skip as bs
-    from nova_bf.compute import SparseCorpusBatch, _sparse_skip_member
+    from nova_bf.compute import SparseCorpusBatch, _sparse_skip_readers
     from nova_bf.config import Filter, FilterCondition, SearchSpec
 
     bs.reset()
@@ -199,26 +203,88 @@ def test_skip_member_gate():
     cos = SearchSpec(name="c", k=5, metric="cosine", vector_type="sparse")
     filt = SearchSpec(name="f", k=5, metric="dot", vector_type="sparse",
                       filter=Filter(must=[FilterCondition(field="x", match="y")]))
-    assert _sparse_skip_member(batch, [0], [dot], [None], [None], True) is None  # mode off
+
+    def gate(ms, specs, qsel=None, scale=None, prune=True, **k):
+        n = len(specs)
+        return _sparse_skip_readers(batch, ms, specs, qsel or [None] * n,
+                                    scale or [None] * n, prune, **k)
+    assert gate([0], [dot]) is None                                  # mode off
     bs.configure("on")
     try:
-        assert _sparse_skip_member(batch, [0], [dot], [None], [None], True) == 0
-        assert _sparse_skip_member(batch, [0], [dot], [None], [None], False) is None
-        assert _sparse_skip_member(batch, [0, 1], [dot, dot], [None] * 2, [None] * 2,
-                                   True) is None
-        assert _sparse_skip_member(batch, [0], [cos], [None], [None], True) is None
-        assert _sparse_skip_member(batch, [0], [filt], [None], [None], True) is None
-        assert _sparse_skip_member(batch, [0], [dot], [[1]], [None], True) is None
-        assert _sparse_skip_member(batch, [0], [dot], [None], [1.0], True) is None
-        assert _sparse_skip_member(object(), [0], [dot], [None], [None], True) is None
+        assert gate([0], [dot]) == [0]
+        assert gate([0], [dot], prune=False) is None
+        assert gate([0, 1], [dot, dot]) == [0, 1]
+        assert gate([0, 1], [dot, filt]) == [0, 1]
+        assert gate([0], [filt]) == [0]
+        assert gate([0], [cos]) is None
+        assert gate([0, 1], [dot, cos]) is None
+        assert gate([0], [dot], qsel=[[1]]) is None                  # heights unknown
+        assert gate([0], [dot], scale=[1.0]) is None
+        assert _sparse_skip_readers(object(), [0], [dot], [None], [None], True) is None
         g = bs.usage()["gates"]
-        assert g["enabled"] == 1 and sum(g.values()) == 7
+        assert g["enabled"] == 4 and g["metric cosine"] == 2, g
+        assert g["pruning off"] == 1 and g["query subset"] == 1 and g["query scaling"] == 1
         bs.disable("test")
-        assert _sparse_skip_member(batch, [0], [dot], [None], [None], True) is None
-        g = bs.usage()["gates"]
-        assert g["enabled"] == 1 and g["skipping disabled for the run"] == 1
+        assert gate([0], [dot]) is None
+        assert bs.usage()["gates"]["skipping disabled for the run"] == 1
     finally:
         bs.reset()
+
+
+def test_skip_readers_gate_selection_heights():
+    """With the query matrix and thresholds given, every reader's selection
+    must be a `_row_selector` selector whose length is its threshold's height."""
+    import torch
+
+    from nova_bf import sparse_block_skip as bs
+    from nova_bf.compute import (SparseCorpusBatch, _selection_len, _sparse_skip_readers,
+                                 _whole_selection)
+    from nova_bf.config import SearchSpec
+
+    batch = SparseCorpusBatch.__new__(SparseCorpusBatch)
+    dot = SearchSpec(name="d", k=5, metric="dot", vector_type="sparse")
+    Q = torch.zeros(7, 3)
+    bs.reset()
+    bs.configure("on")
+    try:
+        def gate(sels, heights):
+            n = len(sels)
+            return _sparse_skip_readers(
+                batch, list(range(n)), [dot] * n, sels, [None] * n, True, [Q] * n,
+                [torch.zeros(h, dtype=torch.int64) for h in heights])
+        assert gate([None], [7]) == [0]
+        assert gate([slice(0, 7)], [7]) == [0]
+        assert gate([slice(2, 5), torch.tensor([0, 3, 6])], [3, 3]) == [0, 1]
+        assert gate([None, slice(0, 4)], [7, 4]) == [0, 1]
+        for sel, h in ((None, 6), (slice(0, 7), 6), (slice(0, 7, 2), 4),
+                       (slice(3, 9), 6), (slice(5, 2), 0), (slice(0, None), 7),
+                       (torch.tensor([0, 1], dtype=torch.int32), 2), ([0, 1], 2)):
+            assert gate([sel], [h]) is None, (sel, h)
+        assert _selection_len(slice(None, 7), 7) == 7
+        assert _whole_selection(None, None) and not _whole_selection(slice(0, 7), None)
+        assert _whole_selection(slice(0, 7), 7) and not _whole_selection(slice(0, 6), 7)
+    finally:
+        bs.reset()
+
+
+def test_skip_threshold_is_the_per_row_minimum():
+    """`_skip_threshold`: per raw row, the lowest key among the readers
+    selecting it (slice, index tensor or whole), the sentinel where none does."""
+    import torch
+
+    from nova_bf.compute import _skip_threshold
+    from nova_bf.tiebreak import sentinel_key
+
+    def keys(v):
+        return torch.tensor(v, dtype=torch.int64)
+    thr = [keys([50, 10, 70, 30, 90, 20]), keys([40, 60]), keys([5, 80, 95])]
+    sel = [None, slice(2, 4), torch.tensor([1, 3, 5])]
+    got = _skip_threshold([0, 1, 2], thr, sel, 6, "cpu")
+    assert got.tolist() == [50, 5, 40, 30, 90, 20]
+    got = _skip_threshold([1, 2], thr, sel, 6, "cpu")
+    s = int(sentinel_key((1,), "cpu")[0])
+    assert got.tolist() == [s, 5, 40, 60, s, 95]
+    assert _skip_threshold([0], thr, sel, 6, "cpu") is thr[0]
 
 
 # --- interpreted child -------------------------------------------------------
@@ -1549,8 +1615,355 @@ if _CHILD:
                     assert u["masked_topk"] > 0
         assert dead and dead > 0, c
 
+    def _shared_dataset(tmp_path, layout, n_files=3, per_file=300, n_q=36, seed=41):
+        """Corpus with dense + sparse + language columns; queries with dense,
+        sparse and a `query_set` column (`layout`: "blocks" = sorted by set,
+        "interleaved" = round robin), as in a shared dense / sparse /
+        filtered ground-truth run."""
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+
+        rng = np.random.default_rng(seed)
+        sp_t = pa.struct([pa.field("indices", pa.list_(pa.uint32())),
+                          pa.field("values", pa.list_(pa.float32()))])
+
+        def srow(lo, hi):
+            k = int(rng.integers(lo, hi + 1))
+            idx = sorted(rng.choice(60, size=k, replace=False).tolist())
+            return {"indices": idx,
+                    "values": (rng.random(k).astype(np.float32) + 0.05).tolist()}
+
+        def drow():
+            return rng.standard_normal(8).astype(np.float32).tolist()
+
+        cdir = tmp_path / "corpus"
+        cdir.mkdir(exist_ok=True)
+        for f in range(n_files):
+            pq.write_table(pa.table({
+                "sparse_embedding": pa.array([srow(1, 12) for _ in range(per_file)], sp_t),
+                "dense_embedding": pa.array([drow() for _ in range(per_file)],
+                                            pa.list_(pa.float32())),
+                "language": pa.array([("eng" if (f + j) % 3 else "fra")
+                                      for j in range(per_file)]),
+                "id": pa.array([f"c{f}_{j:04d}" for j in range(per_file)]),
+            }), str(cdir / f"f{f}.parquet"))
+        sets = ["dense", "sparse", "filtered"]
+        if layout == "blocks":
+            qs = [sets[i * 3 // n_q] for i in range(n_q)]
+        else:
+            qs = [sets[i % 3] for i in range(n_q)]
+        pq.write_table(pa.table({
+            "sparse_embedding": pa.array([srow(1, 6) for _ in range(n_q)], sp_t),
+            "dense_embedding": pa.array([drow() for _ in range(n_q)], pa.list_(pa.float32())),
+            "query_set": pa.array(qs),
+            "lang": pa.array([("eng" if i % 4 else "fra") for i in range(n_q)]),
+            "id": pa.array([f"q{i:03d}" for i in range(n_q)]),
+        }), str(tmp_path / "q.parquet"))
+        return cdir, tmp_path / "q.parquet"
+
+    def _shared_run(tmp_path, cdir, qpath, searches, tag, skip, batch=128):
+        import json
+
+        import pyarrow.parquet as pq
+
+        from nova_bf.compute import run_compute
+        from nova_bf.config import (BruteForceConfig, CorpusConfig, OutputConfig,
+                                    ParamsConfig, QueriesConfig)
+
+        out = tmp_path / f"{tag}_{skip}"
+        cfg = BruteForceConfig(
+            corpus=CorpusConfig(path=str(cdir), id_column="id"),
+            queries=QueriesConfig(path=str(qpath), id_column="id"),
+            output=OutputConfig(path=str(out)),
+            params=ParamsConfig(io_workers=1, sparse_batch_size=batch,
+                                dense_batch_size=batch, sparse_kernel="posting",
+                                sparse_block_skip=skip, sparse_block_skip_sub=16),
+            searches=searches)
+        paths = run_compute(cfg)
+        tables = {n: pq.read_table(p).to_pydict() for n, p in paths.items()}
+        man = json.loads(next(out.rglob("*manifest*.json")).read_text())
+        return tables, man["params"]["kernels"]["sparse_posting_kernel"]["block_skip"]
+
+    def _shared_searches(k, sparse_rows=("sparse",), second_sparse=False):
+        from nova_bf.config import Filter, FilterCondition, RowSelector, SearchSpec
+
+        def rows(*v):
+            return RowSelector(column="query_set", isin=list(v))
+        out = [
+            SearchSpec(name="dense_cos", k=k, metric="cosine", vector_type="dense",
+                       rows=rows("dense", "sparse")),
+            SearchSpec(name="sparse_dot", k=k, metric="dot", vector_type="sparse",
+                       rows=rows(*sparse_rows)),
+            SearchSpec(name="filtered", k=k, metric="cosine", vector_type="dense",
+                       rows=rows("filtered"),
+                       filter=Filter(must=[FilterCondition(field="language", match="eng")])),
+        ]
+        if second_sparse:
+            out.append(SearchSpec(name="sparse_dot2", k=k, metric="dot",
+                                  vector_type="sparse", rows=rows("filtered")))
+        return out
+
+    @pytest.mark.parametrize("layout", ["blocks", "interleaved"])
+    @pytest.mark.parametrize("k", [1, 5])
+    @pytest.mark.parametrize("cpu_topk", [False, True])
+    def test_e2e_shared_mode_sparse_rows_subset_engages(tmp_path, monkeypatch, layout, k,
+                                                        cpu_topk):
+        """Dense, row-subset sparse dot and filtered dense searches in one run
+        (the shared ground-truth layout): the sparse search is its
+        vector_type's only reader, so skipping engages, every search's output
+        is identical to skipping off, and (CPU top-k patched in) the
+        mask-aware top-k is used, i.e. the whole-matrix selection was dropped."""
+        monkeypatch.setattr(sp, "DOC_BLOCK", 64)
+        if cpu_topk:
+            _cpu_topk(monkeypatch)
+        cdir, qpath = _shared_dataset(tmp_path, layout)
+        searches = _shared_searches(k)
+        off, b_off = _shared_run(tmp_path, cdir, qpath, searches, "s", "off")
+        on, b = _shared_run(tmp_path, cdir, qpath, searches, "s", "on")
+        assert set(off) == {"dense_cos", "sparse_dot", "filtered"}
+        assert off == on
+        assert b_off["slices"] == 0
+        assert set(b["gates"]) == {"enabled"}, b["gates"]
+        assert b["slices"] > 0 and b["dead"] > 0, b
+        assert b["checks"] >= 1 and b["check_failures"] == 0 and b["disabled"] is None
+        assert b["model_probes"] >= 1 and b["model_probe_failures"] == 0
+        if cpu_topk:
+            assert b["masked_topk"] > 0, b
+        # each search answered exactly its own query rows
+        n_rows = {"dense_cos": 24, "sparse_dot": 12, "filtered": 12}
+        for n, t in off.items():
+            assert len(t["hit_ids"]) == n_rows[n], n
+
+    def _sparse_specs(case):
+        """Sparse reader mixes over the shared dataset (dense + filtered dense
+        searches always run beside them)."""
+        from nova_bf.config import Filter, FilterCondition, RowSelector, SearchSpec
+
+        def rows(*v):
+            return RowSelector(column="query_set", isin=list(v))
+        eng = Filter(must=[FilterCondition(field="language", match="eng")])
+        perq = Filter(must=[FilterCondition(field="language", match_from_query="lang")])
+
+        def dot(name, k=5, r=None, f=None):
+            return SearchSpec(name=name, k=k, metric="dot", vector_type="sparse",
+                              rows=r, filter=f)
+        return {
+            # disjoint / overlapping proper subsets of the raw matrix
+            "two_subsets": [dot("a", r=rows("sparse")), dot("b", r=rows("filtered"))],
+            "overlapping": [dot("a", r=rows("sparse", "filtered")),
+                            dot("b", k=2, r=rows("filtered", "dense"))],
+            # dot + filtered dot (uniform), whole and subset
+            "dot+filtered": [dot("u"), dot("f", f=eng)],
+            "dot+filtered_subset": [dot("u", r=rows("sparse")),
+                                    dot("f", r=rows("sparse", "filtered"), f=eng)],
+            # dot + per-query filtered dot
+            "dot+perquery": [dot("u", k=3), dot("p", f=perq)],
+            # one filtered reader alone, whole-matrix rows subset, with its
+            # per-query filter SHARED with a dense search over other rows (its
+            # filter mask lives in that union's row space: the selector must
+            # not be dropped)
+            "perquery_alone_shared_filter": [dot("p", r=rows("sparse"), f=perq)],
+            "two_k": [dot("k1", k=1), dot("k20", k=20)],
+        }[case]
+
+    @pytest.mark.parametrize("case", ["two_subsets", "overlapping", "dot+filtered",
+                                      "dot+filtered_subset", "dot+perquery",
+                                      "perquery_alone_shared_filter", "two_k"])
+    @pytest.mark.parametrize("cpu_topk", [False, True])
+    def test_e2e_several_dot_readers_engage(tmp_path, monkeypatch, case, cpu_topk):
+        """Several dot readers of one sparse raw matrix (filters, `rows`
+        subsets, different k), beside dense and filtered dense searches: the
+        slice skips against the per-row minimum threshold, every output is
+        identical to skipping off."""
+        from nova_bf.config import Filter, FilterCondition, RowSelector, SearchSpec
+
+        monkeypatch.setattr(sp, "DOC_BLOCK", 64)
+        if cpu_topk:
+            _cpu_topk(monkeypatch)
+        cdir, qpath = _shared_dataset(tmp_path, "interleaved")
+        searches = _shared_searches(5)[:1] + [_shared_searches(5)[2]] + _sparse_specs(case)
+        if case == "perquery_alone_shared_filter":
+            perq = Filter(must=[FilterCondition(field="language", match_from_query="lang")])
+            searches.append(SearchSpec(
+                name="dense_perq", k=5, metric="cosine", vector_type="dense",
+                rows=RowSelector(column="query_set", isin=["dense", "filtered"]),
+                filter=perq))
+        off, _ = _shared_run(tmp_path, cdir, qpath, searches, case, "off")
+        on, b = _shared_run(tmp_path, cdir, qpath, searches, case, "on")
+        assert off == on
+        assert set(b["gates"]) == {"enabled"}, b["gates"]
+        assert b["slices"] > 0 and b["dead"] > 0, b
+        assert b["check_failures"] == 0 and b["disabled"] is None, b
+        if cpu_topk and case in ("two_k", "dot+filtered", "dot+perquery"):
+            assert b["masked_topk"] > 0, b          # an unfiltered whole reader
+        if case.startswith("perquery_alone"):
+            assert b["masked_topk"] == 0 and b["materialized"] > 0, b
+
+    def test_e2e_dot_plus_cosine_sparse_stays_off(tmp_path, monkeypatch):
+        """A cosine reader of the raw matrix keeps skipping off (its threshold
+        is in cosine units), outputs identical."""
+        from nova_bf.config import SearchSpec
+
+        monkeypatch.setattr(sp, "DOC_BLOCK", 64)
+        cdir, qpath = _shared_dataset(tmp_path, "interleaved")
+        searches = _shared_searches(5) + [SearchSpec(
+            name="sparse_cos", k=5, metric="cosine", vector_type="sparse")]
+        off, _ = _shared_run(tmp_path, cdir, qpath, searches, "dc", "off")
+        on, b = _shared_run(tmp_path, cdir, qpath, searches, "dc", "on")
+        assert off == on
+        assert b["slices"] == 0 and "enabled" not in b["gates"], b
+        assert b["gates"].get("metric cosine", 0) > 0, b
+
+    # --- reviewer round 2: multi-reader differentials ----------------------
+
+    _REV_WORDS = ["alpha", "beta", "gamma", "delta", "eps"]
+
+
+    def _rev_data(root, n_files=4, per_file=400, seed=7, n_q=30):
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+
+        rng = np.random.default_rng(seed)
+        st = pa.struct([pa.field("indices", pa.list_(pa.uint32())),
+                        pa.field("values", pa.list_(pa.float32()))])
+
+        def srow(lo, hi, vocab=80):
+            k = int(rng.integers(lo, hi + 1))
+            idx = sorted(rng.choice(vocab, size=k, replace=False).tolist())
+            v = rng.random(k).astype(np.float32) + 0.05
+            if rng.random() < 0.3:
+                v = (np.round(v * 4) / 4 + 0.25).astype(np.float32)
+            return {"indices": idx, "values": v.tolist()}
+
+        cdir = root / "corpus"
+        cdir.mkdir()
+        for f in range(n_files):
+            rows = [srow(1, 12) for _ in range(per_file)]
+            for j in range(per_file - 4, per_file):   # strong late rows
+                rows[j] = {"indices": list(range(0, 80, 3)), "values": [2.0] * 27}
+            body = [" ".join(rng.choice(_REV_WORDS, size=int(rng.integers(1, 4)))) for _ in range(per_file)]
+            pq.write_table(pa.table({
+                "sparse_embedding": pa.array(rows, st),
+                "language": pa.array([("eng" if (f + j) % 3 else "fra") for j in range(per_file)]),
+                "rare": pa.array([("x" if (j * 7 + f) % 23 == 0 else "y") for j in range(per_file)]),
+                "body": pa.array(body),
+                "id": pa.array([f"{(j * 7919 + f * 104729) % 10**6:07d}_{f}_{j}" for j in range(per_file)]),
+            }), str(cdir / f"f{f}.parquet"))
+        qs = [srow(1, 6) for _ in range(n_q)]
+        qs[3] = {"indices": [], "values": []}          # empty query
+        qs[7] = {"indices": [79], "values": [1.0]}     # rare-ish token
+        pq.write_table(pa.table({
+            "sparse_embedding": pa.array(qs, st),
+            "query_set": pa.array([["a", "b", "c"][i % 3] for i in range(n_q)]),
+            "lang": pa.array([("eng" if i % 4 else "fra") for i in range(n_q)]),
+            "phrase": pa.array([_REV_WORDS[i % 5] if i % 6 else "alpha beta" for i in range(n_q)]),
+            "id": pa.array([f"q{i:03d}" for i in range(n_q)]),
+        }), str(root / "q.parquet"))
+        return cdir, root / "q.parquet"
+
+
+    def _rev_specs(case):
+        from nova_bf.config import Filter, FilterCondition, RowSelector, SearchSpec
+
+        def rows(*v):
+            return RowSelector(column="query_set", isin=list(v))
+
+        def dot(name, k=5, r=None, f=None):
+            return SearchSpec(name=name, k=k, metric="dot", vector_type="sparse", rows=r, filter=f)
+        fra = Filter(must=[FilterCondition(field="language", match="fra")])
+        rare = Filter(must=[FilterCondition(field="rare", match="x")])
+        txt = Filter(must=[FilterCondition(field="body", match_text="alpha")])
+        perq = Filter(must=[FilterCondition(field="language", match_from_query="lang")])
+        ptxt = Filter(must=[FilterCondition(field="body", match_text_from_query="phrase")])
+        return {
+            "filters_only_coalesce": [dot("fra", 3, f=fra), dot("rare", 4, r=rows("a", "c"), f=rare),
+                                      dot("txt", 2, r=rows("b"), f=txt)],
+            "perquery_text_only": [dot("pq", 5, f=perq), dot("pt", 3, r=rows("a", "b"), f=ptxt),
+                                   dot("pt2", 1, r=rows("c"), f=ptxt)],
+            "empty_filter_mix": [dot("empty", 4, f=Filter()), dot("pt", 2, r=rows("b", "c"), f=ptxt),
+                                 dot("huge", 5000, r=rows("a")), dot("u", 3, r=rows("c")),
+                                 dot("rare", 6, f=rare)],
+            "mixed_and_none": [dot("u", 7), dot("f", 2, r=rows("a"), f=perq),
+                               dot("fr", 9, r=rows("b"), f=fra)],
+        }[case]
+
+
+    def _rev_run(root, cdir, qpath, searches, tag, skip, batch, num_jobs=None, elide=True):
+        import json
+
+        import pyarrow.parquet as pq
+
+        from nova_bf.compute import run_compute
+        from nova_bf.config import (BruteForceConfig, CorpusConfig, OutputConfig,
+                                    ParamsConfig, QueriesConfig)
+        from nova_bf.merge import run_merge
+
+        out = root / f"{tag}_{skip}_{elide}"
+        cfg = BruteForceConfig(
+            corpus=CorpusConfig(path=str(cdir), sparse_column="sparse_embedding", id_column="id"),
+            queries=QueriesConfig(path=str(qpath), sparse_column="sparse_embedding", id_column="id"),
+            output=OutputConfig(path=str(out)),
+            params=ParamsConfig(io_workers=1, sparse_batch_size=batch, sparse_kernel="posting",
+                                sparse_block_skip=skip, sparse_block_skip_sub=16,
+                                sparse_block_skip_elide=elide, threshold_exchange=False),
+            searches=searches)
+        usages = []
+        if num_jobs is None:
+            paths = run_compute(cfg)
+        else:
+            for r in range(num_jobs):
+                run_compute(cfg, num_jobs=num_jobs, job_rank=r)
+            paths = run_merge(cfg)
+        for mf in list(out.rglob("*manifest*.json")) + list(out.glob("_bf_manifest_*_compute/*.json")):
+            man = json.loads(mf.read_text())
+            try:
+                usages.append(man["params"]["kernels"]["sparse_posting_kernel"]["block_skip"])
+            except KeyError:
+                pass
+        t = {n: pq.read_table(p).to_pydict() for n, p in paths.items()}
+        for n in t:
+            t[n].pop("src", None)
+        return t, usages
+
+
+    @pytest.mark.parametrize("case", ["filters_only_coalesce", "perquery_text_only",
+                                      "empty_filter_mix", "mixed_and_none"])
+    @pytest.mark.parametrize("cpu_topk", [False, True])
+    @pytest.mark.parametrize("batch", [64, 512])
+    def test_e2e_readers_differential(tmp_path, monkeypatch, case, cpu_topk, batch):
+        """Reviewer round 2 (2026-11-16): several dot readers with no unfiltered
+        search (union-compacted, coalesced batches), text and per-query filters on
+        index-tensor `rows` subsets, `filter: {}`, an empty query, k beyond the
+        corpus: off vs on byte-identical on the poisoned buffer."""
+        monkeypatch.setattr(sp, "DOC_BLOCK", 64)
+        if cpu_topk:
+            _cpu_topk(monkeypatch)
+        cdir, qpath = _rev_data(tmp_path)
+        s = _rev_specs(case)
+        off, _ = _rev_run(tmp_path, cdir, qpath, s, case, "off", batch)
+        on, us = _rev_run(tmp_path, cdir, qpath, s, case, "on", batch)
+        assert off == on
+        u = us[0]
+        assert u["check_failures"] == 0 and u["disabled"] is None, u
+        assert u["slices"] > 0 and u["dead"] > 0, u
+
+
+    @pytest.mark.parametrize("case", ["empty_filter_mix", "mixed_and_none"])
+    def test_e2e_readers_multirank_merge(tmp_path, monkeypatch, case):
+        """Two ranks + merge, several dot readers: merged outputs identical."""
+        monkeypatch.setattr(sp, "DOC_BLOCK", 64)
+        _cpu_topk(monkeypatch)
+        cdir, qpath = _rev_data(tmp_path)
+        s = _rev_specs(case)
+        off, _ = _rev_run(tmp_path, cdir, qpath, s, case, "off", 64, num_jobs=2)
+        on, us = _rev_run(tmp_path, cdir, qpath, s, case, "on", 64, num_jobs=2)
+        assert off == on
+        assert len(us) >= 2, us                       # both ranks' manifests
+        assert all(u["check_failures"] == 0 and u["disabled"] is None for u in us), us
+        assert any(u["dead"] > 0 for u in us)
+
     @pytest.mark.parametrize("case", ["dot+cos", "two_k", "filtered", "filtered+unfiltered"])
-    def test_e2e_shared_raw_auto_disables(tmp_path, monkeypatch, case):
+    def test_e2e_shared_raw(tmp_path, monkeypatch, case):
         from nova_bf.config import Filter, FilterCondition, SearchSpec
 
         eng = Filter(must=[FilterCondition(field="language", match="eng")])
@@ -1564,8 +1977,12 @@ if _CHILD:
         off, _ = _run(tmp_path, monkeypatch, searches, case, "off")
         on, b = _run(tmp_path, monkeypatch, searches, case, "on")
         _same(off, on)
-        assert b["slices"] == 0 and b["dead"] == 0
-        assert "enabled" not in b["gates"] and sum(b["gates"].values()) > 0, b
+        if case == "dot+cos":       # a cosine reader: off
+            assert b["slices"] == 0 and b["dead"] == 0
+            assert "enabled" not in b["gates"] and sum(b["gates"].values()) > 0, b
+        else:                       # dot readers only: skip against the minimum
+            assert set(b["gates"]) == {"enabled"} and b["slices"] > 0, b
+            assert b["check_failures"] == 0 and b["disabled"] is None, b
 
 
 if _CHILD:

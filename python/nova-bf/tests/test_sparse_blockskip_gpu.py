@@ -241,11 +241,15 @@ def _write_dataset(root, seed=3, n_files=4, per_file=9000, vocab=3000, n_q=600):
     return cdir, root / "q.parquet"
 
 
+@pytest.mark.parametrize("readers", ["one", "two_k"])
 @pytest.mark.parametrize("tiebreak", ["ordinal", "id"])
 @pytest.mark.parametrize("k", [10, 100])
-def test_e2e_poisoned_differential_on_gpu(tmp_path, monkeypatch, tiebreak, k):
+def test_e2e_poisoned_differential_on_gpu(tmp_path, monkeypatch, tiebreak, k, readers):
     """run_compute on the GPU: off vs on (elided), on (unelided), overhead,
-    with the score buffer poisoned before every skip launch."""
+    with the score buffer poisoned before every skip launch. `two_k`: two dot
+    searches (k and 3k) read one raw matrix and skip against the per-row
+    minimum; the first reads through the mask-aware top-k, the second must
+    see no unwritten (poisoned) cell."""
     import json
 
     import pyarrow.parquet as pq
@@ -269,7 +273,9 @@ def test_e2e_poisoned_differential_on_gpu(tmp_path, monkeypatch, tiebreak, k):
             params=ParamsConfig(io_workers=1, sparse_kernel="posting",
                                 sparse_block_skip=skip, sparse_block_skip_elide=elide,
                                 tiebreak=tiebreak),
-            searches=[SearchSpec(name="dot", k=k, metric="dot", vector_type="sparse")])
+            searches=[SearchSpec(name="dot", k=k, metric="dot", vector_type="sparse")]
+            + ([SearchSpec(name="dot3", k=3 * k, metric="dot", vector_type="sparse")]
+               if readers == "two_k" else []))
         paths = run_compute(cfg)
         t = {n: pq.read_table(p).to_pydict() for n, p in paths.items()}
         man = json.loads(next(out.rglob("*manifest*.json")).read_text())

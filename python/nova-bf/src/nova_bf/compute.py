@@ -1910,17 +1910,18 @@ class SparseBatchSlice:
     value_absmax: float | None = None
     value_min: float | None = None
     _masked_raw: object = None  # lazy dot-scale masked (n_q, n_rows) — see docstring
-    # Block-max skipping (prototype, `params.sparse_block_skip`): the single
-    # consumer's running k-th packed key per query, set by `_process_batch_group`
-    # only when `_sparse_skip_member` proves this slice's raw matrix has exactly
-    # one reader (one unfiltered dot search, no query subset, no scaling).
-    # With it, `_masked_raw` may hold -inf for cells proven below that
+    # Block-max skipping (prototype, `params.sparse_block_skip`): a packed
+    # threshold key per raw query row, set by `_process_batch_group` only
+    # when `_sparse_skip_readers` proves every reader of this slice's raw
+    # matrix is an unscaled dot search: the per-raw-row MINIMUM of the
+    # readers' thresholds (`_skip_threshold`). With it, `_masked_raw` may hold
+    # -inf (or, elided, nothing) for cells proven below every reader's
     # threshold, so it is NOT a general raw matrix any more.
     skip_thr: object = None
     # The slice's `sparse_block_skip.SkipMask` when skipping ran. If it is
     # `elided`, dead cells of `_masked_raw` are UNWRITTEN until
-    # `skip_mask.materialize()`; only the single consumer may read the raw
-    # without materializing, and only through a mask-aware top-k.
+    # `skip_mask.materialize()`; a reader may read the raw without
+    # materializing only through a mask-aware top-k (every skip reader checks).
     skip_mask: object = None
     _raw_served: bool = False
 
@@ -5072,9 +5073,10 @@ def _process_batch_group(
         two_pass=two_pass,
     )
 
-    # Block-max sub-block skipping in the sparse posting kernel (prototype).
-    skip_member = _sparse_skip_member(batch, member_idxs, specs, spec_qsel,
-                                      spec_cos_scale, prune)
+    # Block-max sub-block skipping in the sparse posting kernel.
+    skip_readers = _sparse_skip_readers(batch, member_idxs, specs, spec_qsel,
+                                        spec_cos_scale, prune, spec_Q, spec_thr)
+    skip_set = frozenset(skip_readers or ())
     from nova_bf import sparse_block_skip as _sbs
 
     twopass._STATS["groups_seen"] += 1
@@ -5180,12 +5182,18 @@ def _process_batch_group(
         sf = (None if slice_filters is None
               else slice_filters(rows, true_rows, sl.n_rows))
 
-        if skip_member is not None and isinstance(sl, SparseBatchSlice):
-            # Use the search's own top-k threshold, not the cross-worker threshold.
-            # Older thresholds are safe because the threshold only increases.
-            # Enable skipping only after at least k rows have been processed.
-            if _sbs.rows_seen(skip_member) >= specs[skip_member].k:
-                sl.skip_thr = spec_thr[skip_member]
+        if skip_readers and isinstance(sl, SparseBatchSlice):
+            # Use the searches' own top-k thresholds, not the cross-worker
+            # ones; a stale threshold is safe (thresholds only rise). Build
+            # tables only once some reader has folded k rows (before that
+            # every threshold is still the sentinel: nothing could be dead).
+            if any(_sbs.rows_seen(m) >= specs[m].k for m in skip_readers):
+                # spec_thr (own states), never `_thr(m)`: the exchanged bound
+                # would also be sound, but it would make this worker's
+                # partials differ from skipping off.
+                sl.skip_thr = _skip_threshold(
+                    skip_readers, spec_thr, spec_qsel,
+                    int(spec_Q[skip_readers[0]].shape[0]), device)
             else:
                 _sbs.decline("state cannot be full yet")
 
@@ -5290,11 +5298,19 @@ def _process_batch_group(
             if sel_rows is None:
                 continue
             
+            # An unfiltered skip reader whose `rows` subset covers the whole
+            # raw matrix reads it unselected (same rows), so the mask-aware
+            # top-k below stays available. A filtered reader keeps its
+            # selector: the cell-mask conversion below keys on it.
             qsel = spec_qsel[m]
-            # Only mask-aware Triton top-k can use scores with skipped cells.
-            # All other paths must fill skipped cells with -inf before reading scores.
+            if (m in skip_set and qsel is not None and _is_unfiltered(s.filter)
+                    and _whole_selection(qsel, int(spec_Q[m].shape[0]))):
+                qsel = None
+            # Every skip reader reads the one raw matrix, so every one honours
+            # the skip mask: only the mask-aware Triton top-k may read skipped
+            # cells; every other read fills them with -inf first.
             lmask = None
-            smask = getattr(sl, "skip_mask", None) if m == skip_member else None
+            smask = getattr(sl, "skip_mask", None) if m in skip_set else None
             if smask is not None and smask.elided:
                 if (prune and plan is None and scores is not None
                         and sel_cols is None and qsel is None and cell_mask is None
@@ -5403,8 +5419,8 @@ def _process_batch_group(
             if pending_cols[m] >= s.k:
                 _flush_pending(m)
 
-        if skip_member is not None:
-            _sbs.add_rows(skip_member, sl.n_rows)
+        for m in skip_readers or ():
+            _sbs.add_rows(m, sl.n_rows)
 
         if mv_prune is not None and mv_tally[1]:
             mv_prune.note_pruned(mv_tally[0], mv_tally[1])
@@ -5620,43 +5636,104 @@ def _process_batch_group(
     return time.perf_counter() - t0
 
 
-def _sparse_skip_member(batch, member_idxs, specs, spec_qsel, spec_cos_scale,
-                        prune) -> int | None:
-    """Select the search whose top-k threshold can safely drive block-max
-    skipping, or return None.
+def _whole_selection(qsel, n: int | None) -> bool:
+    """`qsel` selects every row of an `n`-row query axis, in order: `None`, or
+    the slice `[0, n)` (what `_row_selector` makes of a `rows` subset that
+    covers its whole vector_type matrix, e.g. a vector_type's only search)."""
+    if qsel is None:
+        return True
+    return (n is not None and isinstance(qsel, slice)
+            and qsel.step in (None, 1) and qsel.start in (None, 0)
+            and qsel.stop is not None and int(qsel.stop) == n)
 
-    Raw sparse scores are shared across searches, so skipping is only safe
-    if a block cannot contribute to any reader's top-k. For now, require a
-    single unfiltered dot-product search with pruning enabled, no query
-    subset, and no per-query scaling.
 
-    Otherwise, use the kernel without skipping. Record the decision in
-    the manifest (`block_skip.gates`)."""
+def _selection_len(qsel, n: int) -> int | None:
+    """Rows `qsel` selects from an `n`-row query axis (None: all), or None if
+    it is not a selector `_row_selector` makes (a unit-step slice inside the
+    axis, or a 1-D int64 index tensor)."""
+    if qsel is None:
+        return n
+    if isinstance(qsel, slice):
+        if qsel.step not in (None, 1) or qsel.stop is None:
+            return None
+        start = 0 if qsel.start is None else int(qsel.start)
+        stop = int(qsel.stop)
+        return stop - start if 0 <= start <= stop <= n else None
+    if (getattr(qsel, "ndim", None) == 1 and getattr(qsel, "dtype", None) is not None
+            and str(qsel.dtype) == "torch.int64"):
+        return int(qsel.numel())
+    return None
+
+
+def _sparse_skip_readers(batch, member_idxs, specs, spec_qsel, spec_cos_scale,
+                         prune, spec_Q=None, spec_thr=None) -> list[int] | None:
+    """Return searches whose thresholds can safely drive block-max skipping,
+    or None if any search is incompatible.
+
+    All searches share the same raw sparse scores. For each query row,
+    use the lowest threshold among searches that read it, ensuring skipped
+    cells cannot enter any search's top-k.
+
+    Requires unscaled dot-product searches with pruning enabled.
+    Filtered searches and query subsets are supported; other metrics
+    disable skipping for the group.
+
+    Record the decision in the manifest (`block_skip.gates`).
+    """
+
     from nova_bf import sparse_block_skip as sp
 
     if sp.mode() == "off" or not isinstance(batch, SparseCorpusBatch):
         return None
+    why = None
     if not prune:
         why = "pruning off"
-    elif len(member_idxs) != 1:
-        why = "several searches share the raw matrix"
     else:
-        m = member_idxs[0]
-        if specs[m].metric != "dot":
-            why = f"metric {specs[m].metric}"
-        elif not _is_unfiltered(specs[m].filter):
-            why = "filtered search"
-        elif spec_qsel[m] is not None:
-            why = "query subset"
-        elif spec_cos_scale[m] is not None:
-            why = "query scaling"
-        elif not sp.active():
+        for m in member_idxs:
+            if specs[m].metric != "dot":
+                why = f"metric {specs[m].metric}"
+            elif spec_cos_scale[m] is not None:
+                why = "query scaling"
+            elif spec_Q is None or spec_thr is None:
+                # heights unknown: only an unselected reader is admitted
+                if spec_qsel[m] is not None:
+                    why = "query subset"
+            else:
+                n = int(spec_Q[m].shape[0])
+                t = spec_thr[m]
+                if not (getattr(t, "ndim", None) == 1
+                        and _selection_len(spec_qsel[m], n) == int(t.shape[0])):
+                    why = "threshold shape"
+            if why is not None:
+                break
+        if why is None and not sp.active():
             why = "skipping disabled for the run"
+    if why is not None:
+        sp.note_gate(why)
+        return None
+    sp.note_gate("enabled")
+    return list(member_idxs)
+
+
+def _skip_threshold(readers, spec_thr, spec_qsel, n_raw: int, device):
+    """Return the lowest top-k threshold among searches selecting each query row.
+    Rows with no readers use the sentinel to disable skipping.
+    For a single reader covering all rows, use its threshold directly."""
+    import torch
+
+    if len(readers) == 1 and spec_qsel[readers[0]] is None:
+        return spec_thr[readers[0]]
+    big = torch.iinfo(torch.int64).max
+    comb = torch.full((n_raw,), big, dtype=torch.int64, device=device)
+    for m in readers:
+        q, t = spec_qsel[m], spec_thr[m]
+        if q is None:
+            torch.minimum(comb, t, out=comb)
+        elif isinstance(q, slice):
+            comb[q] = torch.minimum(comb[q], t)
         else:
-            sp.note_gate("enabled")
-            return m
-    sp.note_gate(why)
-    return None
+            comb.scatter_reduce_(0, q, t, reduce="amin")
+    return torch.where(comb == big, sentinel_key((n_raw,), device), comb)
 
 
 def _is_unfiltered(f: Filter | None) -> bool:

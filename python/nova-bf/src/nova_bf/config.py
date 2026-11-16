@@ -218,7 +218,9 @@ class ParamsConfig(BaseModel):
     # Sparse block-max skipping for the sparse posting kernel's hot path.
     # "on" (default) enables it; "off" disables skipping; "overhead" builds bounds
     # without skipping to measure overhead. Results are unchanged.
-    # Requires a single unfiltered dot-product search.
+    # Requires every search on the sparse vector to be a dot search (filters,
+    # `rows` subsets, different k, and dense searches beside them are fine);
+    # a sparse cosine search turns it off for that vector.
     # Environment overrides take precedence; the effective mode is recorded
     # in the manifest. Each kernel variant is checked on first use (an
     # adversarial fp-model probe, then sampled rows against cuSPARSE).
