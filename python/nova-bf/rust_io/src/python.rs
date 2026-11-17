@@ -11,7 +11,7 @@ use pyo3::prelude::*;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use crate::core::{Dest, FetchConfig, FetchError, Fetcher, ReadOpts, S3Settings, Span};
+use crate::core::{Dest, FetchConfig, FetchError, Fetcher, ReadOpts, S3Auth, S3Settings, Span};
 use crate::dense::{self, DenseError};
 
 create_exception!(
@@ -142,10 +142,14 @@ fn writable_dest(obj: &Bound<'_, PyAny>) -> PyResult<(PyBuffer<u8>, Dest)> {
 /// Long-lived native downloader. Thread-safe: share one per process.
 ///
 /// Client(region=None, concurrency=64, part_size=16 MiB, connect_timeout_s=5,
-///        part_timeout_s=60, retries=5, endpoint=None, allow_http=None, threads=None)
+///        part_timeout_s=60, retries=5, endpoint=None, allow_http=None, threads=None,
+///        anonymous=False, access_key_id=None, secret_access_key=None, session_token=None)
 ///
 /// Credentials/region/endpoint come from the standard AWS_* env vars or the
-/// instance profile; `region`/`endpoint`/`allow_http` override them. With no
+/// instance profile; `region`/`endpoint`/`allow_http` override them.
+/// `anonymous=True` sends unsigned requests (public buckets); explicit keys
+/// replace the env's credentials entirely (an env session token is never
+/// paired with them). With no
 /// region anywhere (and no custom endpoint) the bucket's region is resolved.
 /// `concurrency` caps in-flight GETs across ALL calls on this client.
 #[pyclass(frozen, module = "rust_fetch")]
@@ -284,7 +288,8 @@ impl Client {
 impl Client {
     #[new]
     #[pyo3(signature = (region=None, concurrency=64, part_size=16<<20, connect_timeout_s=5.0,
-                        part_timeout_s=60.0, retries=5, endpoint=None, allow_http=None, threads=None))]
+                        part_timeout_s=60.0, retries=5, endpoint=None, allow_http=None, threads=None,
+                        anonymous=false, access_key_id=None, secret_access_key=None, session_token=None))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         region: Option<String>,
@@ -296,7 +301,13 @@ impl Client {
         endpoint: Option<String>,
         allow_http: Option<bool>,
         threads: Option<usize>,
+        anonymous: bool,
+        access_key_id: Option<String>,
+        secret_access_key: Option<String>,
+        session_token: Option<String>,
     ) -> PyResult<Self> {
+        let auth = S3Auth::from_args(anonymous, access_key_id, secret_access_key, session_token)
+            .map_err(PyValueError::new_err)?;
         let secs = |name: &str, v: f64| -> PyResult<Duration> {
             if !(v >= 0.001 && v <= 86_400.0) {
                 return Err(PyValueError::new_err(format!("{name} must be in [0.001, 86400] seconds, got {v}")));
@@ -333,7 +344,7 @@ impl Client {
             connect_timeout,
             ..Default::default()
         };
-        let f = Fetcher::new(cfg, S3Settings { region, endpoint, allow_http }).map_err(to_py)?;
+        let f = Fetcher::new(cfg, S3Settings { region, endpoint, allow_http, auth }).map_err(to_py)?;
         Ok(Self {
             rt: std::mem::ManuallyDrop::new(rt),
             f: Arc::new(f),
@@ -500,8 +511,9 @@ impl Client {
 
     fn __repr__(&self) -> String {
         format!(
-            "rust_fetch.Client(concurrency={}, part_size={}, retries={}, region={:?}, endpoint={:?})",
-            self.f.cfg.concurrency, self.f.cfg.part_size, self.f.cfg.retries, self.f.s3.region, self.f.s3.endpoint
+            "rust_fetch.Client(concurrency={}, part_size={}, retries={}, region={:?}, endpoint={:?}, auth={})",
+            self.f.cfg.concurrency, self.f.cfg.part_size, self.f.cfg.retries, self.f.s3.region, self.f.s3.endpoint,
+            self.f.s3.auth.mode()
         )
     }
 }

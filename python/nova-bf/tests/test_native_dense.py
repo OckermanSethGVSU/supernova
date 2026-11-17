@@ -310,10 +310,10 @@ def test_transport_failure_disables_native_for_the_store(tmp_path, native_on, mo
         def dense_plan(self, *a, **k):
             raise OSError("simulated transport failure")
 
-    monkeypatch.setattr(nio, "_native_client", lambda region: Boom())
+    monkeypatch.setattr(nio, "_native_client", lambda region, s3=None: Boom())
     assert store.read_dense(str(p), "dense_embedding") is None
     assert store._native_failed
-    monkeypatch.setattr(nio, "_native_client", lambda region: pytest.fail("native used after failure"))
+    monkeypatch.setattr(nio, "_native_client", lambda region, s3=None: pytest.fail("native used after failure"))
     assert store.read_dense(str(p), "dense_embedding") is None
 
 
@@ -342,7 +342,7 @@ def test_object_rewritten_mid_read_falls_back(tmp_path, native_on, monkeypatch):
         def read_dense_into(self, *a, **k):
             return client.read_dense_into(*a, **k)
 
-    monkeypatch.setattr(nio, "_native_client", lambda region: Rewriting())
+    monkeypatch.setattr(nio, "_native_client", lambda region, s3=None: Rewriting())
     assert Store(str(tmp_path)).read_dense(str(p), "dense_embedding") is None
 
 
@@ -581,7 +581,7 @@ def test_fetch_downloads_only_the_requested_columns(tmp_path, fetch_on, monkeypa
             fetched_bytes.append(sum(r[1] for r in ranges))
             return client.read_ranges_into(url, dest, ranges, if_match=if_match)
 
-    monkeypatch.setattr(nio, "_native_client", lambda region: Spy())
+    monkeypatch.setattr(nio, "_native_client", lambda region, s3=None: Spy())
     monkeypatch.setattr(nio, "_FETCH_TAIL", 8192)  # tail smaller than the file
     monkeypatch.setattr(nio, "_FETCH_COALESCE", 0)
     got = Store(str(tmp_path)).read_columns_fetched(str(p), ["id"])
@@ -701,7 +701,7 @@ def test_missing_column_defers_without_downloading_the_file(tmp_path, fetch_on, 
             fetched.append(sum(r[1] for r in ranges))
             return client.read_ranges_into(url, dest, ranges, if_match=if_match)
 
-    monkeypatch.setattr(nio, "_native_client", lambda region: Spy())
+    monkeypatch.setattr(nio, "_native_client", lambda region, s3=None: Spy())
     assert Store(str(tmp_path)).read_columns_fetched(str(p), ["nope"]) is None
     footer = pq.read_metadata(str(p)).serialized_size
     assert sum(fetched) <= 64 + footer + 8  # tail + footer only, never the file

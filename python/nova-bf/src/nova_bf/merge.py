@@ -1289,7 +1289,7 @@ def preflight_searches(cfg: BruteForceConfig) -> None:
     `run_merge` repeats these checks per search; this avoids duplicate failures
     when searches are merged concurrently.
     """
-    out = Store(cfg.output.path)
+    out = Store(cfg.output.path, s3=cfg.output.s3)
     forced = merge_forced(cfg)
 
     counts: dict[str, int] = {}
@@ -1350,7 +1350,7 @@ def run_merge(cfg: BruteForceConfig, only: set[str] | None = None) -> dict[str, 
             "provably wrong output, not merely unverified output."
         )
 
-    out = Store(cfg.output.path)
+    out = Store(cfg.output.path, s3=cfg.output.s3)
 
     partials_by_name: dict[str, list[ParquetFile]] = {}
     for spec in cfg.searches:
@@ -2270,7 +2270,7 @@ def _reduce(
     inputs_forced = _inputs_forced(readers)
     # Divide ranged GET concurrency across in-flight partials (minimum one per file).
     per_file = max(1, _RANGED_GET_POOL // max(1, window_n))
-    src = Store(out.uri, ranged_get=ranged, ranged_get_concurrency=per_file)
+    src = Store(out.uri, ranged_get=ranged, ranged_get_concurrency=per_file, s3=out.s3)
 
     # Allow additional GET concurrency for the first partial to reduce startup latency.
     raw_first = os.environ.get("NOVA_BF_FIRST_GETS", "").strip()
@@ -2282,7 +2282,7 @@ def _reduce(
         logger.warning("NOVA_BF_FIRST_GETS=%r is not a positive integer; "
                        "using %d", raw_first, _RANGED_GET_POOL)
         first_gets = _RANGED_GET_POOL
-    src_first = (Store(out.uri, ranged_get=ranged, ranged_get_concurrency=first_gets)
+    src_first = (Store(out.uri, ranged_get=ranged, ranged_get_concurrency=first_gets, s3=out.s3)
                  if ranged and first_gets != per_file else src)
     q: Queue = Queue(maxsize=window_n)
     window = Semaphore(window_n)

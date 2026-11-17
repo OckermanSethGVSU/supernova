@@ -18,6 +18,7 @@ from __future__ import annotations
 import glob
 import json
 import os
+import re
 import shutil
 import time
 
@@ -874,32 +875,67 @@ def test_concurrent_ranks_exchange_mid_scan(tmp_path, monkeypatch):
                for s in stats), stats
 
 
-def test_nan_corpus_row_does_not_poison_peers(tmp_path, monkeypatch):
-    """Round 6: a NaN corpus row sorts into a rank's top-k slots, so its
-    k-th best is no lower bound on the global k-th REAL score, and the
-    partial writer drops the NaN hit. The rank must publish -inf for such
-    queries; otherwise peers prune true neighbours and the merge (correctly)
-    refuses, unforceably, with no re-run that helps."""
-    monkeypatch.setenv("NOVA_BF_DEVICE", TEST_DEVICE)
-    cdir, qpath = _dataset(tmp_path, n_files=4, rows=20, n_q=10)
-    f0 = os.path.join(cdir, "part0.parquet")          # rank 0's first file
-    t = pq.read_table(f0).to_pydict()
-    t["dense_embedding"][3] = [float("nan")] * DIM
+# NaN/inf vectors are refused at read time (`io.check_finite`, da8c619), so
+# the exchange's NaN handling can no longer be reached from run_compute: a rank
+# publishing -inf for queries whose top-k held a NaN row, the merge's
+# `nan_hits` exemption from verification, and the truncation of NaN-cut lists.
+# Those guards are still in compute/merge. The NaN-tolerance tests of rounds
+# 6-10 (a NaN row not poisoning peers; a late NaN row exempting queries; a NaN
+# row not switching verification off; the exchange-off remedy re-run; merge
+# batches mixing cut and uncut rows) are replaced by the refusal tests below,
+# at the same placements: rank 0's first file (part0) and its second file
+# (part2, i.e. after it has already published), exchange on and off, and a NaN
+# query row.
+
+def _write_nan_row(path, row, cols):
+    t = pq.read_table(path).to_pydict()
+    t["dense_embedding"][row] = [float("nan")] * DIM
     pq.write_table(pa.table({
         "dense_embedding": pa.array(t["dense_embedding"], pa.list_(pa.float32())),
-        "id": pa.array(t["id"]), "lang": pa.array(t["lang"]),
-    }), f0)
+        **{c: pa.array(t[c]) for c in cols}}), path)
+
+
+def _error_text(excinfo) -> str:
+    # The reader thread's ValueError arrives wrapped (RuntimeError), so look
+    # down the whole chain.
+    out, e = [], excinfo.value
+    while e is not None:
+        out.append(str(e))
+        e = e.__cause__ or e.__context__
+    return "\n".join(out)
+
+
+@pytest.mark.parametrize("exch", [False, True])
+@pytest.mark.parametrize("part, row", [("part0", 3), ("part2", 0)])
+def test_nan_corpus_row_is_refused_naming_file_and_row(tmp_path, monkeypatch, exch, part, row):
+    monkeypatch.setenv("NOVA_BF_DEVICE", TEST_DEVICE)
+    cdir, qpath = _dataset(tmp_path, n_files=4, rows=20, n_q=10)
+    _write_nan_row(os.path.join(cdir, f"{part}.parquet"), row, ("id", "lang"))
+    want = (rf"corpus file \S*{part}\.parquet: column `dense_embedding` has 1 row\(s\) "
+            rf"with NaN/inf vector values \(rows {row};")
     ref = tmp_path / "ref"; ref.mkdir()
-    single = {n: pq.read_table(p).to_pydict()
-              for n, p in run_compute(_cfg(cdir, qpath, ref, False), num_jobs=None).items()}
+    with pytest.raises(Exception) as e:
+        run_compute(_cfg(cdir, qpath, ref, False), num_jobs=None)
+    assert re.search(want, _error_text(e)), _error_text(e)
     out = tmp_path / "o"; out.mkdir()
-    cfg = _cfg(cdir, qpath, out, True)
-    run_compute(cfg, num_jobs=2, job_rank=0)
-    run_compute(cfg, num_jobs=2, job_rank=1)          # inherits rank 0's thresholds
-    merged = {n: pq.read_table(p).to_pydict() for n, p in run_merge(cfg).items()}
-    # The merged result equals the single run's: the NaN hit is dropped and
-    # the list is cut to the top (k - 1) rather than padded with leftovers.
-    _assert_same(merged, single)
+    cfg = _cfg(cdir, qpath, out, exch)
+    with pytest.raises(Exception) as e:          # rank 0 reads part0 and part2
+        run_compute(cfg, num_jobs=2, job_rank=0)
+    assert re.search(want, _error_text(e)), _error_text(e)
+    run_compute(cfg, num_jobs=2, job_rank=1)     # the clean rank is unaffected
+    assert not glob.glob(os.path.join(str(out), "**", "rank000.parquet"), recursive=True)
+
+
+@pytest.mark.parametrize("exch", [False, True])
+def test_nan_query_row_is_refused_naming_file_and_row(tmp_path, monkeypatch, exch):
+    monkeypatch.setenv("NOVA_BF_DEVICE", TEST_DEVICE)
+    cdir, qpath = _dataset(tmp_path, n_files=4, rows=20, n_q=10)
+    _write_nan_row(qpath, 7, ("qid", "qset"))
+    out = tmp_path / "o"; out.mkdir()
+    with pytest.raises(Exception) as e:
+        run_compute(_cfg(cdir, qpath, out, exch, multi=True), num_jobs=2, job_rank=0)
+    assert re.search(r"queries file \S*: column `dense_embedding` has 1 row\(s\) with "
+                     r"NaN/inf vector values \(rows 7;", _error_text(e)), _error_text(e)
 
 
 def test_verification_failure_names_the_rank_at_fault(tmp_path, monkeypatch):
@@ -929,147 +965,6 @@ def test_verification_failure_names_the_rank_at_fault(tmp_path, monkeypatch):
     _assert_same(merged, single)
 
 
-def test_late_nan_row_exempts_queries_instead_of_refusing(tmp_path, monkeypatch, caplog):
-    """Round 7: rank 0 published a finite k-th best, THEN scored a NaN row
-    that displaced a real hit (the writer drops the NaN, so its list is
-    short) while rank 1 had already pruned against the published value. The
-    merge must not refuse: rank 0's partial records the dropped NaN hits and
-    those queries are exempted from verification, with a warning. Rank 0's
-    intermediate publish is reproduced by rewriting its exchange file after
-    it finished (its final publish was -inf for every query)."""
-    monkeypatch.setenv("NOVA_BF_DEVICE", TEST_DEVICE)
-    cdir, qpath = _dataset(tmp_path, n_files=4, rows=20, n_q=10)
-    # Rank 0's second file (part2) gets the NaN row, so file 0 publishes finite.
-    f2 = os.path.join(cdir, "part2.parquet")
-    t = pq.read_table(f2).to_pydict()
-    t["dense_embedding"][0] = [float("nan")] * DIM
-    pq.write_table(pa.table({
-        "dense_embedding": pa.array(t["dense_embedding"], pa.list_(pa.float32())),
-        "id": pa.array(t["id"]), "lang": pa.array(t["lang"]),
-    }), f2)
-    ref = tmp_path / "ref"; ref.mkdir()
-    single = {n: pq.read_table(p).to_pydict()
-              for n, p in run_compute(_cfg(cdir, qpath, ref, False), num_jobs=None).items()}
-    out = tmp_path / "o"; out.mkdir()
-    cfg = _cfg(cdir, qpath, out, True)
-    run_compute(cfg, num_jobs=2, job_rank=0)
-    (p0,) = glob.glob(os.path.join(str(out), "**", "rank000.parquet"), recursive=True)
-    t0 = pq.read_table(p0)
-    assert (t0.column("nan_hits").to_numpy() > 0).all()
-    (thr0,) = glob.glob(os.path.join(str(out), thresholds.SUBDIR, "*", file_name(0)))
-    _, pub_d = thresholds.decode(open(thr0, "rb").read(), {"dense": (10, thresholds.publish_width(K, 2))})
-    pub = pub_d["dense"].astype(np.float32)
-    assert pub.shape == (10, thresholds.publish_width(K, 2)) and np.isfinite(pub).any()
-    # The intermediate publish: rank 0's real k-th best after file 0 (a valid
-    # lower bound at the time), which rank 1 will now prune against.
-    # Rank 0's list as the single run's (k-1) real best per query padded to
-    # width k (the published width at 2 ranks), which rank 1 will union with.
-    w = thresholds.publish_width(K, 2)
-    lst = np.full((len(single["dense"]["hit_scores"]), w), -np.inf, np.float32)
-    for i, s in enumerate(single["dense"]["hit_scores"]):
-        lst[i, :min(w, len(s))] = sorted(s, reverse=True)[:w]
-    open(thr0, "wb").write(thresholds.encode(time.time_ns() // 1_000_000 + 10 ** 9,
-                                             {"dense": thresholds.fp16_floor(lst)}))
-    run_compute(cfg, num_jobs=2, job_rank=1)
-    (p1,) = glob.glob(os.path.join(str(out), "**", "rank001.parquet"), recursive=True)
-    assert np.isfinite(pq.read_table(p1).column("applied_threshold").to_numpy()).all()
-    with caplog.at_level("WARNING"):
-        merged = {n: pq.read_table(p).to_pydict() for n, p in run_merge(cfg).items()}
-    assert any("NaN-scored corpus hits dropped" in r.getMessage() for r in caplog.records)
-    _assert_same(merged, single)
-    # Those queries were still verified (top k-1), not skipped wholesale.
-    (m,) = [json.load(open(f)) for f in glob.glob(os.path.join(str(out), "_bf_manifest_*merge*", "*.json"))]
-    assert m["searches"][0]["threshold_exchange_verified_queries"] == 10
-
-
-def test_nan_row_does_not_switch_off_verification(tmp_path, monkeypatch):
-    """Round 8: one NaN corpus row scores NaN for EVERY query, so a blanket
-    exemption would disable the check wholesale. With stale thresholds from
-    an earlier run (same names, same sizes) and a NaN row, the merge must
-    still refuse."""
-    monkeypatch.setenv("NOVA_BF_DEVICE", TEST_DEVICE)
-    cdir, qpath = _dataset(tmp_path, n_files=4, rows=20, n_q=10, seed=1)
-    out = tmp_path / "o"; out.mkdir()
-    cfg = _cfg(cdir, qpath, out, True)
-    # Run A, with a NaN row on rank 0 from the start (so both runs look alike).
-    f0 = os.path.join(cdir, "part0.parquet")
-    def _nanify(path, row):
-        t = pq.read_table(path).to_pydict()
-        t["dense_embedding"][row] = [float("nan")] * DIM
-        pq.write_table(pa.table({
-            "dense_embedding": pa.array(t["dense_embedding"], pa.list_(pa.float32())),
-            "id": pa.array(t["id"]), "lang": pa.array(t["lang"]),
-        }), path)
-    _nanify(f0, 5)
-    run_compute(cfg, num_jobs=2, job_rank=0)
-    run_compute(cfg, num_jobs=2, job_rank=1)
-    # Regenerate the corpus in place (same names/sizes: same exchange id) with
-    # much weaker vectors, keep the NaN row, and delete the partials only.
-    rng = np.random.default_rng(7)
-    for fi in range(4):
-        path = os.path.join(cdir, f"part{fi}.parquet")
-        t = pq.read_table(path).to_pydict()
-        v = (rng.standard_normal((20, DIM)) * 0.01).astype(np.float32)
-        t["dense_embedding"] = v.tolist()
-        pq.write_table(pa.table({
-            "dense_embedding": pa.array(t["dense_embedding"], pa.list_(pa.float32())),
-            "id": pa.array(t["id"]), "lang": pa.array(t["lang"]),
-        }), path)
-    _nanify(f0, 5)
-    for d in glob.glob(os.path.join(str(out), "_bf_partial_*")):
-        shutil.rmtree(d)
-    # Make the stale (run A) thresholds bite: a fresh query set would not be
-    # scored by the same vectors, so just force the weak corpus under the old
-    # files -- cosine scores of random vectors are ~N(0, 1/sqrt(DIM)) either
-    # way, but run A's file holds run A's k-th best which the regenerated
-    # corpus must now clear with different rows; the lists come out wrong.
-    run_compute(cfg, num_jobs=2, job_rank=0)
-    run_compute(cfg, num_jobs=2, job_rank=1)
-    monkeypatch.setenv("NOVA_BF_MERGE_FORCE", "1")
-    with pytest.raises(RuntimeError, match="VERIFICATION FAILED"):
-        run_merge(cfg)
-
-
-def test_remedy_rerun_of_nan_rank_with_exchange_off_still_merges(tmp_path, monkeypatch):
-    """Round 9: the NaN rank re-run with the exchange off (the merge's own
-    remedy) carries nan_hits but no applied_threshold; its counts must still
-    relax the check, or a correct result is refused and an innocent rank
-    blamed."""
-    monkeypatch.setenv("NOVA_BF_DEVICE", TEST_DEVICE)
-    cdir, qpath = _dataset(tmp_path, n_files=4, rows=20, n_q=10)
-    f2 = os.path.join(cdir, "part2.parquet")
-    t = pq.read_table(f2).to_pydict()
-    t["dense_embedding"][0] = [float("nan")] * DIM
-    pq.write_table(pa.table({
-        "dense_embedding": pa.array(t["dense_embedding"], pa.list_(pa.float32())),
-        "id": pa.array(t["id"]), "lang": pa.array(t["lang"]),
-    }), f2)
-    ref = tmp_path / "ref"; ref.mkdir()
-    single = {n: pq.read_table(p).to_pydict()
-              for n, p in run_compute(_cfg(cdir, qpath, ref, False), num_jobs=None).items()}
-    out = tmp_path / "o"; out.mkdir()
-    cfg = _cfg(cdir, qpath, out, True)
-    run_compute(cfg, num_jobs=2, job_rank=0)
-    (thr0,) = glob.glob(os.path.join(str(out), thresholds.SUBDIR, "*", file_name(0)))
-    # Rank 0's list as the single run's (k-1) real best per query padded to
-    # width k (the published width at 2 ranks), which rank 1 will union with.
-    w = thresholds.publish_width(K, 2)
-    lst = np.full((len(single["dense"]["hit_scores"]), w), -np.inf, np.float32)
-    for i, s in enumerate(single["dense"]["hit_scores"]):
-        lst[i, :min(w, len(s))] = sorted(s, reverse=True)[:w]
-    open(thr0, "wb").write(thresholds.encode(time.time_ns() // 1_000_000 + 10 ** 9,
-                                             {"dense": thresholds.fp16_floor(lst)}))
-    run_compute(cfg, num_jobs=2, job_rank=1)
-    run_merge(cfg)
-    # Now the remedy re-run of the NaN rank, exchange OFF.
-    run_compute(_cfg(cdir, qpath, out, False), num_jobs=2, job_rank=0)
-    (p0,) = glob.glob(os.path.join(str(out), "**", "rank000.parquet"), recursive=True)
-    names = pq.read_table(p0).column_names
-    assert "nan_hits" in names and "applied_threshold" not in names
-    merged = {n: pq.read_table(p).to_pydict() for n, p in run_merge(cfg).items()}
-    _assert_same(merged, single)
-
-
 def test_truncate_lists_unit():
     from nova_bf.merge import _truncate_lists
     arr = pa.array([[1, 2, 3], [], [4, 5], [6]], pa.list_(pa.int64()))
@@ -1095,38 +990,6 @@ def test_exchange_setup_failure_degrades(tmp_path, monkeypatch):
         assert st["enabled"] is False and st["configured"] is True
         assert st["reason"].startswith("setup failed")
     run_merge(cfg)
-
-
-@pytest.mark.parametrize("exch", [False, True])
-@pytest.mark.parametrize("nanmode", ["query", "corpus"])
-def test_multi_batch_merge_mixes_cut_and_uncut_batches(tmp_path, monkeypatch, exch, nanmode):
-    """Round 10: with `merge_batch_size` small, batches with and without
-    NaN-truncated rows share one output file (same list types), exchange on
-    or off, across all three searches; the result equals the single-node run."""
-    monkeypatch.setenv("NOVA_BF_DEVICE", TEST_DEVICE)
-    cdir, qpath = _dataset(tmp_path, n_files=4, rows=20, n_q=10)
-    if nanmode == "query":
-        t = pq.read_table(qpath).to_pydict(); t["dense_embedding"][7] = [float("nan")] * DIM
-        pq.write_table(pa.table({"dense_embedding": pa.array(t["dense_embedding"], pa.list_(pa.float32())),
-                                 "qid": pa.array(t["qid"]), "qset": pa.array(t["qset"])}), qpath)
-    else:
-        f = os.path.join(cdir, "part2.parquet"); t = pq.read_table(f).to_pydict()
-        t["dense_embedding"][0] = [float("nan")] * DIM
-        pq.write_table(pa.table({"dense_embedding": pa.array(t["dense_embedding"], pa.list_(pa.float32())),
-                                 "id": pa.array(t["id"]), "lang": pa.array(t["lang"])}), f)
-    ref = tmp_path / "ref"; ref.mkdir()
-    single = {n: pq.read_table(p).to_pydict()
-              for n, p in run_compute(_cfg(cdir, qpath, ref, False, multi=True), num_jobs=None).items()}
-    out = tmp_path / "o"; out.mkdir()
-    cfg = _cfg(cdir, qpath, out, exch, multi=True)
-    cfg.params.merge_batch_size = 3
-    merged = _run_sharded(cfg, 3)
-    _assert_same(merged, single)
-    ms = [json.load(open(f)) for f in glob.glob(os.path.join(str(out), "_bf_manifest_*merge*", "*.json"))]
-    cut = {e["name"]: e.get("nan_truncated_queries", 0) for m in ms for e in m["searches"]}
-    if nanmode == "corpus":
-        assert all(v > 0 for v in cut.values()), cut
-
 
 
 def test_union_kth_never_mutates_float32_peer(tmp_path):

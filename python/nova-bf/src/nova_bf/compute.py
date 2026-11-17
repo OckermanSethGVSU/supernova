@@ -7033,7 +7033,7 @@ def run_compute(
 
     # 1. queries — loaded once per DISTINCT vector_type needed across all specs
     #    (queries files are small, so no need to dedupe further than that).
-    qstore = Store(cfg.queries.path, ranged_get=cfg.params.io_ranged_get)
+    qstore = Store(cfg.queries.path, ranged_get=cfg.params.io_ranged_get, s3=cfg.queries.s3)
     # Union of every spec's per-query filter columns — same "read exactly (and
     # only) what's referenced" guarantee corpus-side filter_cols already makes,
     # extended to the query side (see Filter.query_fields()).
@@ -7157,7 +7157,7 @@ def run_compute(
     # 2. corpus files (global, deterministic order); this worker takes a stride
     #    slice so its global indices stay stable for id decoding. Shared across
     #    every spec — they must all see the identical file set/order/truncation.
-    cstore = Store(cfg.corpus.path, ranged_get=cfg.params.io_ranged_get)
+    cstore = Store(cfg.corpus.path, ranged_get=cfg.params.io_ranged_get, s3=cfg.corpus.s3)
     all_files = cstore.list_parquets()
     # Restrict the recursive glob to the intended shards (see corpus.include/exclude).
     # Applied BEFORE striding so the global file index — and thus make_point_id — is
@@ -7395,7 +7395,7 @@ def run_compute(
             exchange_id = _run_scope_id()
             try:
                 thr_exchange = _thresholds.ThresholdExchange(
-                    Store(cfg.output.path), exchange_id, job_rank, num_jobs,
+                    Store(cfg.output.path, s3=cfg.output.s3), exchange_id, job_rank, num_jobs,
                     {specs[m].name: (int(spec_thr[m].shape[0]),
                                      _thresholds.publish_width(specs[m].k, num_jobs))
                      for m in range(len(specs))},
@@ -9052,7 +9052,7 @@ def run_compute(
             logger.debug("could not read queries dtype for provenance: %s", exc)
         return out
 
-    out = Store(cfg.output.path)
+    out = Store(cfg.output.path, s3=cfg.output.s3)
     results: dict[str, str] = {}
     # Per-search rows for the run manifest, filled as each output is written.
     manifest_searches: list[dict] = []

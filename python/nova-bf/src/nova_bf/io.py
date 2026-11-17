@@ -385,8 +385,38 @@ def _warn_once(key: str, msg: str, *args) -> None:
     logger.warning(msg, *args)
 
 
-def _native_client(region: str | None):
-    """Return a process-local Rust fetch client for the given region.
+def _auth_kwargs(s3) -> dict:
+    """rust_fetch.Client credential kwargs for an `S3AccessConfig` (or None)."""
+    if s3 is None:
+        return {}
+    if s3.anonymous:
+        return {"anonymous": True}
+    return {
+        "access_key_id": s3.access_key_id.get_secret_value(),
+        "secret_access_key": s3.secret_access_key.get_secret_value(),
+        "session_token": (None if s3.session_token is None
+                          else s3.session_token.get_secret_value()),
+    }
+
+
+def _redact(text: object, s3=None) -> str:
+    """`text` with this location's credentials (and the env session token)
+    replaced: object_store transport errors can carry the raw S3 response
+    body, which may echo the session token."""
+    out = str(text)
+    secrets = [os.environ.get("AWS_SESSION_TOKEN"), os.environ.get("AWS_SECRET_ACCESS_KEY")]
+    if s3 is not None and not s3.anonymous:
+        secrets += [v.get_secret_value() for v in
+                    (s3.access_key_id, s3.secret_access_key, s3.session_token) if v is not None]
+    for v in secrets:
+        if v and len(v) >= 4:
+            out = out.replace(v, "***")
+    return out
+
+
+def _native_client(region: str | None, s3=None):
+    """Return a process-local Rust fetch client for the given region and
+    S3 auth (`S3AccessConfig` or None for the default credential chain).
 
     Creates clients lazily and reinitializes them after fork.
     Returns None if rust_fetch is unavailable.
@@ -398,6 +428,17 @@ def _native_client(region: str | None):
                    "(%s); reading with pyarrow. Install python/nova-bf/rust_io "
                    "(`make bf`) or set params.rust_fetch_dense/rust_fetch_columns: false", e)
         return None
+    # Everything that can log (_env_int, the fallback below) runs OUTSIDE
+    # _NATIVE_LOCK: _warn_once takes that same non-reentrant lock.
+    conc = _env_int("NOVA_BF_RUST_FETCH_CONC", _NATIVE_CFG["concurrency"])
+    part = _env_int("NOVA_BF_RUST_FETCH_PART_MIB", _NATIVE_CFG["part_mib"]) << 20
+    # Keyed by the tuning too: a later run in this process with other
+    # settings must not reuse a client built with the old ones.
+    # And by auth: an anonymous corpus client must never serve a signed
+    # output read, nor one set of keys another's.
+    auth = _auth_kwargs(s3)
+    key = (region, conc, part, tuple(sorted(auth.items())))
+    unsupported = None
     with _NATIVE_LOCK:
         if _NATIVE["pid"] != os.getpid():
             # A client inherited across fork() cannot be used in the child
@@ -405,41 +446,102 @@ def _native_client(region: str | None):
             # leaks it on drop). Build fresh ones for this process.
             _NATIVE["orphans"].append(_NATIVE["clients"])
             _NATIVE["pid"], _NATIVE["clients"] = os.getpid(), {}
-        conc = _env_int("NOVA_BF_RUST_FETCH_CONC", _NATIVE_CFG["concurrency"])
-        part = _env_int("NOVA_BF_RUST_FETCH_PART_MIB", _NATIVE_CFG["part_mib"]) << 20
-        # Keyed by the tuning too: a later run in this process with other
-        # settings must not reuse a client built with the old ones.
-        key = (region, conc, part)
         client = _NATIVE["clients"].get(key)
         if client is None:
-            client = rust_fetch.Client(region=region, concurrency=conc, part_size=part)
-            _NATIVE["clients"][key] = client
-        return client
+            try:
+                client = rust_fetch.Client(region=region, concurrency=conc,
+                                           part_size=part, **auth)
+            except TypeError as e:
+                if not auth:
+                    raise
+                # An older rust_fetch build without per-location auth: it would
+                # sign with the env credentials, so it must not be used here.
+                unsupported = e
+            else:
+                _NATIVE["clients"][key] = client
+    if unsupported is not None:
+        _warn_once("auth-unsupported", "the installed rust_fetch does not support "
+                   "s3: auth settings (%s); reading those paths with pyarrow. "
+                   "Rebuild python/nova-bf/rust_io (`make bf`)", unsupported)
+        return None
+    return client
 
 
 def _is_s3(uri: str) -> bool:
     return uri.startswith("s3://")
 
 
-def _fs_and_path(uri: str) -> tuple[pafs.FileSystem, str]:
+def _fs_and_path(uri: str, s3=None) -> tuple[pafs.FileSystem, str]:
+    if s3 is not None:
+        if not _is_s3(uri):
+            raise ValueError(f"an s3: auth block is set for {uri!r}, which is not an s3:// path")
+        return _s3_fs_with_auth(uri, s3)
     if "://" in uri:
         return pafs.FileSystem.from_uri(uri)
     # bare local path (relative or absolute)
     return pafs.LocalFileSystem(), os.path.abspath(uri)
 
 
+# S3FileSystem options that choose credentials. Everything else that
+# from_uri resolved (region, endpoint from AWS_ENDPOINT_URL*, scheme, query
+# options) is kept, so the filesystem differs from the default path ONLY in
+# how requests are authenticated.
+_S3_CREDENTIAL_OPTIONS = ("access_key", "secret_key", "session_token", "anonymous",
+                          "role_arn", "session_name", "external_id", "load_frequency")
+
+
+def _s3_fs_with_auth(uri: str, s3) -> tuple[pafs.FileSystem, str]:
+    """An S3FileSystem for `uri` authenticated per `s3` (an S3AccessConfig).
+
+    pyarrow's URI form has no anonymous/credential parameters, so parse the
+    URI with pyarrow itself (identical root path, region, endpoint and query
+    handling to the default path -- point ids must not change) and rebuild
+    the filesystem from those resolved options with only the credentials
+    replaced. from_uri's own region lookup is an unsigned request.
+    """
+    from urllib.parse import urlsplit
+
+    parts = urlsplit(uri)
+    if parts.username is not None or parts.password is not None:
+        raise ValueError(f"s3://{parts.hostname}/...: credentials in the URI conflict "
+                         "with the s3: auth block; remove them from the path")
+    base, root = pafs.FileSystem.from_uri(uri)
+    # S3FileSystem pickles as (_reconstruct, (kwargs,)) where kwargs are its
+    # full constructor options -- the supported way to copy one.
+    opts = dict(base.__reduce__()[1][0])
+    missing = [k for k in ("access_key", "secret_key", "anonymous", "region") if k not in opts]
+    if missing:
+        raise RuntimeError(f"unexpected pyarrow S3FileSystem options (missing {missing}); "
+                           f"pyarrow {pa.__version__} is not supported for s3: auth blocks")
+    for k in _S3_CREDENTIAL_OPTIONS:
+        opts.pop(k, None)
+    if s3.anonymous:
+        opts["anonymous"] = True
+    else:
+        opts["access_key"] = s3.access_key_id.get_secret_value()
+        opts["secret_key"] = s3.secret_access_key.get_secret_value()
+        if s3.session_token is not None:
+            opts["session_token"] = s3.session_token.get_secret_value()
+    return pafs.S3FileSystem(**opts), root
+
+
 class Store:
-    """A Parquet root backed by local storage or S3."""
+    """A Parquet root backed by local storage or S3.
+
+    `s3` is the location's `S3AccessConfig` (None = default credential
+    chain); it applies to pyarrow and the native reader alike.
+    """
 
     def __init__(self, uri: str, ranged_get: bool = False,
-                 ranged_get_concurrency: int | None = None):
+                 ranged_get_concurrency: int | None = None, s3=None):
         self.uri = uri
         self.is_s3 = _is_s3(uri)
         self.ranged_get = ranged_get
+        self.s3 = s3
 
         # Per-file GET concurrency; account for parallel file reads.
         self.ranged_get_concurrency = ranged_get_concurrency or _RANGED_GET_CONCURRENCY
-        self.fs, self.root = _fs_and_path(uri)
+        self.fs, self.root = _fs_and_path(uri, s3)
 
         # Enable native reads only for supported local/S3 configurations.
         # Match PyArrow's resolved S3 region.
@@ -467,8 +569,26 @@ class Store:
         Every `*.parquet` under the root (or root/subpath), sorted.
         """
         base = f"{self.root.rstrip('/')}/{subpath}" if subpath else self.root
-        info = self.fs.get_file_info(base)
-        if info.type == pafs.FileType.File:
+        try:
+            info = self.fs.get_file_info(base)
+        except OSError as head_err:
+            # S3 answers a HEAD on `prefix` (no slash) with 403, not 404, when
+            # access is granted only on `prefix/*` -- e.g. a public bucket
+            # whose policy covers `resharded/*`. The listing may still be
+            # allowed, so try it; if it finds nothing, the HEAD error was the
+            # real answer.
+            if not self.is_s3:
+                raise
+            try:
+                entries = self.fs.get_file_info(pafs.FileSelector(base, recursive=True))
+            except OSError:
+                raise head_err from None
+            if not entries:
+                raise head_err
+            info = None
+        if info is None:
+            pass
+        elif info.type == pafs.FileType.File:
             entries = [info]
         elif info.type == pafs.FileType.NotFound:
             return []
@@ -543,7 +663,7 @@ class Store:
         if not _native_enter():
             return False  # shutting down: let pyarrow re-read, never call in
         try:
-            client = _native_client(self._native_region)
+            client = _native_client(self._native_region, self.s3)
             if client is None:
                 return False
             url = f"s3://{read_path}" if self.is_s3 else read_path
@@ -568,7 +688,7 @@ class Store:
                         "plain s3:// or local root, or an AWS_ENDPOINT_URL* override "
                         "is set; reading with pyarrow", self.uri)
             return None
-        client = _native_client(self._native_region)
+        client = _native_client(self._native_region, self.s3)
         if client is None:
             return None
         import rust_fetch
@@ -626,7 +746,7 @@ class Store:
             kind = type(e).__name__
             _warn_once(f"fallback:{kind}:{str(e).replace(url, '')}", "native dense read "
                     "of %s fell back to pyarrow: %s: %s (further files with this "
-                    "reason are not logged)", read_path, kind, e)
+                    "reason are not logged)", read_path, kind, _redact(e, self.s3))
             return None
 
         except FileNotFoundError:
@@ -639,7 +759,7 @@ class Store:
             # Disable native reads after transport failure; use PyArrow thereafter.
             self._native_failed = True
             logger.warning("native dense transport failed on %s (%s); using pyarrow "
-                        "for the rest of this run on %s", read_path, e, self.uri)
+                        "for the rest of this run on %s", read_path, _redact(e, self.s3), self.uri)
             return None
 
     def read_columns_fetched(self, read_path: str, columns: list[str],
@@ -656,7 +776,7 @@ class Store:
         if any(c.startswith("__") for c in columns) or any(
                 "=" in seg for seg in read_path.split("/")[:-1]):
             return None
-        client = _native_client(self._native_region)
+        client = _native_client(self._native_region, self.s3)
         if client is None:
             return None
         import rust_fetch
@@ -685,7 +805,7 @@ class Store:
             except (ValueError, MemoryError, rust_fetch.CorruptParquet) as e:
                 kind = type(e).__name__
                 _warn_once(f"fetch:{kind}:{str(e).replace(url, '')}", "native fetch of %s "
-                        "fell back to pyarrow: %s: %s", read_path, kind, e)
+                        "fell back to pyarrow: %s: %s", read_path, kind, _redact(e, self.s3))
                 return None
             except FileNotFoundError:
                 return None
@@ -696,7 +816,7 @@ class Store:
                     return None
                 self._native_failed = True
                 logger.warning("native fetch transport failed on %s (%s); using pyarrow "
-                            "for the rest of this run on %s", read_path, e, self.uri)
+                            "for the rest of this run on %s", read_path, _redact(e, self.s3), self.uri)
                 return None
 
             buf = pa.py_buffer(image)

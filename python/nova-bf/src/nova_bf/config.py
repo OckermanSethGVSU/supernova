@@ -19,7 +19,7 @@ from typing import Literal
 
 import yaml
 
-from pydantic import (BaseModel, ConfigDict, Field, field_validator,
+from pydantic import (BaseModel, ConfigDict, Field, SecretStr, field_validator,
                       model_validator)
 
 from nova_bf.tokenize import tokenize
@@ -58,10 +58,124 @@ def expand_env(text: str) -> str:
     return _ENV_RE.sub(repl, text)
 
 
+# What SecretStr prints and model_dump(mode="json") writes in place of a secret.
+_SECRET_MASK = "**********"
+
+
+def _check_s3_location(path: str, s3) -> None:
+    """Fail at config load (not after a full scan) on a path that cannot work.
+
+    Credentials embedded in ANY path are refused, block or not: pyarrow would
+    sign with them while the native reader signs with the env chain, and the
+    path (secret included) is recorded verbatim in manifests and results
+    metadata. Error text never repeats the path's credentials."""
+    from urllib.parse import urlsplit
+    if "://" in path:
+        scheme, rest = path.split("://", 1)
+        parts = urlsplit(path)
+        # urlsplit ends the authority at the first `/`, `?` or `#`, so a pasted
+        # secret containing one (AWS secret keys often contain `/`) hides the
+        # `@` from it. Bucket names contain neither `:` nor `@`, so a `:` in the
+        # first segment with an `@` anywhere after it is credentials (or, at
+        # worst, a port, which S3 URIs never need).
+        first = re.split(r"[/?#]", rest, maxsplit=1)[0]
+        if (parts.username is not None or parts.password is not None
+                or (":" in first and "@" in rest)):
+            raise ValueError(f"{scheme}://...: credentials embedded in the path are "
+                             "not supported; use an s3: block (or the default AWS "
+                             "credential chain) instead")
+    if s3 is not None and not path.startswith("s3://"):
+        raise ValueError(f"an s3: block is set for {path!r}, which is not an s3:// path")
+
+
+class S3AccessConfig(BaseModel):
+    """How one location (corpus, queries or output) authenticates to S3.
+
+    Omitted (the default): the standard AWS credential chain -- AWS_* env
+    vars, ~/.aws, the instance profile -- for both pyarrow and the native
+    (rust_fetch) reader, exactly as before this block existed. Otherwise
+    exactly one of:
+
+        s3: {anonymous: true}          # unsigned requests (public bucket)
+
+        s3:                            # these credentials, only for this location
+          access_key_id: ${READ_KEY_ID}
+          secret_access_key: ${READ_SECRET}
+          session_token: ${READ_TOKEN}     # optional (STS credentials)
+
+    Explicit keys REPLACE the credential chain for this location: an env
+    AWS_SESSION_TOKEN is never paired with them. Each location is independent,
+    so e.g. a public corpus can be read anonymously while partials are written
+    with the run's own credentials. Use `${VAR}` for the keys rather than
+    pasting them into the file; the secrets are never logged, echoed in
+    validation errors, or written to the manifest. Without a session token,
+    delete the line: `${VAR}` expansion runs on the raw text, comments
+    included, so a commented-out line with an unset variable still fails.
+    Empty values are rejected. `s3:` with no value (null) means the default
+    credential chain, same as omitting it.
+    """
+
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
+
+    anonymous: bool = False
+    access_key_id: SecretStr | None = None
+    secret_access_key: SecretStr | None = None
+    session_token: SecretStr | None = None
+
+    @field_validator("access_key_id", "secret_access_key", "session_token")
+    @classmethod
+    def _not_blank(cls, v: SecretStr | None, info) -> SecretStr | None:
+        # pyarrow treats empty keys as "unsigned" while object_store signs
+        # with them, so "" would silently mean anonymous on one reader only.
+        if v is not None and not v.get_secret_value().strip():
+            raise ValueError(f"s3.{info.field_name} is empty (an unset ${{VAR:-}}?); "
+                             "remove the line or give a value")
+        if v is not None and v.get_secret_value() == _SECRET_MASK:
+            raise ValueError(f"s3.{info.field_name} is the masked placeholder a dumped "
+                             "config writes; supply the real value (e.g. via ${VAR})")
+        return v
+
+    @model_validator(mode="after")
+    def _one_mode(self) -> "S3AccessConfig":
+        if not self.anonymous:
+            # `session_token: ${UNSET:-}` (unquoted) parses as null: refuse
+            # rather than silently treating STS keys as long-term ones.
+            # Anonymous blocks may carry nulls (that is what model_dump writes).
+            for name in ("access_key_id", "secret_access_key", "session_token"):
+                if name in self.model_fields_set and getattr(self, name) is None:
+                    raise ValueError(f"s3.{name} has no value (an unset ${{VAR:-}}?); "
+                                     "remove the line or give a value")
+        keys = self.access_key_id is not None or self.secret_access_key is not None
+        if self.anonymous and (keys or self.session_token is not None):
+            raise ValueError("s3.anonymous: true cannot be combined with credentials")
+        if (self.access_key_id is None) != (self.secret_access_key is None):
+            raise ValueError("s3.access_key_id and s3.secret_access_key must be given together")
+        if self.session_token is not None and not keys:
+            raise ValueError("s3.session_token needs access_key_id and secret_access_key")
+        if not self.anonymous and not keys:
+            raise ValueError("an s3: block must set anonymous: true or access_key_id + "
+                             "secret_access_key (omit the block to use the default "
+                             "AWS credential chain)")
+        return self
+
+    @property
+    def mode(self) -> str:
+        return "anonymous" if self.anonymous else "static"
+
+
 class CorpusConfig(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
     path: str
+    # S3 authentication for this path only; see S3AccessConfig. Omitted or
+    # null (what model_dump writes, so dumped configs reload) = the default
+    # AWS credential chain.
+    s3: S3AccessConfig | None = None
+
+    @model_validator(mode="after")
+    def _s3_fits_path(self):
+        _check_s3_location(self.path, self.s3)
+        return self
     dense_column: str = "dense_embedding"
     # Struct<indices: list<uint32>, values: list<float32>> column, read instead
     # of dense_column by a search whose `vector_type` is "sparse" —
@@ -110,9 +224,18 @@ class CorpusConfig(BaseModel):
 
 
 class QueriesConfig(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
     path: str
+    # S3 authentication for this path only; see S3AccessConfig. Omitted or
+    # null (what model_dump writes, so dumped configs reload) = the default
+    # AWS credential chain.
+    s3: S3AccessConfig | None = None
+
+    @model_validator(mode="after")
+    def _s3_fits_path(self):
+        _check_s3_location(self.path, self.s3)
+        return self
     dense_column: str = "dense_embedding"
     sparse_column: str = "sparse_embedding"
     # list<list<float32>> query column for a multivector search — see
@@ -148,9 +271,18 @@ class QueriesConfig(BaseModel):
 
 
 class OutputConfig(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
     path: str
+    # S3 authentication for this path only; see S3AccessConfig. Omitted or
+    # null (what model_dump writes, so dumped configs reload) = the default
+    # AWS credential chain.
+    s3: S3AccessConfig | None = None
+
+    @model_validator(mode="after")
+    def _s3_fits_path(self):
+        _check_s3_location(self.path, self.s3)
+        return self
 
 
 class ParamsConfig(BaseModel):
@@ -735,7 +867,12 @@ def _assign_default_names(specs: list[SearchSpec]) -> None:
 
 class BruteForceConfig(BaseModel):
     # allow extra top-level keys (e.g. a `resources:` block for `nova dist`).
-    model_config = ConfigDict(extra="allow")
+    # hide_input_in_errors: a section may hold S3 credentials (s3: blocks),
+    # and pydantic otherwise echoes raw input into ValidationError text. Only
+    # the outermost model's setting applies, so it must be set here too. The
+    # cost: no config error shows the offending value (location + message
+    # only). `e.errors()` still carries raw input -- never log it.
+    model_config = ConfigDict(extra="allow", hide_input_in_errors=True)
 
     corpus: CorpusConfig
     queries: QueriesConfig
@@ -898,6 +1035,19 @@ def _normalize_static_date_bounds(data: dict) -> dict:
 def load_config(path: str) -> BruteForceConfig:
     with open(path) as f:
         raw = expand_env(f.read())
-    data = yaml.safe_load(raw)
+    try:
+        data = yaml.safe_load(raw)
+    except yaml.YAMLError as e:
+        # PyYAML quotes the offending source line, which by now holds expanded
+        # ${VAR} values (possibly S3 credentials). Report the line only (a
+        # column would refer to the expanded text), and the problem text only
+        # for scanner errors, which quote at most one character; parser,
+        # composer and constructor errors can quote parts of values (a tag
+        # handle, an alias or tag name).
+        mark = getattr(e, "problem_mark", None)
+        where = f" near line {mark.line + 1}" if mark else ""
+        structural = isinstance(e, yaml.scanner.ScannerError)
+        what = (getattr(e, "problem", None) if structural else None) or type(e).__name__
+        raise ValueError(f"{path}: invalid YAML{where}: {what}") from None
     data = _normalize_static_date_bounds(data)
     return BruteForceConfig.model_validate(data)

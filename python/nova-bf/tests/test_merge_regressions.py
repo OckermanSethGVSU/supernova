@@ -123,11 +123,11 @@ def test_merge_against_an_s3_style_root_reads_its_own_partials(tmp_path, monkeyp
     fake_s3.mkdir()
     real = io_mod._fs_and_path
 
-    def fake_fs_and_path(uri: str):
+    def fake_fs_and_path(uri: str, s3=None):
         if uri.startswith("s3://"):
             return (pafs.SubTreeFileSystem(str(fake_s3), pafs.LocalFileSystem()),
                     uri[len("s3://"):])
-        return real(uri)
+        return real(uri, s3)
 
     monkeypatch.setattr(io_mod, "_fs_and_path", fake_fs_and_path)
 
@@ -1945,12 +1945,12 @@ def test_a_failed_write_removes_the_truncated_output_on_every_store(
         fake_s3.mkdir()
         real_fs = io_mod._fs_and_path
 
-        def fake_fs_and_path(uri: str):
+        def fake_fs_and_path(uri: str, s3=None):
             if uri.startswith("s3://"):
                 return (pafs.SubTreeFileSystem(str(fake_s3),
                                                pafs.LocalFileSystem()),
                         uri[len("s3://"):])
-            return real_fs(uri)
+            return real_fs(uri, s3)
 
         monkeypatch.setattr(io_mod, "_fs_and_path", fake_fs_and_path)
         cfg = _cfg("s3://bucket/prefix")
@@ -2112,10 +2112,10 @@ def test_an_s3_merge_that_fails_to_commit_keeps_the_previous_result(
     handler = _CloseFailsFS(fake_s3)
     real_fs = io_mod._fs_and_path
 
-    def fake_fs_and_path(uri: str):
+    def fake_fs_and_path(uri: str, s3=None):
         if uri.startswith("s3://"):
             return pafs.PyFileSystem(handler), uri[len("s3://"):]
-        return real_fs(uri)
+        return real_fs(uri, s3)
 
     monkeypatch.setattr(io_mod, "_fs_and_path", fake_fs_and_path)
     cfg = _cfg("s3://bucket/prefix")
@@ -2151,11 +2151,11 @@ def test_a_footer_failure_is_not_an_uncommitted_upload(tmp_path, monkeypatch):
     fake_s3.mkdir()
     real_fs = io_mod._fs_and_path
 
-    def fake_fs_and_path(uri: str):
+    def fake_fs_and_path(uri: str, s3=None):
         if uri.startswith("s3://"):
             return (pafs.SubTreeFileSystem(str(fake_s3), pafs.LocalFileSystem()),
                     uri[len("s3://"):])
-        return real_fs(uri)
+        return real_fs(uri, s3)
 
     monkeypatch.setattr(io_mod, "_fs_and_path", fake_fs_and_path)
     cfg = _cfg("s3://bucket/prefix")

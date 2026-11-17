@@ -17,6 +17,10 @@ class Client:
         endpoint: str | None = None,
         allow_http: bool | None = None,
         threads: int | None = None,
+        anonymous: bool = False,
+        access_key_id: str | None = None,
+        secret_access_key: str | None = None,
+        session_token: str | None = None,
     ) -> None: ...
     @property
     def concurrency(self) -> int: ...

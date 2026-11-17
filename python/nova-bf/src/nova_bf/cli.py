@@ -217,7 +217,7 @@ def _merge_fanout(config: str, names: list[str], jobs: int) -> int:
 
         try:
             drop_legacy_manifest(
-                Store(cfg.output.path),
+                Store(cfg.output.path, s3=cfg.output.s3),
                 cfg,
                 {
                     result_name(cfg, search)

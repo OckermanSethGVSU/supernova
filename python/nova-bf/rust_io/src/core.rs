@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures::StreamExt;
-use object_store::aws::{resolve_bucket_region, AmazonS3Builder};
+use object_store::aws::{resolve_bucket_region, AmazonS3Builder, AmazonS3ConfigKey};
 use object_store::local::LocalFileSystem;
 use object_store::path::Path;
 use object_store::{
@@ -85,12 +85,106 @@ impl Location {
     }
 }
 
+/// How S3 requests are authenticated.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub enum S3Auth {
+    /// The standard AWS_* env vars / instance profile (the default).
+    #[default]
+    Env,
+    /// Unsigned requests (public buckets). No credentials are looked up, so
+    /// none in the environment can leak into this client.
+    Anonymous,
+    /// These credentials only. The env's AWS_ACCESS_KEY_ID /
+    /// AWS_SECRET_ACCESS_KEY / AWS_SESSION_TOKEN are ignored, so an env
+    /// session token can never be paired with these keys.
+    Static { key_id: String, secret: String, token: Option<String> },
+}
+
+impl S3Auth {
+    /// The auth for a client's constructor arguments: nothing set = env,
+    /// `anonymous` alone, or a key + secret (+ optional token). Every other
+    /// combination, and any empty/blank value, is an error (pyarrow treats
+    /// blank keys as unsigned while object_store would sign with them).
+    pub fn from_args(
+        anonymous: bool,
+        key_id: Option<String>,
+        secret: Option<String>,
+        token: Option<String>,
+    ) -> std::result::Result<Self, String> {
+        for (name, v) in [("access_key_id", &key_id), ("secret_access_key", &secret), ("session_token", &token)] {
+            if v.as_deref().is_some_and(|v| v.trim().is_empty()) {
+                return Err(format!("{name} is empty"));
+            }
+        }
+        match (anonymous, key_id, secret, token) {
+            (false, None, None, None) => Ok(S3Auth::Env),
+            (true, None, None, None) => Ok(S3Auth::Anonymous),
+            (false, Some(key_id), Some(secret), token) => Ok(S3Auth::Static { key_id, secret, token }),
+            (true, ..) => Err("anonymous=True cannot be combined with credentials".into()),
+            _ => Err("access_key_id and secret_access_key must be given together (session_token needs both)".into()),
+        }
+    }
+
+    pub fn mode(&self) -> &'static str {
+        match self {
+            S3Auth::Env => "env",
+            S3Auth::Anonymous => "anonymous",
+            S3Auth::Static { .. } => "static",
+        }
+    }
+}
+
+// Never print secrets (S3Settings is Debug).
+impl std::fmt::Debug for S3Auth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.mode())
+    }
+}
+
 /// Settings for the S3 backend; `None` means "from the environment".
 #[derive(Debug, Clone, Default)]
 pub struct S3Settings {
     pub region: Option<String>,
     pub endpoint: Option<String>,
     pub allow_http: Option<bool>,
+    pub auth: S3Auth,
+}
+
+/// An S3 builder configured from `env` (AWS_* pairs, as `from_env` reads
+/// them) and `auth`. Pure in `env`, so tests need not touch the process env.
+fn s3_builder<I>(auth: &S3Auth, env: I) -> AmazonS3Builder
+where
+    I: IntoIterator<Item = (String, String)>,
+{
+    let mut b = AmazonS3Builder::new();
+    for (k, v) in env {
+        if !k.starts_with("AWS_") {
+            continue;
+        }
+        let Ok(key) = k.to_ascii_lowercase().parse::<AmazonS3ConfigKey>() else { continue };
+        let is_cred = matches!(
+            key,
+            AmazonS3ConfigKey::AccessKeyId
+                | AmazonS3ConfigKey::SecretAccessKey
+                | AmazonS3ConfigKey::Token
+                | AmazonS3ConfigKey::SkipSignature
+        );
+        if is_cred && *auth != S3Auth::Env {
+            continue;
+        }
+        b = b.with_config(key, v);
+    }
+    match auth {
+        S3Auth::Env => b,
+        S3Auth::Anonymous => b.with_skip_signature(true),
+        S3Auth::Static { key_id, secret, token } => {
+            let b = b.with_skip_signature(false).with_access_key_id(key_id).with_secret_access_key(secret);
+            match token {
+                Some(t) => b.with_token(t),
+                None => b,
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -486,12 +580,13 @@ impl Fetcher {
         o
     }
 
-    async fn s3_store(&self, bucket: &str) -> Result<Arc<dyn ObjectStore>> {
-        let key = format!("s3://{bucket}");
-        if let Some(s) = self.stores.lock().unwrap().get(&key) {
-            return Ok(s.clone());
-        }
-        let mut b = AmazonS3Builder::from_env()
+    /// Everything about a bucket's store except region resolution; pure in
+    /// `env` so tests can check that this fetcher's auth is what is applied.
+    fn s3_base_builder<I>(&self, bucket: &str, env: I) -> AmazonS3Builder
+    where
+        I: IntoIterator<Item = (String, String)>,
+    {
+        let mut b = s3_builder(&self.s3.auth, env)
             .with_bucket_name(bucket)
             .with_client_options(self.client_options())
             // Retries are ours (per part, covering the body too).
@@ -502,6 +597,16 @@ impl Fetcher {
         if let Some(h) = self.s3.allow_http {
             b = b.with_allow_http(h);
         }
+        b
+    }
+
+    async fn s3_store(&self, bucket: &str) -> Result<Arc<dyn ObjectStore>> {
+        let key = format!("s3://{bucket}");
+        if let Some(s) = self.stores.lock().unwrap().get(&key) {
+            return Ok(s.clone());
+        }
+        let env = std::env::vars_os().filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)));
+        let mut b = self.s3_base_builder(bucket, env);
         let env_region = std::env::var("AWS_REGION").ok().or_else(|| std::env::var("AWS_DEFAULT_REGION").ok());
         let env_endpoint = std::env::var("AWS_ENDPOINT_URL").ok().or_else(|| std::env::var("AWS_ENDPOINT").ok());
         if let Some(r) = &self.s3.region {
@@ -590,6 +695,111 @@ mod tests {
     use super::*;
     use object_store::memory::InMemory;
     use object_store::PutPayload;
+
+    fn env(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+    }
+
+    const ENV_CREDS: &[(&str, &str)] = &[
+        ("AWS_ACCESS_KEY_ID", "ENVKEY"),
+        ("AWS_SECRET_ACCESS_KEY", "ENVSECRET"),
+        ("AWS_SESSION_TOKEN", "ENVTOKEN"),
+        ("AWS_REGION", "eu-west-2"),
+        ("HOME", "/x"),
+    ];
+
+    #[test]
+    fn s3_auth_env_keeps_env_credentials() {
+        let mut e = env(ENV_CREDS);
+        e.push(("AWS_SKIP_SIGNATURE".into(), "true".into()));
+        let b = s3_builder(&S3Auth::Env, e);
+        assert_eq!(b.get_config_value(&AmazonS3ConfigKey::AccessKeyId).as_deref(), Some("ENVKEY"));
+        assert_eq!(b.get_config_value(&AmazonS3ConfigKey::SecretAccessKey).as_deref(), Some("ENVSECRET"));
+        assert_eq!(b.get_config_value(&AmazonS3ConfigKey::Token).as_deref(), Some("ENVTOKEN"));
+        assert_eq!(b.get_config_value(&AmazonS3ConfigKey::Region).as_deref(), Some("eu-west-2"));
+        // Env mode is from_env: an env AWS_SKIP_SIGNATURE is honoured as before.
+        assert_eq!(b.get_config_value(&AmazonS3ConfigKey::SkipSignature).as_deref(), Some("true"));
+    }
+
+    #[test]
+    fn s3_auth_static_never_pairs_with_env_token() {
+        let auth = S3Auth::Static { key_id: "K".into(), secret: "S".into(), token: None };
+        let mut e = env(ENV_CREDS);
+        e.push(("AWS_SKIP_SIGNATURE".into(), "true".into()));
+        let b = s3_builder(&auth, e);
+        assert_eq!(b.get_config_value(&AmazonS3ConfigKey::AccessKeyId).as_deref(), Some("K"));
+        assert_eq!(b.get_config_value(&AmazonS3ConfigKey::SecretAccessKey).as_deref(), Some("S"));
+        assert_eq!(b.get_config_value(&AmazonS3ConfigKey::Token), None);
+        assert_eq!(b.get_config_value(&AmazonS3ConfigKey::SkipSignature).as_deref(), Some("false"));
+        // Non-credential env settings still apply.
+        assert_eq!(b.get_config_value(&AmazonS3ConfigKey::Region).as_deref(), Some("eu-west-2"));
+        let auth = S3Auth::Static { key_id: "K".into(), secret: "S".into(), token: Some("T".into()) };
+        let b = s3_builder(&auth, env(ENV_CREDS));
+        assert_eq!(b.get_config_value(&AmazonS3ConfigKey::Token).as_deref(), Some("T"));
+    }
+
+    #[test]
+    fn s3_auth_anonymous_skips_signing_and_drops_env_keys() {
+        let mut e = env(ENV_CREDS);
+        e.push(("AWS_TOKEN".into(), "ALIASTOKEN".into()));
+        let b = s3_builder(&S3Auth::Anonymous, e);
+        assert_eq!(b.get_config_value(&AmazonS3ConfigKey::SkipSignature).as_deref(), Some("true"));
+        assert_eq!(b.get_config_value(&AmazonS3ConfigKey::AccessKeyId), None);
+        assert_eq!(b.get_config_value(&AmazonS3ConfigKey::SecretAccessKey), None);
+        assert_eq!(b.get_config_value(&AmazonS3ConfigKey::Token), None);
+        // An env secret alone must not break build() (MissingAccessKeyId).
+        let b = s3_builder(&S3Auth::Anonymous, env(&[("AWS_SECRET_ACCESS_KEY", "X"), ("AWS_REGION", "us-east-1")]));
+        b.with_bucket_name("b").build().expect("anonymous build with an env secret");
+    }
+
+    #[test]
+    fn s3_auth_from_args() {
+        let s = |v: &str| Some(v.to_string());
+        assert_eq!(S3Auth::from_args(false, None, None, None), Ok(S3Auth::Env));
+        assert_eq!(S3Auth::from_args(true, None, None, None), Ok(S3Auth::Anonymous));
+        assert_eq!(
+            S3Auth::from_args(false, s("K"), s("S"), s("T")),
+            Ok(S3Auth::Static { key_id: "K".into(), secret: "S".into(), token: s("T") })
+        );
+        assert_eq!(
+            S3Auth::from_args(false, s("K"), s("S"), None),
+            Ok(S3Auth::Static { key_id: "K".into(), secret: "S".into(), token: None })
+        );
+        for bad in [
+            (true, s("K"), s("S"), None),
+            (true, None, None, s("T")),
+            (false, s("K"), None, None),
+            (false, None, s("S"), None),
+            (false, None, None, s("T")),
+            (false, s(""), s("S"), None),
+            (false, s("K"), s("  "), None),
+            (false, s("K"), s("S"), s("")),
+        ] {
+            assert!(S3Auth::from_args(bad.0, bad.1.clone(), bad.2.clone(), bad.3.clone()).is_err(), "{:?}", bad.0);
+        }
+    }
+
+    #[test]
+    fn fetcher_applies_its_own_auth_to_bucket_stores() {
+        let mk = |auth| Fetcher::new(FetchConfig::default(), S3Settings { auth, ..Default::default() }).unwrap();
+        let get = |f: &Fetcher, k| f.s3_base_builder("b", env(ENV_CREDS)).get_config_value(&k);
+        let anon = mk(S3Auth::Anonymous);
+        assert_eq!(get(&anon, AmazonS3ConfigKey::SkipSignature).as_deref(), Some("true"));
+        assert_eq!(get(&anon, AmazonS3ConfigKey::AccessKeyId), None);
+        let st = mk(S3Auth::Static { key_id: "K".into(), secret: "S".into(), token: None });
+        assert_eq!(get(&st, AmazonS3ConfigKey::AccessKeyId).as_deref(), Some("K"));
+        assert_eq!(get(&st, AmazonS3ConfigKey::Token), None);
+        let envf = mk(S3Auth::Env);
+        assert_eq!(get(&envf, AmazonS3ConfigKey::AccessKeyId).as_deref(), Some("ENVKEY"));
+        assert_eq!(get(&envf, AmazonS3ConfigKey::Bucket).as_deref(), Some("b"));
+    }
+
+    #[test]
+    fn s3_auth_debug_hides_secrets() {
+        let auth = S3Auth::Static { key_id: "K".into(), secret: "SECRET".into(), token: Some("TOK".into()) };
+        let s = format!("{:?}", S3Settings { auth, ..Default::default() });
+        assert!(!s.contains("SECRET") && !s.contains("TOK"), "{s}");
+    }
 
     fn data(n: usize) -> Vec<u8> {
         (0..n).map(|i| (i.wrapping_mul(2654435761) >> 7) as u8).collect()
