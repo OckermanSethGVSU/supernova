@@ -574,7 +574,7 @@ class Store:
         except OSError as head_err:
             # S3 answers a HEAD on `prefix` (no slash) with 403, not 404, when
             # access is granted only on `prefix/*` -- e.g. a public bucket
-            # whose policy covers `resharded/*`. The listing may still be
+            # whose policy covers one folder. The listing may still be
             # allowed, so try it; if it finds nothing, the HEAD error was the
             # real answer.
             if not self.is_s3:

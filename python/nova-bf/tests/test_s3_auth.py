@@ -1,7 +1,8 @@
 """Per-location S3 auth (`s3:` on corpus/queries/output).
 
-Offline except `test_live_public_bucket_anonymous`, which reads the public
-fineweb-gte-with-payloads bucket and runs only with NOVA_BF_LIVE_S3=1.
+Offline except the two `test_live_*` tests, which run only when
+NOVA_BF_LIVE_S3_URI names a publicly readable S3 prefix of parquet files
+(e.g. `s3://<bucket>/<prefix>/?region=<region>`). No real path lives here.
 """
 
 import os
@@ -320,24 +321,33 @@ def test_rust_client_rejects_bad_auth(kw):
         rf.Client(**kw)
 
 
-@pytest.mark.skipif(os.environ.get("NOVA_BF_LIVE_S3") != "1",
-                    reason="live S3; set NOVA_BF_LIVE_S3=1")
+# Live S3, opt in: NOVA_BF_LIVE_S3_URI = a publicly readable prefix of parquet
+# files with a dense column (NOVA_BF_LIVE_S3_COLUMN, default dense_embedding).
+# A prefix whose read grant covers only `prefix/*` also exercises the
+# HEAD-denied listing fallback. Kept out of the repo: bucket paths are private.
+_LIVE_URI = os.environ.get("NOVA_BF_LIVE_S3_URI", "")
+_LIVE_COLUMN = os.environ.get("NOVA_BF_LIVE_S3_COLUMN", "dense_embedding")
+_live = pytest.mark.skipif(
+    not _LIVE_URI, reason="live S3; set NOVA_BF_LIVE_S3_URI to a public prefix")
+
+
+@_live
 def test_live_public_bucket_anonymous(monkeypatch):
     """Anonymous reads must ignore (here: poisoned) env credentials, on both
     the pyarrow and native paths, and the two must agree byte for byte.
-    Downloads one ~141 MB file's dense column."""
+    Downloads the dense column of the SMALLEST file under the prefix."""
     import numpy as np
 
     monkeypatch.setenv("AWS_ACCESS_KEY_ID", "AKIAPOISONED00000000")
     monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "poison")
     monkeypatch.setenv("AWS_SESSION_TOKEN", "poison")
-    s = Store("s3://fineweb-gte-with-payloads/resharded/00/?region=us-east-1",
-              s3=S3AccessConfig(anonymous=True))
-    f = "fineweb-gte-with-payloads/resharded/00/train-part0__0200.parquet"
-    assert any(p.read_path == f for p in s.list_parquets())
-    native = s.read_dense_versioned(f, "dense_embedding")
+    s = Store(_LIVE_URI, s3=S3AccessConfig(anonymous=True))
+    files = s.list_parquets()
+    assert files, f"no parquet files under {_LIVE_URI}"
+    f = min(files, key=lambda p: p.size if p.size is not None else float("inf")).read_path
+    native = s.read_dense_versioned(f, _LIVE_COLUMN)
     assert native is not None, "native read fell back to pyarrow"
-    ref = nio.dense_to_2d(s.read_columns(f, ["dense_embedding"]).column(0))
+    ref = nio.dense_to_2d(s.read_columns(f, [_LIVE_COLUMN]).column(0))
     assert np.array_equal(native[0], ref)
 
 
@@ -378,12 +388,10 @@ def test_list_reraises_head_error_when_listing_is_empty(tmp_path):
         _s3_like_store(tmp_path).list_parquets()
 
 
-@pytest.mark.skipif(os.environ.get("NOVA_BF_LIVE_S3") != "1",
-                    reason="live S3; set NOVA_BF_LIVE_S3=1")
+@_live
 def test_live_list_prefix_scoped_root():
-    s = Store("s3://fineweb-gte-with-payloads/resharded/?region=us-east-1",
-              s3=S3AccessConfig(anonymous=True))
-    assert len(s.list_parquets()) > 1000
+    s = Store(_LIVE_URI, s3=S3AccessConfig(anonymous=True))
+    assert len(s.list_parquets()) > 0
 
 
 def test_bad_tuning_env_does_not_deadlock(monkeypatch):
