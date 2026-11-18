@@ -1920,7 +1920,8 @@ class SparseBatchSlice:
     # threshold key per raw query row, set by `_process_batch_group` only
     # when `_sparse_skip_readers` proves every reader of this slice's raw
     # matrix is an unscaled dot search: the per-raw-row MINIMUM of the
-    # readers' thresholds (`_skip_threshold`). With it, `_masked_raw` may hold
+    # readers' effective thresholds (own state raised to any exchanged
+    # cross-worker threshold, `_thr`; see `_skip_threshold`). With it, `_masked_raw` may hold
     # -inf (or, elided, nothing) for cells proven below every reader's
     # threshold, so it is NOT a general raw matrix any more.
     skip_thr: object = None
@@ -5286,16 +5287,25 @@ def _process_batch_group(
               else slice_filters(rows, true_rows, sl.n_rows))
 
         if skip_readers and isinstance(sl, SparseBatchSlice):
-            # Use the searches' own top-k thresholds, not the cross-worker
-            # ones; a stale threshold is safe (thresholds only rise). Build
-            # tables only once some reader has folded k rows (before that
-            # every threshold is still the sentinel: nothing could be dead).
-            if any(_sbs.rows_seen(m) >= specs[m].k for m in skip_readers):
-                # spec_thr (own states), never `_thr(m)`: the exchanged bound
-                # would also be sound, but it would make this worker's
-                # partials differ from skipping off.
+            # Skip against the EFFECTIVE thresholds `_thr(m)`: the own state's
+            # raised to any cross-worker (exchanged) one, the same bound the
+            # top-k prune below uses. A stale threshold is safe (both only
+            # rise). A cell dies only if its proven upper bound is strictly
+            # below max(own, external): below its own state it could never
+            # enter this rank's top-k; below the external key it is below
+            # the applied threshold the partial records (`spec_thr_ext` only
+            # rises), so it cannot be a global winner and the merge's
+            # exchange check covers it. Partials may therefore hold fewer
+            # sub-threshold entries than with skipping off (untrimmed
+            # partials, and rows `_trim_mask` keeps whole for NaN/+inf);
+            # the merged output is unchanged. Build tables only once some
+            # reader has folded k rows or holds an external threshold
+            # (before that every threshold is still the sentinel).
+            has_ext = (spec_thr_ext is not None
+                       and any(spec_thr_ext[m] is not None for m in skip_readers))
+            if has_ext or any(_sbs.rows_seen(m) >= specs[m].k for m in skip_readers):
                 sl.skip_thr = _skip_threshold(
-                    skip_readers, spec_thr, spec_qsel,
+                    skip_readers, _ThrView(_thr), spec_qsel,
                     int(spec_Q[skip_readers[0]].shape[0]), device)
             else:
                 _sbs.decline("state cannot be full yet")
@@ -5829,6 +5839,8 @@ def _sparse_skip_readers(batch, member_idxs, specs, spec_qsel, spec_cos_scale,
 
 def _skip_threshold(readers, spec_thr, spec_qsel, n_raw: int, device):
     """Return the lowest top-k threshold among searches selecting each query row.
+    `spec_thr` is indexed by member: the caller passes the EFFECTIVE
+    thresholds (own state raised to any exchanged one, `_ThrView(_thr)`).
     Rows with no readers use the sentinel to disable skipping.
     For a single reader covering all rows, use its threshold directly."""
     import torch
@@ -7555,15 +7567,22 @@ def run_compute(
             own = _own_top_lists()
             for m in range(len(specs)):
                 thr = _thresholds.union_kth(own[m], lists[specs[m].name], specs[m].k, device)
-                new_key = _thresholds.keys_from_scores(thr.cpu().numpy(), device, dim=_spec_dim(m))
-                if spec_to_state[m] is not None:
-                    # File order (the union above) -> this rank's state order.
-                    new_key = new_key.index_select(0, spec_to_state[m])
-                # Never lower: the recorded applied value must be >= every key
-                # this worker ever pruned against (the lowering rounds 1-2 ulp
-                # near zero, and a peer list can be replaced by a shorter one).
-                spec_thr_ext[m] = (new_key if spec_thr_ext[m] is None
-                                   else torch.maximum(spec_thr_ext[m], new_key))
+                thr_np = thr.cpu().numpy()
+                # Stay None until some row carries a finite bound: an
+                # all -inf key means nothing to every consumer (`_thr`, the
+                # `applied_threshold` column, trim), but `None` also lets
+                # sparse block skip keep declining instead of building its
+                # tables to find no dead cell.
+                if spec_thr_ext[m] is not None or np.isfinite(thr_np).any():
+                    new_key = _thresholds.keys_from_scores(thr_np, device, dim=_spec_dim(m))
+                    if spec_to_state[m] is not None:
+                        # File order (the union above) -> this rank's state order.
+                        new_key = new_key.index_select(0, spec_to_state[m])
+                    # Never lower: the recorded applied value must be >= every key
+                    # this worker ever pruned against (the lowering rounds 1-2 ulp
+                    # near zero, and a peer list can be replaced by a shorter one).
+                    spec_thr_ext[m] = (new_key if spec_thr_ext[m] is None
+                                       else torch.maximum(spec_thr_ext[m], new_key))
                 if thr_exchange.stats["first_applied_file"] is None:
                     # -1 = before the first file (inherited at startup); "final" =
                     # first applied by the end-of-scan refresh (`trim_partials`),

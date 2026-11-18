@@ -516,7 +516,9 @@ def scores(q_csr, Cb, cmin: float | None = None, skip_thr=None,
     Raise KernelMismatch if the first-launch check fails.
 
     The dense hot-token path requires a positive minimum corpus weight.
-    skip_thr enables block-max skipping using a single search's top-k threshold.
+    skip_thr enables block-max skipping: one packed key per query row, the
+    minimum over the slice's readers of their effective top-k thresholds
+    (own state raised to any exchanged cross-worker threshold).
 
     With return_skip=True, return (scores, mask). Skipped cells may be
     unwritten, so callers must use the mask or materialize it before reading.

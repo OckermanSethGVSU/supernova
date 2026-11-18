@@ -1907,7 +1907,8 @@ if _CHILD:
         }[case]
 
 
-    def _rev_run(root, cdir, qpath, searches, tag, skip, batch, num_jobs=None, elide=True):
+    def _rev_run(root, cdir, qpath, searches, tag, skip, batch, num_jobs=None, elide=True,
+                 exchange=False, per_rank=False, trim=None, partials=None):
         import json
 
         import pyarrow.parquet as pq
@@ -1924,8 +1925,34 @@ if _CHILD:
             output=OutputConfig(path=str(out)),
             params=ParamsConfig(io_workers=1, sparse_batch_size=batch, sparse_kernel="posting",
                                 sparse_block_skip=skip, sparse_block_skip_sub=16,
-                                sparse_block_skip_elide=elide, threshold_exchange=False),
+                                sparse_block_skip_elide=elide, threshold_exchange=exchange,
+                                trim_partials=exchange if trim is None else trim),
             searches=searches)
+        if per_rank:
+            # rank -> block_skip usage, read from each rank's own manifest
+            # BEFORE the merge, which may fold them away.
+            assert num_jobs is not None
+            usages = {}
+            for r in range(num_jobs):
+                before = set(out.rglob("*.json"))
+                run_compute(cfg, num_jobs=num_jobs, job_rank=r)
+                for mf in sorted(set(out.rglob("*.json")) - before):
+                    man = json.loads(mf.read_text())
+                    try:
+                        usages[r] = man["params"]["kernels"]["sparse_posting_kernel"]["block_skip"]
+                    except (KeyError, TypeError):
+                        pass
+            if partials is not None:
+                # every rank partial, keyed by its path relative to `out`
+                for f in sorted(out.rglob("*.parquet")):
+                    tb = pq.read_table(f).to_pydict()
+                    tb.pop("src", None)
+                    partials[str(f.relative_to(out))] = tb
+            paths = run_merge(cfg)
+            t = {n: pq.read_table(p).to_pydict() for n, p in paths.items()}
+            for n in t:
+                t[n].pop("src", None)
+            return t, usages
         usages = []
         if num_jobs is None:
             paths = run_compute(cfg)
@@ -1980,6 +2007,44 @@ if _CHILD:
         assert len(us) >= 2, us                       # both ranks' manifests
         assert all(u["check_failures"] == 0 and u["disabled"] is None for u in us), us
         assert any(u["dead"] > 0 for u in us)
+
+    @pytest.mark.parametrize("case", ["empty_filter_mix", "mixed_and_none"])
+    @pytest.mark.parametrize("cpu_topk", [False, True])
+    @pytest.mark.parametrize("trim,elide", [(True, True), (False, True), (True, False)])
+    def test_e2e_skip_uses_exchanged_threshold(tmp_path, monkeypatch, case, cpu_topk,
+                                               trim, elide):
+        """Skipping against the exchanged (cross-worker) threshold. Ranks run
+        one after the other, so rank 1 starts from rank 0's finished
+        thresholds: with the exchange it must skip strictly more cells than
+        without, and the merged outputs (exchange + skip, trim on or off)
+        must equal the plain run (no exchange, no skip) byte for byte. With
+        trim on (no NaN/+inf rows here) the PARTIALS must also equal the
+        exchange run with skipping off: every skipped cell is below the
+        applied threshold the trim cuts at."""
+        monkeypatch.setattr(sp, "DOC_BLOCK", 64)
+        if cpu_topk:
+            _cpu_topk(monkeypatch)
+        cdir, qpath = _rev_data(tmp_path)
+        s = _rev_specs(case)
+        ref, _ = _rev_run(tmp_path, cdir, qpath, s, case + "_ref", "off", 64, num_jobs=2,
+                          per_rank=True)
+        own, u_own = _rev_run(tmp_path, cdir, qpath, s, case + "_own", "on", 64, num_jobs=2,
+                              per_rank=True, elide=elide)
+        p_ext, p_xoff = {}, {}
+        ext, u_ext = _rev_run(tmp_path, cdir, qpath, s, case + "_ext", "on", 64, num_jobs=2,
+                              exchange=True, per_rank=True, trim=trim, elide=elide,
+                              partials=p_ext)
+        assert ref == own == ext
+        if trim:
+            xoff, _ = _rev_run(tmp_path, cdir, qpath, s, case + "_xoff", "off", 64,
+                               num_jobs=2, exchange=True, per_rank=True, partials=p_xoff)
+            assert xoff == ref
+            assert p_ext and set(p_ext) == set(p_xoff), (sorted(p_ext), sorted(p_xoff))
+            assert p_ext == p_xoff
+        assert set(u_ext) == {0, 1} and set(u_own) == {0, 1}, (u_own, u_ext)
+        for u in list(u_own.values()) + list(u_ext.values()):
+            assert u["check_failures"] == 0 and u["disabled"] is None, u
+        assert u_ext[1]["dead"] > u_own[1]["dead"], (u_own[1], u_ext[1])
 
     @pytest.mark.parametrize("case", ["dot+cos", "two_k", "filtered", "filtered+unfiltered"])
     def test_e2e_shared_raw(tmp_path, monkeypatch, case):

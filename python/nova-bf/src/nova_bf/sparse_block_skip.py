@@ -2,7 +2,8 @@
 (prototype, on by default; `params.sparse_block_skip: off` disables it).
 
 Skip document sub-blocks whose maximum possible score is below the
-query's running top-k threshold. Live cells are scored exactly as in
+query's running top-k threshold (raised to the cross-worker threshold
+under `threshold_exchange`). Live cells are scored exactly as in
 the unskipped kernel, preserving the final results.
 
 Steps:

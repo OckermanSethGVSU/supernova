@@ -349,7 +349,10 @@ class ParamsConfig(BaseModel):
     sparse_kernel: Literal["auto", "posting", "cusparse"] = "auto"
     # Sparse block-max skipping for the sparse posting kernel's hot path.
     # "on" (default) enables it; "off" disables skipping; "overhead" builds bounds
-    # without skipping to measure overhead. Results are unchanged.
+    # without skipping to measure overhead. Final (merged) results are
+    # unchanged. Skipping uses each query's effective threshold, raised to
+    # the cross-worker one under `threshold_exchange`; partials may then hold
+    # fewer entries below that threshold (none the merge could select).
     # Requires every search on the sparse vector to be a dot search (filters,
     # `rows` subsets, different k, and dense searches beside them are fine);
     # a sparse cosine search turns it off for that vector.
