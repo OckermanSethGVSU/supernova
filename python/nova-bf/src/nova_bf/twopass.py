@@ -773,20 +773,20 @@ def exact_math_mode_flags(device) -> str | None:
     if emu is not None and emu != "0":
         return (f"CUBLAS_EMULATE_SINGLE_PRECISION={emu!r} enables cuBLAS "
                 f"single-precision emulation. bf16x9 and friends are not the "
-                f"IEEE binary32 arithmetic (R2) describes, however accurate "
+                f"IEEE binary32 arithmetic the bound assumes, however accurate "
                 f"they are, and the `1 + 2**-13` probe cannot see them")
 
     strategy = os.environ.get("CUBLAS_EMULATION_STRATEGY")
     if strategy:
         return (f"CUBLAS_EMULATION_STRATEGY={strategy!r} is set; even with the "
                 f"enable flag unset this signals an emulation configuration "
-                f"P3 does not admit")
+                f"the exact pass does not admit")
 
     override = os.environ.get("TORCH_ALLOW_TF32_CUBLAS_OVERRIDE")
     if override and override not in ("0", "false", "False", ""):
         return (
             f"TORCH_ALLOW_TF32_CUBLAS_OVERRIDE={override!r} is set, which "
-            f"makes cuBLAS matmul default to TF32. (R2) and the `gamma_d` "
+            f"makes cuBLAS matmul default to TF32. The exact-pass error model and the `gamma_d` "
             f"term are stated for IEEE binary32 round-to-nearest"
         )
 
@@ -795,13 +795,13 @@ def exact_math_mode_flags(device) -> str | None:
         prec = m.fp32_precision
     except Exception as exc:           # noqa: BLE001
         return (f"torch cannot report `matmul.fp32_precision` ({exc!r}), so "
-                f"the exact pass's arithmetic mode is unknown; P3 needs it "
+                f"the exact pass's arithmetic mode is unknown; the bound needs it "
                 f"KNOWN, not assumed")
 
     # Accept only settings that resolve to full binary32 computation.
     if prec not in ("ieee", "none"):
         return (f"the exact pass would run with matmul.fp32_precision="
-                f"{prec!r}. (R2) and the `gamma_d` term are stated for IEEE "
+                f"{prec!r}. The exact-pass error model and the `gamma_d` term are stated for IEEE "
                 f"binary32 round-to-nearest; anything else adds an input "
                 f"conversion error the bound does not carry")
 
@@ -809,11 +809,11 @@ def exact_math_mode_flags(device) -> str | None:
         if m.allow_tf32:
             return ("the exact pass would run with "
                     "torch.backends.cuda.matmul.allow_tf32=True, which is not "
-                    "the binary32 arithmetic (R2) describes")
+                    "the binary32 arithmetic the bound assumes")
     except Exception:                  # noqa: BLE001
         # An unreadable legacy/new API state is not evidence that TF32 is off.
         return ("torch reports a mixed legacy/new TF32 API state for cuBLAS "
-                "matmul, so `allow_tf32` cannot be read; P3 is not established")
+                "matmul, so `allow_tf32` cannot be read; binary32 arithmetic is not established")
 
     return None
 
@@ -846,7 +846,7 @@ def probe_exact_math_mode(device) -> str | None:
     except Exception as exc:                       # noqa: BLE001
         return (
             f"the exact-pass arithmetic probe could not run on {device} "
-            f"({exc!r}). P3 needs the arithmetic mode KNOWN, and a probe that "
+            f"({exc!r}). The bound needs the arithmetic mode KNOWN, and a probe that "
             f"did not complete has established nothing"
         )
     if got != x:
@@ -854,7 +854,7 @@ def probe_exact_math_mode(device) -> str | None:
             f"the exact-pass GEMM on {device} returned {got!r} for a product "
             f"whose binary32 value is {x!r}. `1 + 2**-13` survives binary32 "
             f"and collapses to 1.0 under TF32 (10 mantissa bits) or bfloat16 "
-            f"(7), so this GEMM is not doing the arithmetic (R2) assumes -- "
+            f"(7), so this GEMM is not doing the arithmetic the bound assumes -- "
             f"whatever the precision flags report"
         )
     return None
@@ -979,7 +979,7 @@ def prunability_cut(qn, cn_min: float):
 
 # Evaluate guards on the GPU to avoid host synchronization before pass one.
 # Match host-side comparisons and precision, using float64 where required
-# by the proof. Refused slices receive +inf bounds, preventing pruning.
+# by the bound. Refused slices receive +inf bounds, preventing pruning.
 # Guard results are read back together after the kernel is launched.
 
 # Refusal priority matches the original host-side checks.
@@ -1824,7 +1824,7 @@ _STATS = {
     # and a classifier has to be right at every site. A string that steers behaviour is a
     # classifier, and a classifier has to be right at every site.
     "last_refusal_reason": None,
-    # Worst absolute pass-one maximum relative to Theorem 1's cap,
+    # Worst absolute pass-one maximum relative to the cosine bound's cap,
     # including tile maxima. Values above 1 force rows live.
     "rowmax_worst_ratio": None,
     "probe_accum_worst_rel": None,
@@ -2171,7 +2171,7 @@ def corpus_side(Cb, col_scale, cn=None, device_scalars=False):
         cn = Cb.float().norm(dim=1)
     elif cn.dtype is not torch.float32:
         raise ValueError(
-            f"two-pass: corpus norms must be binary32 (R4 is stated for the "
+            f"two-pass: corpus norms must be binary32 (the norm error model is stated for the "
             f"computed binary32 norm); got {cn.dtype}")
     elif cn.shape != (Cb.shape[0],):
         raise ValueError(
@@ -2211,7 +2211,7 @@ def bound(qs: dict, d: int, sigma_max, half_out: bool, metric, fmt_q=None,
     # Dot product applies no query-side scaling.
     if metric == "dot" and qs["row_scale"] is not None:
         raise ValueError(
-            "two-pass: metric='dot' applies no scaling, so Theorem 1' is "
+            "two-pass: metric='dot' applies no scaling, so the dot bound is "
             "stated at rho = sigma = 1; passing a row_scale means the bound "
             "would describe different arithmetic than the pass performed"
         )
@@ -2226,8 +2226,8 @@ def bound(qs: dict, d: int, sigma_max, half_out: bool, metric, fmt_q=None,
 
     if metric not in ("cosine", "dot"):
         raise ValueError(
-            f"two-pass: no bound is derived for metric={metric!r}. Theorem 1 "
-            f"covers cosine and Theorem 1' covers dot; euclidean is scored by "
+            f"two-pass: no bound is derived for metric={metric!r}. The bound "
+            f"covers cosine and dot only; euclidean is scored by "
             f"the one-pass path"
         )
 
@@ -2235,7 +2235,7 @@ def bound(qs: dict, d: int, sigma_max, half_out: bool, metric, fmt_q=None,
         # Dot-product error depends on the largest corpus norm in the slice.
         if cn_max is None:
             raise ValueError(
-                "two-pass: metric='dot' needs cn_max = max_S N_c; Theorem 1' "
+                "two-pass: metric='dot' needs cn_max = max_S N_c; the dot bound "
                 "has no scale-free constant and E is proportional to it"
             )
 
@@ -2840,7 +2840,7 @@ def _upper_bounds(Q, Cb, col_scale, row_scale, out_dtype, metric,
     # Enforce the metric's corpus-scaling contract.
     if metric == "dot" and col_scale is not None:
         raise ValueError(
-            "two-pass: metric='dot' applies no corpus scaling, so Theorem 1' "
+            "two-pass: metric='dot' applies no corpus scaling, so the dot bound "
             "is stated at sigma = 1 and `eps_dot` never reads sigma_max; "
             "passing a col_scale means pass one's output is scaled by a "
             "factor the bound does not account for"
@@ -3261,7 +3261,7 @@ def _check_rowmax_magnitude(approx, d, fmt_q, fmt_c, half_out, metric,
         _ROWMAX_MAG_WARNED = True
         logger.warning(
             "two-pass: a first-pass %s maximum of magnitude %.6g exceeds the "
-            "%.6g that Theorem 1 admits at d=%d. The affected rows will be "
+            "%.6g that the cosine bound admits at d=%d. The affected rows will be "
             "forced live; check the applied scales and `probe_scales`.",
             what, worst, cap, d,
         )

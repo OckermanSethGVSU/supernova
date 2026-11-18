@@ -68,8 +68,12 @@ try:
             # issues no score load at all (and is then dead below: thr > -inf
             # whenever anything was proven dead).
             # Explicit booleans throughout (an int8 flag never feeds a mask
-            # directly; triton 3.9's interpreter rejects that).
-            ra_live = _tl.broadcast_to(_tl.load(ROWANY + row) != 0, [BLOCK])
+            # directly; triton 3.9's interpreter rejects that). The row flag is
+            # compared on a full-width tensor rather than compared as a scalar
+            # and broadcast: under 3.9's interpreter `m & broadcast(scalar
+            # bool)` comes out int32-typed, which a load's mask also rejects.
+            ra_live = (_tl.zeros([BLOCK], dtype=_tl.int8)
+                       + _tl.load(ROWANY + row)) != 0
             lm = m & (_tl.load(LMASK + row * n_sub_l + offs // LSUB,
                                mask=m & ra_live, other=0) != 0)
             s = _tl.load(S + row * stride_s + offs, mask=lm, other=float("-inf"))

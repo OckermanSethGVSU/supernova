@@ -17,8 +17,6 @@ from __future__ import annotations
 
 import os
 import re
-import subprocess
-import sys
 
 import numpy as np
 import pytest
@@ -31,17 +29,11 @@ def test_the_interpreted_suite_passes():
     """Re-run this file with `TRITON_INTERPRET=1` set before `import triton`."""
     if _CHILD:
         pytest.skip("this process IS the interpreted child")
-    env = dict(os.environ)
-    env["TRITON_INTERPRET"] = "1"
-    env["NOVA_BF_SPARSE_POSTING_INTERPRET_CHILD"] = "1"
-    env.pop("NOVA_BF_NO_SPARSE_POSTING", None)
-    env["PYTHONPATH"] = os.pathsep.join(
-        [p for p in sys.path if p] + [env.get("PYTHONPATH", "")]).strip(os.pathsep)
-    proc = subprocess.run(
-        [sys.executable, "-m", "pytest", "-q", "--no-header",
-         "-p", "no:cacheprovider", os.path.abspath(__file__)],
-        env=env, capture_output=True, text=True, timeout=3600,
-    )
+    import interpret_child
+
+    # In parallel on the whole machine: see tests/interpret_child.py.
+    proc = interpret_child.run(__file__, "NOVA_BF_SPARSE_POSTING_INTERPRET_CHILD",
+                               env_drop=("NOVA_BF_NO_SPARSE_POSTING",))
     assert proc.returncode == 0, (
         f"the interpreted sparse-posting suite failed:\n{proc.stdout}\n{proc.stderr}")
     m = re.search(r"(\d+) passed", proc.stdout)

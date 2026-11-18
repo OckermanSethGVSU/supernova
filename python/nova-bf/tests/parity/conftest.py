@@ -135,7 +135,13 @@ def client():
                        reason=f"qdrant_client is not installed ({exc})")
         _unavailable()
     try:
-        c = qdrant_client.QdrantClient(url=QDRANT_URL, timeout=60)
+        # Reuse Qdrant connections to avoid exhausting TCP ports during
+        # parallel tests. Expire idle connections before the server's
+        # 5-second keep-alive timeout.
+        import httpx
+
+        c = qdrant_client.QdrantClient(url=QDRANT_URL, timeout=60,
+            limits=httpx.Limits(max_keepalive_connections=16, keepalive_expiry=2.0))
         c.get_collections()
     except Exception as exc:  # pragma: no cover - environment gate
         _QDRANT.update(probed=True, reachable=False,

@@ -44,7 +44,13 @@ EPOCH0 = datetime(2010, 1, 1, tzinfo=timezone.utc)
 @pytest.fixture(scope="module")
 def client():
     try:
-        c = QdrantClient(url=QDRANT_URL, timeout=10)
+        # Reuse Qdrant connections to prevent TCP port exhaustion during
+        # parallel tests. Expire idle connections before Qdrant's 5-second
+        # keep-alive timeout.
+        import httpx
+
+        c = QdrantClient(url=QDRANT_URL, timeout=10,
+            limits=httpx.Limits(max_keepalive_connections=16, keepalive_expiry=2.0))
         c.get_collections()
     except Exception as e:  # pragma: no cover - environment gate
         pytest.skip(f"no reachable Qdrant at {QDRANT_URL}: {e}")

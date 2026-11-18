@@ -1,4 +1,4 @@
-"""Block-max sub-block skipping in the sparse posting kernel (PROTOTYPE),
+"""Block-max sub-block skipping in the sparse posting kernel,
 executed for real on CPU in the Triton interpreter.
 
 What is checked (see python/nova-bf/docs/sparse_block_skip_prototype.md):
@@ -29,14 +29,13 @@ from __future__ import annotations
 
 import os
 import re
-import subprocess
-import sys
 
 import numpy as np
 import pytest
 
 _CHILD = os.environ.get("NOVA_BF_SPARSE_BLOCKSKIP_INTERPRET_CHILD") == "1"
 _MIN_CHILD_TESTS = 180
+_MIN_CHILD_TESTS_FAST = 150   # `-m "not slow"`: 290 minus 66 e2e minus 60 grid cells
 _ENV_KEYS = ("NOVA_BF_NO_SPARSE_POSTING", "NOVA_BF_SPARSE_BLOCK_SKIP",
              "NOVA_BF_SPARSE_BLOCK_SKIP_SUB", "NOVA_BF_SPARSE_BLOCK_SKIP_ELIDE",
              "NOVA_BF_SPARSE_BLOCK_SKIP_BUDGET_MIB", "NOVA_BF_NO_TOPK_SELECT",
@@ -44,28 +43,34 @@ _ENV_KEYS = ("NOVA_BF_NO_SPARSE_POSTING", "NOVA_BF_SPARSE_BLOCK_SKIP",
              "NOVA_BF_SPARSE_BLOCK_SKIP_CHECK")
 
 
-def test_the_interpreted_suite_passes():
-    """Re-run this file with `TRITON_INTERPRET=1` set before `import triton`."""
+def test_the_interpreted_suite_passes(request):
+    """Re-run this file with `TRITON_INTERPRET=1` set before `import triton`.
+
+    The parent's `-m` expression is forwarded, so `pytest -m "not slow"`
+    (the fast tier) also drops the child's `slow` cases -- the end-to-end
+    runs and two thirds of the random-contract grid, ~33 of its ~44 serial
+    minutes on CPU; a plain `pytest` still runs all of them. The child runs
+    in parallel (tests/interpret_child.py)."""
     if _CHILD:
         pytest.skip("this process IS the interpreted child")
-    env = dict(os.environ)
-    env["TRITON_INTERPRET"] = "1"
-    env["NOVA_BF_SPARSE_BLOCKSKIP_INTERPRET_CHILD"] = "1"
-    for k in _ENV_KEYS:
-        env.pop(k, None)
-    env["PYTHONPATH"] = os.pathsep.join(
-        [p for p in sys.path if p] + [env.get("PYTHONPATH", "")]).strip(os.pathsep)
-    proc = subprocess.run(
-        [sys.executable, "-m", "pytest", "-q", "--no-header",
-         "-p", "no:cacheprovider", os.path.abspath(__file__)],
-        env=env, capture_output=True, text=True, timeout=3600,
-    )
+    import interpret_child
+
+    markexpr = request.config.getoption("markexpr") or ""
+    # Spread over xdist workers on the whole machine (~43 -> ~8 min at 8):
+    # see tests/interpret_child.py, NOVA_BF_INTERPRET_WORKERS=1 for serial.
+    proc = interpret_child.run(__file__, "NOVA_BF_SPARSE_BLOCKSKIP_INTERPRET_CHILD",
+                               env_drop=_ENV_KEYS, markexpr=markexpr)
     assert proc.returncode == 0, (
         f"the interpreted block-skip suite failed:\n{proc.stdout}\n{proc.stderr}")
     m = re.search(r"(\d+) passed", proc.stdout)
     assert m, f"the child reported no passing tests:\n{proc.stdout}"
-    assert int(m.group(1)) >= _MIN_CHILD_TESTS, (
-        f"the interpreted child ran only {m.group(1)} tests:\n{proc.stdout}")
+    # A floor for the full run and for the fast tier; any other `-m`
+    # selection is the caller's choice.
+    floor = {"": _MIN_CHILD_TESTS, "notslow": _MIN_CHILD_TESTS_FAST}.get(
+        markexpr.replace(" ", ""))
+    if floor is not None:
+        assert int(m.group(1)) >= floor, (
+            f"the interpreted child ran only {m.group(1)} tests:\n{proc.stdout}")
 
 
 # --- ordinary (non-interpreted) process --------------------------------------
@@ -400,10 +405,24 @@ if _CHILD:
 
     # --- (a) skip posting kernel ---------------------------------------------
 
-    @pytest.mark.parametrize("db,sub", SHAPES)
-    @pytest.mark.parametrize("hot_tokens", [64, 3])
-    @pytest.mark.parametrize("n_rows", [300, 64 * 5 + 1, 1000 + 37])
-    @pytest.mark.parametrize("k", [1, 7, 40])
+    # The full 5 x 2 x 3 x 3 grid (90 cells, ~5.8 s each interpreted) runs in
+    # the full tier. `k` only moves the threshold -- the launches are the same
+    # for every k -- so the fast tier keeps a Latin-square third of it (one k
+    # per (shape, hot, n_rows) cell, k index = (shape + hot + n_rows) % 3):
+    # every shape x hot x n_rows cell still runs, every (shape, k), (hot, k)
+    # and (n_rows, k) pair still occurs, and every shape still sees both
+    # elision modes. The other 60 cells are marked `slow`.
+    _RC_HOT, _RC_ROWS, _RC_K = [64, 3], [300, 64 * 5 + 1, 1000 + 37], [1, 7, 40]
+    _RC_GRID = [
+        pytest.param(db, sub, h, n, k, id=f"{k}-{n}-{h}-{db}-{sub}",
+                     marks=() if ki == (si + hi + ni) % 3 else pytest.mark.slow)
+        for si, (db, sub) in enumerate(SHAPES)
+        for hi, h in enumerate(_RC_HOT)
+        for ni, n in enumerate(_RC_ROWS)
+        for ki, k in enumerate(_RC_K)
+    ]
+
+    @pytest.mark.parametrize("db,sub,hot_tokens,n_rows,k", _RC_GRID)
     def test_random_contract(monkeypatch, db, sub, hot_tokens, n_rows, k):
         elide = (n_rows + k) % 2 == 0          # both elision modes across the grid
         _setup(monkeypatch, db, sub, hot_tokens, elide)

@@ -31,6 +31,7 @@ import pytest
 from nova_bf import nativetok
 from nova_bf.tokenizer_tables.qdrant_word_chars import WORD_CHAR_RANGES
 from nova_bf.tokenizer_tables.rust_case_props import CASE_IGNORABLE_RANGES, CASED_RANGES
+from nova_bf.tokenizer_tables.rust_case_props import UNICODE_VERSION as TABLES_UNICODE
 from nova_bf.tokenize import TOKEN_SPLIT_PATTERN, tokenize, tokenize_many
 
 # Built = importable with the required features. Token tests then run against
@@ -219,9 +220,29 @@ def test_every_case_context_matches_rust_to_lowercase(rust_lower):
         assert not bad, f"{len(bad)} native mismatches, e.g. {bad[:5]}"
 
 
-def test_case_tables_are_rusts(rust_lower):
-    """`tokenizer_tables.rust_case_props` against rustc directly: `A c Σ` / `c Σ` / `AΣ c`
-    end in final sigma exactly as the recorded classes predict."""
+@pytest.fixture(scope="module")
+def rustc_unicode(tmp_path_factory):
+    """The local rustc's `char::UNICODE_VERSION`, as "major.minor.update"."""
+    if shutil.which("rustc") is None:
+        pytest.skip("rustc not on PATH")
+    d = tmp_path_factory.mktemp("rsu")
+    (d / "u.rs").write_text('fn main() { let (a, b, c) = char::UNICODE_VERSION; '
+                            'println!("{a}.{b}.{c}"); }\n')
+    subprocess.run(["rustc", "-o", str(d / "u"), str(d / "u.rs")], check=True)
+    return subprocess.run([str(d / "u")], capture_output=True, text=True,
+                          check=True).stdout.strip()
+
+
+def test_case_tables_are_rusts(rust_lower, rustc_unicode):
+    """Check Rust case-property tables against rustc using final-sigma examples.
+
+    Requires matching Unicode versions; differences across versions do not
+    indicate incorrect tables. Regenerate the tables when updating the
+    Rust/Qdrant toolchain.
+    """
+    if rustc_unicode != TABLES_UNICODE:
+        pytest.skip(f"local rustc has Unicode {rustc_unicode}; the case tables were "
+                    f"generated from Unicode {TABLES_UNICODE}")
     ci = {c for lo, hi in CASE_IGNORABLE_RANGES for c in range(lo, hi + 1)}
     cased = {c for lo, hi in CASED_RANGES for c in range(lo, hi + 1)}
     rng = random.Random(5)

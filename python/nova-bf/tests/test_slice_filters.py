@@ -211,7 +211,25 @@ def test_select_masks_match_independent_masks_end_to_end(tmp_path, monkeypatch, 
             return got
 
     monkeypatch.setattr(compute, "_SliceFilters", Rec)
+    # nova-bf may REORDER the query rows so each search's rows are contiguous
+    # (on CUDA, where that enables the two-pass). A filter's mask is then in
+    # that order, not file order, so record the order it chose.
+    orders = []
+    real_layout = compute._vt_row_layout
+
+    def layout(*a, **kw):
+        out = real_layout(*a, **kw)
+        orders.append(out[0])
+        return out
+
+    monkeypatch.setattr(compute, "_vt_row_layout", layout)
     run_compute(cfg)
+    # Only an APPLIED reorder changes the layout: the manifest says so (on CPU
+    # an order can be found and then not used -- there is no two-pass to gain).
+    import json
+    man = json.loads(next((tmp_path / "out").rglob("*manifest*.json")).read_text())
+    applied = man["params"]["query_row_layout"].get("dense", {}).get("status") == "reordered"
+    order = next((o for o in orders if o is not None), None) if applied else None
 
     # Independent oracle: the CPU evaluator over the whole file and ALL queries
     # (a query's allowed rows do not depend on the other queries). A per-query
@@ -261,7 +279,10 @@ def test_select_masks_match_independent_masks_end_to_end(tmp_path, monkeypatch, 
             else:
                 assert none_sel
         else:
-            want = full[s.filter][filter_rows[s.filter]][:, cols]
+            rows = filter_rows[s.filter]
+            if order is not None:   # the mask follows the reordered layout
+                rows = np.asarray(order)[np.isin(order, rows)]
+            want = full[s.filter][rows][:, cols]
             if cm is None:
                 assert none_sel and not want.any()
             else:

@@ -54,10 +54,11 @@ POISON_ID = 2**61 + 12345
 
 
 def poisoning_pack_topk(scores, ordinal, k, scale=None, thr=None, encoded=None,
-                        rank=None, cscale=None):
+                        rank=None, cscale=None, lmask=None):
     """`pack_topk`, with `_cutfill`'s uninitialized-dead-row contract."""
     keys, vals, live = _real_pack_topk(scores, ordinal, k, scale, thr=thr,
-                                       encoded=encoded, rank=rank, cscale=cscale)
+                                       encoded=encoded, rank=rank, cscale=cscale,
+                                       lmask=lmask)
     if live is not None:
         dead = live == 0
         if dead.any():
@@ -76,11 +77,12 @@ _state = {"folds": 0, "dead_rows_seen": 0, "available_false": 0,
 
 
 def counting_pack_topk(scores, ordinal, k, scale=None, thr=None, encoded=None,
-                       rank=None, cscale=None):
+                       rank=None, cscale=None, lmask=None):
     """Count without poisoning — for `native`, where the real kernel has
     already left dead rows uninitialized on its own."""
     keys, idx, live = _real_pack_topk(scores, ordinal, k, scale, thr=thr,
-                                      encoded=encoded, rank=rank, cscale=cscale)
+                                      encoded=encoded, rank=rank, cscale=cscale,
+                                      lmask=lmask)
     if live is not None:
         dead = int((live == 0).sum())
         _state["dead_rows_seen"] += dead

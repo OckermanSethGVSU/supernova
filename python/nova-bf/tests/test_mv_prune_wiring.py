@@ -456,6 +456,7 @@ def test_the_prune_statistics_reach_the_manifest_on_cpu(
     manifest must say so with the same numbers the log line reports."""
     import logging
 
+    monkeypatch.setenv("NOVA_BF_DEVICE", "cpu")   # the CPU decline is the point
     monkeypatch.delenv("NOVA_BF_MV_PRUNE_AUDIT", raising=False)
     monkeypatch.delenv("NOVA_BF_PRUNE_TIMING", raising=False)
     cdir, qpath = many_docs
@@ -489,6 +490,7 @@ def test_off_records_the_block_as_not_permitted(tmp_path, corpus_and_queries):
 
 
 def test_a_certification_refusal_is_named(tmp_path, many_docs, monkeypatch):
+    monkeypatch.setenv("NOVA_BF_DEVICE", "cpu")   # the message names the device
     monkeypatch.setattr(mv_fp16, "certify", lambda dim, device: "test refusal")
     cdir, qpath = many_docs
     cfg, out = _mv_manifest_cfg(tmp_path, cdir, qpath, "fp16", "mf_cert", k=2)
@@ -589,6 +591,7 @@ def test_pruned_pairs_and_the_audit_reach_the_manifest(
     import logging
 
     cdir, qpath = many_docs
+    monkeypatch.setenv("NOVA_BF_DEVICE", "cpu")   # `_cpu_exact_prune` is a CPU stand-in
     monkeypatch.setattr(mv_fp16.Fp16State, "score", _cpu_exact_prune)
     monkeypatch.setenv("NOVA_BF_MV_PRUNE_AUDIT", "1")
     monkeypatch.setenv("NOVA_BF_PRUNE_TIMING", "1")
@@ -655,6 +658,7 @@ def test_pruned_counts_only_owned_rows_even_with_an_infinite_threshold(
     import torch
 
     cdir, qpath = many_docs
+    monkeypatch.setenv("NOVA_BF_DEVICE", "cpu")   # `_cpu_exact_prune` is a CPU stand-in
     real_thr = cm._mv_full_threshold
 
     def thr_with_inf(*a, **kw):

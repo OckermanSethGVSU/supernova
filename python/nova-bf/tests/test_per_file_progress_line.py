@@ -37,8 +37,8 @@ TP_LINE = re.compile(
 )
 
 
-# `dim` is 64, not 8: the closed-form bound's P6 requires `64 <= d <= 2**20`
-# (Lemma 2' needs `d >= 64` for its block count), so below it `upper_bounds`
+# `dim` is 64, not 8: the closed-form bound admits only `64 <= d <= 2**20`
+# (the accumulation model needs `d >= 64` for its block count), so below it `upper_bounds`
 # refuses every row, the two-pass never engages, and no progress rows exist to
 # take a delta of.
 def _corpus(root, n_files=4, rows=32, dim=64, seed=0):

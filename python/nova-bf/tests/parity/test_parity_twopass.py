@@ -183,8 +183,22 @@ def _run(ds, specs, *, tag, device, params=None):
     p = {"dense_batch_size": BATCH}
     p.update(params or {})
     cfg = build_config(ds, specs, out_tag=f"{tag}_{device or 'auto'}", params=p)
+    _LAST_CFG["cfg"] = cfg
     with pinned_device(device):
         return read_results(run_compute(cfg))
+
+
+_LAST_CFG: dict = {}
+
+
+def _last_row_layout() -> dict:
+    """The `query_row_layout` the last `_run` recorded in its manifest."""
+    import json
+    from pathlib import Path
+
+    out = Path(_LAST_CFG["cfg"].output.path)
+    man = sorted(out.rglob("*manifest*.json"), key=lambda q: q.stat().st_mtime)[-1]
+    return json.loads(man.read_text())["params"]["query_row_layout"]
 
 
 def device_is_cuda():
@@ -573,18 +587,25 @@ def _assert_subset_agrees(got, want, members, *, label):
                 label=f"{label} {name} q{qi}")
 
 
+@pytest.mark.parametrize("reorder", ["default", "off"])
 def test_a_gathered_row_subset_is_refused_not_mishandled(ds_wide, oracle_wide,
-                                                         device, forced):
-    """A member whose query rows are NOT contiguous must take the ordinary path.
+                                                         device, forced, reorder,
+                                                         monkeypatch):
+    """A member whose query rows are NOT contiguous must never be scored as if
+    they were.
 
-    `_twopass_groups` requires `qsel is None or isinstance(qsel, slice)`,
-    because the live index is sorted and a member's live rows are read as a
-    contiguous SPAN of it. An interleaved selector (`query_set` is even/odd
-    here) resolves to a gathered index tensor, for which that span assumption
-    is false — a group admitted anyway would hand each member the wrong rows.
+    The two-pass reads a member's live rows as a contiguous SPAN of the sorted
+    live index, so an interleaved selector (`query_set` even/odd here) taken
+    as a gathered index tensor would hand each member the wrong rows.
 
-    So this pins the refusal itself: the two-pass must not fire, and the
-    answers must still be right. It is the eligibility guard's only test.
+    Production handles it in two ways, and each is pinned here:
+      * `default`: nova-bf REORDERS the query rows (`_vt_row_layout`,
+        bit-checked) so every member's rows are contiguous; the two-pass may
+        then run, but only if the manifest says the rows were `reordered`.
+      * `off` (`NOVA_BF_NO_ROW_REORDER=1`): the layout falls back to gathers,
+        and `_twopass_groups` must REFUSE (`qsel` is not a slice).
+    Either way the answers must be the oracle's. (Before the reorder landed
+    this test only had the `off` half; on CUDA the default now reorders.)
     """
     specs = [
         spec("even", vector_type="dense", metric="cosine", k=K,
@@ -601,11 +622,20 @@ def test_a_gathered_row_subset_is_refused_not_mishandled(ds_wide, oracle_wide,
          tag="tp_gathered_ctl", device=device)
     _assert_it_pruned(f"[{device}] gathered-subset control")
 
-    got = _run(ds_wide, specs, tag="tp_gathered", device=device)
+    if reorder == "off":
+        monkeypatch.setenv("NOVA_BF_NO_ROW_REORDER", "1")
+    else:
+        monkeypatch.delenv("NOVA_BF_NO_ROW_REORDER", raising=False)
+    got = _run(ds_wide, specs, tag=f"tp_gathered_{reorder}", device=device)
     st = twopass.stats()
-    assert st["slices_twopass"] == 0, (
-        f"[{device}] a gathered (non-slice) row subset was scored through the "
-        f"two-pass ({st}) — `span`/`dst` assume a contiguous slice")
+    layout = _last_row_layout().get("dense", {})
+    if reorder == "off" or layout.get("status") != "reordered":
+        assert st["slices_twopass"] == 0, (
+            f"[{device}] a gathered (non-slice) row subset was scored through the "
+            f"two-pass ({st}, layout {layout}) — `span`/`dst` assume a contiguous "
+            f"slice")
+    if reorder == "off":
+        assert layout.get("status") == "fallback", layout
 
     want = oracle_wide.topk(vector_type="dense", metric="cosine", k=K, filt=None)
     covered = set()
@@ -619,7 +649,7 @@ def test_a_gathered_row_subset_is_refused_not_mishandled(ds_wide, oracle_wide,
         for qi in expected:
             compare.assert_scores_agree(
                 got[name][qi], want[qi], metric="cosine",
-                label=f"[{device}] gathered {name} q{qi}")
+                label=f"[{device}] gathered {name} q{qi} (reorder={reorder})")
     assert covered == set(range(len(ds_wide.queries)))
 
 

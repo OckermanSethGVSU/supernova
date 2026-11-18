@@ -204,7 +204,7 @@ def test_the_twopass_charges_a_float16_stored_corpus_no_conversion_error():
     The measured-residual bound computed `dc = ||c - c_h||` and got exactly
     zero for a float16-stored corpus. The closed form has no residual to
     measure: it charges the corpus axis a conversion roundoff `u_c` from
-    Lemma 1, and the whole term VANISHES (`u_c = eta_c = 0`) when the values
+    the conversion error model, and the whole term VANISHES (`u_c = eta_c = 0`) when the values
     are already fp16-exact, because then `.half()` is the identity.
 
     Same fact, and it must still survive the path — host fp16, widened on the

@@ -541,6 +541,17 @@ def test_query_counts_distinguish_the_file_from_what_was_searched(ds, tmp_path):
 
 
 def test_code_versions_reports_git_for_an_in_repo_checkout():
+    import pathlib
+    import shutil
+    import subprocess
+
+    pkg = pathlib.Path(run_manifest.__file__).resolve().parent
+    inside = shutil.which("git") and subprocess.run(
+        ["git", "-C", str(pkg), "rev-parse", "--is-inside-work-tree"],
+        capture_output=True, text=True).stdout.strip() == "true"
+    if not inside:
+        pytest.skip("nova_bf is not inside a git checkout here (e.g. a staged copy "
+                    "on a test node), so there is no commit to report")
     info = run_manifest.code_versions()
     assert info.get("git_commit"), "in-repo run should still report a commit"
     assert len(info["git_commit"]) >= 7
@@ -645,7 +656,11 @@ def test_run_compute_refuses_duplicate_cuda_libraries_before_any_read(ds, tmp_pa
     out.mkdir()
     with pytest.raises(RuntimeError, match="two copies of a CUDA library"):
         run_compute(_cfg(ds, out))
-    assert seen == ["cpu"] and not read and not list(out.iterdir())
+    # The device run_compute itself chose (cpu on a laptop, cuda on a GPU box).
+    import torch
+
+    assert seen == [compute._select_device(torch)], seen
+    assert not read and not list(out.iterdir())
 
 
 # --- 18 + today's additions: the manifest records what RAN ----------------
@@ -944,11 +959,14 @@ def test_sparse_branches_are_counted_and_reset_per_run(tmp_path):
 
 
 def test_params_record_the_resolved_cpu_thread_count(ds, tmp_path):
-    """`params` is what RAN. `cpu_thread_count: 0` means "use os.cpu_count()",
-    so the configured value answers nothing when you are reading a manifest
-    later asking why one rank was slow — the resolved number has to be here.
+    """`params` is what RAN. `cpu_thread_count: 0` means "use every usable
+    CPU", so the configured value answers nothing when you are reading a
+    manifest later asking why one rank was slow — the resolved number has to
+    be here. "Usable" honours CPU affinity and cgroup quota, so compare with
+    that, not `os.cpu_count()` (they differ in a pinned container, or under
+    pytest-xdist, whose workers the conftest pins to a slice of the CPUs).
     """
-    import os as _os
+    from nova_bf.compute import _usable_cpu_count
 
     out = tmp_path / "cpu"
     out.mkdir()
@@ -956,7 +974,7 @@ def test_params_record_the_resolved_cpu_thread_count(ds, tmp_path):
 
     doc = _read(out / "_bf_manifest_queries_compute.json")
     got = doc["params"]["cpu_thread_count"]
-    assert got == (_os.cpu_count() or 1), (
+    assert got == _usable_cpu_count(), (
         f"expected the RESOLVED thread count, got {got!r}")
     assert got > 0
 

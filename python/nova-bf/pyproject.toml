@@ -22,7 +22,8 @@ compute = ["torch"]
 # Tests: pytest + torch (the compute-phase test runs the GPU topk path on CPU),
 # and qdrant-client for tests/parity (`query_points` and multivector configs
 # need >= 1.10; the live-Qdrant cases still skip without a server).
-dev = ["pytest", "torch", "qdrant-client>=1.10"]
+# pytest-xdist: `make test` runs the suite in parallel (see BF_WORKERS).
+dev = ["pytest", "pytest-xdist", "torch", "qdrant-client>=1.10"]
 
 # Exposes `nova-bf` on PATH so `nova bf ...` dispatches here like a Rust binary.
 [project.scripts]

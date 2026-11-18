@@ -10,8 +10,8 @@ notice.
 WHAT THIS FILE IS FOR, NOW THAT THE BOUND IS CLOSED-FORM
 --------------------------------------------------------
 `closed_form.py` owns the arithmetic and `tests/test_closed_form.py` owns its
-verification — differentially against the document's own script, against the
-document's published table, structurally, and by running both passes for real.
+verification — differentially against the independent checker script, against a
+hand-transcribed reference table, structurally, and by running both passes for real.
 None of that is repeated here.
 
 What `twopass` owns, and what this file tests, is the PLUMBING around it: which
@@ -51,8 +51,8 @@ from nova_bf import twopass
 from nova_bf.compute import _scores
 from nova_bf.tiebreak import TIE_WORST, pack, unpack_score
 
-# The dimension every `upper_bounds` fixture in this file uses. P6 admits only
-# `64 <= d <= 2**20` — below 64 Lemma 2' does not apply and pass one is refused
+# The dimension every `upper_bounds` fixture in this file uses. The bound admits only
+# `64 <= d <= 2**20` — below 64 the accumulation model does not apply and pass one is refused
 # outright, all rows live — so a fixture at d = 32 no longer tests the bound at
 # all, it tests the dimension guard. Fixtures that used to run at 32 were moved
 # up rather than left to pass for the wrong reason;
@@ -179,12 +179,12 @@ def test_a_subnormal_fp16_gram_is_still_bounded(metric, seed):
     max here, which silently kills live rows. `out_dtype=None` is the
     production setting, so this is the path the run takes.
 
-    Under the closed form the absolute terms live in `Psi` (Lemma 1's `eta`
-    for the conversions, Lemma 2's anchor for the accumulation) plus the
+    Under the closed form the absolute terms live in `Psi` (the conversion model's `eta`
+    for the conversions, the accumulation model's anchor term) plus the
     `ETA16 * rho * sigma_max` output term that `half_out` adds — so the same
     regime still has to be covered, just by different arithmetic.
 
-    Run at `DIM` rather than the original 32: P6 refuses anything below 64, so
+    Run at `DIM` rather than the original 32: the bound refuses anything below 64, so
     at 32 this would exercise the dimension guard and prove nothing about the
     subnormal regime. The magnitude is what makes the fixture, not the width —
     measured, 97% of the raw `q_h·c_h` entries here are below `2**-14`.
@@ -344,9 +344,9 @@ def test_the_stored_format_is_read_from_the_data_not_from_configuration():
     assert twopass.stored_format(torch.zeros(2, 4, dtype=torch.float16)) is cf.EXACT
     # NOT `cf.BF16`. `query_side` runs `Q.half()` unconditionally, so a
     # bfloat16 axis is converted bf16 -> FP16 and fp16's constants are the
-    # ones Lemma 1 needs. Charging bf16's `eta_t = 2**-134` and
+    # ones the conversion error model needs. Charging bf16's `eta_t = 2**-134` and
     # `lambda_t = 2**-126` to an fp16 conversion understates `Psi`'s anchor
-    # term by 2**112, and Lemma 1 is violated outright: a bf16 1.0e-8 flushes
+    # term by 2**112, and the conversion error model is violated outright: a bf16 1.0e-8 flushes
     # to zero under `.half()`, an error of 1e-8 against an allowance of 4e-11.
     assert twopass.stored_format(torch.zeros(2, 4, dtype=torch.bfloat16)) is cf.FP16
     assert twopass.stored_format(torch.zeros(2, 4)) is cf.FP16
@@ -364,7 +364,7 @@ def test_the_stored_format_is_read_from_the_data_not_from_configuration():
 
 
 def test_the_query_side_reports_the_applied_scale_not_a_recomputed_one():
-    """`rho_a` is P1's premise, made into data.
+    """`rho_a` is the scale-factor premise, made into data.
 
     """
     Q, _ = _make(64, 8, DIM, fp16_corpus=False, q_scale=1.0, c_scale=1.0,
@@ -379,8 +379,8 @@ def test_the_query_side_reports_the_applied_scale_not_a_recomputed_one():
         "`rho_a` is not the scale pass one applies")
     assert qs["rho_a"].dtype == np.float64
 
-    # A row whose stored reciprocal exceeds the binary64 `1/N` — the case P1 is
-    # written for. `rho_a` must carry the LARGER, applied value.
+    # A row whose stored reciprocal exceeds the binary64 `1/N` — the case the
+    # scale-factor band is written for. `rho_a` must carry the LARGER, applied value.
     bigger = row_scale.clone()
     bigger[3] = float(np.nextafter(np.float32(bigger[3]), np.float32(np.inf)))
     twopass.release()
@@ -583,9 +583,9 @@ def _cf_eps_for(Q, C, cs, rs, metric, half_out, corpus_is_fp16):
     """`eps` derived straight from the tensors, not from anything `twopass` built.
 
     This is the wiring oracle: it reads the formats and the scales off the data
-    the way the document says to, and calls `closed_form` directly. If
+    the way the bound specifies, and calls `closed_form` directly. If
     `bound()` picks up the wrong `Format`, forgets `row_scale`, applies the
-    cosine theorem to `dot` scores, or drops `half_out`, the two disagree.
+    cosine bound to `dot` scores, or drops `half_out`, the two disagree.
     """
     d = int(Q.shape[1])
     u_c, eta_c = (0.0, 0.0) if corpus_is_fp16 else (cf.U16, cf.ETA16)
@@ -608,16 +608,16 @@ def test_the_bound_is_the_closed_form_at_the_formats_and_scales_that_ran(
     Not a restatement of `bound()`'s body — the arithmetic is not repeated
     here at all. What is repeated is the DERIVATION OF ITS ARGUMENTS from the
     raw tensors: the per-axis storage format, the applied row and column
-    scales, the metric's theorem, and whether a float16 Gram was written. Every
+    scales, the metric's bound, and whether a float16 Gram was written. Every
     one of those is a decision `twopass` makes and `closed_form` cannot check,
     and every one of them fails silently:
 
       * the wrong `fmt_c` understates `eps` by 41% at d = 768;
       * a `sigma_max` or `rho` below what the kernel applied breaks the
         monotonicity `Psi`'s admissibility rests on;
-      * the cosine theorem on `dot` scores is four orders of magnitude small
+      * the cosine bound on `dot` scores is four orders of magnitude small
         on production norms, which the `metric` parameter's docstring records
-        as a real bug in an earlier draft;
+        as a real bug in an earlier version;
       * a dropped `half_out` silently forgives the fp16 output rounding.
     """
     twopass.reset()
@@ -640,7 +640,7 @@ def test_the_bound_is_the_closed_form_at_the_formats_and_scales_that_ran(
 
 
 def test_the_bound_is_evaluated_in_binary64_and_handed_back_as_binary32():
-    """P8's evaluation rule, at the boundary `twopass` is responsible for.
+    """The binary64 evaluation rule, at the boundary `twopass` is responsible for.
 
     `thr` is stored in binary32, so `eps` has to be a binary32 value — and it
     has to be the binary32 value ABOVE the real one, since whatever consumes it
@@ -676,15 +676,15 @@ def test_the_bound_is_evaluated_in_binary64_and_handed_back_as_binary32():
 
 
 def test_the_metric_has_no_default_and_dot_is_not_charged_cosines_constant():
-    """A caller that forgets to say which theorem applies must not be guessed for.
+    """A caller that forgets to say which bound applies must not be guessed for.
 
-    Theorem 1 bounds a quantity of magnitude at most `Lambda(d) ~ 1`; Theorem
-    1' bounds one that scales with `N_q * max_S N_c`. On the fixture below that
+    The cosine bound covers a quantity of magnitude at most `Lambda(d) ~ 1`; the
+    dot bound covers one that scales with `N_q * max_S N_c`. On the fixture below that
     is nearly three orders of magnitude, and on production norms four. Applying
     the cosine constant to `dot` scores gives an `eps` that small with no
     symptom anywhere — rows whose real score clears the threshold get an upper
     bound below it and are called dead. The `metric` parameter's own docstring
-    records this as a real bug in an earlier draft of the function, fixed by
+    records this as a real bug in an earlier version of the function, fixed by
     making the caller state it.
     """
     twopass.reset()
@@ -693,7 +693,7 @@ def test_the_metric_has_no_default_and_dot_is_not_charged_cosines_constant():
     with pytest.raises(TypeError):
         twopass.upper_bounds(Q, C, None, None, None)      # no metric
 
-    # Two DIFFERENT query sides: dot applies no scaling at all (Theorem 1' is
+    # Two DIFFERENT query sides: dot applies no scaling at all (the dot bound is
     # stated at rho = sigma = 1 exactly, and `bound` now refuses a dot call
     # carrying a scale), while cosine requires one.
     qs_dot = twopass.query_side(Q, None)
@@ -703,17 +703,17 @@ def test_the_metric_has_no_default_and_dot_is_not_charged_cosines_constant():
     e_cos = twopass.bound(qs_cos, DIM, 1.0, False, "cosine")
     assert float(np.min(e_dot)) > 100.0 * float(np.max(e_cos)), (
         f"the dot bound ({float(np.min(e_dot)):.3e}) is not scaling with the "
-        f"norms the way Theorem 1' says; it is within a factor of 100 of the "
+        f"norms the way the dot bound says; it is within a factor of 100 of the "
         f"cosine constant ({float(np.max(e_cos)):.3e})")
 
-    # euclidean is scored by the one-pass path and has no theorem here, so it
+    # euclidean is scored by the one-pass path and has no bound here, so it
     # is refused rather than given the nearest available constant.
     with pytest.raises(ValueError, match="no bound is derived for metric"):
         twopass.bound(qs_cos, DIM, 1.0, False, "euclidean")
 
 
 def test_the_measured_residual_machinery_is_really_gone():
-    """The ledger of Sec.13, as an assertion.
+    """The ledger of removed run-time measurements, as an assertion.
 
     Each of these was a constant or a measurement whose sufficiency had to be
     certified at run time, and each was removed because the closed form derives
@@ -764,7 +764,7 @@ def test_pass_one_is_charged_a_truncating_accumulator_not_a_rounding_one():
 
     This was `U_ACC = 2**-22`, a coefficient CHOSEN as 2x the published
     truncation model. It is now `closed_form.kappa_acc` — the same leading
-    `4du`, DERIVED as an envelope over every published generation (Lemma 2')
+    `4du`, DERIVED as an envelope over every published generation
     rather than picked. The constant went; the property it existed for did not,
     so it is asserted here on the function that replaced it.
 
@@ -872,7 +872,7 @@ def test_the_norm_guard_refuses_nan_rather_than_accepting_it():
     it (prunable, wrong), and the second reads like a harmless simplification.
 
     A non-finite component makes its row's norm non-finite, so this is also
-    what establishes P5 on both axes — the fused kernel's `tl.max` lowers to a
+    what establishes finite inputs on both axes — the fused kernel's `tl.max` lowers to a
     NaN-IGNORING PTX `max.f32` and would otherwise silently drop one.
     """
     norms = torch.tensor([1.0, float("nan"), float("inf"), -float("inf"), 0.0,
@@ -882,7 +882,7 @@ def test_the_norm_guard_refuses_nan_rather_than_accepting_it():
     bad = twopass.norm_guard(norms)
     assert bad.tolist() == [False, True, True, True, True, False, False, True], (
         f"the two-sided norm guard is not refusing what it must: {bad.tolist()}")
-    # The thresholds are the document's, not a value that drifted with an edit.
+    # The thresholds are the bound's, not a value that drifted with an edit.
     assert cf.NORM_MIN == 2.0 ** -40 and cf.NORM_MAX == 2.0 ** 126
     # And an empty axis is not an error — a zero-column slice is a real slice.
     assert twopass.norm_guard(torch.zeros(0)).shape == (0,)
@@ -906,8 +906,8 @@ def test_a_norm_that_underflowed_forces_every_row_live(side):
     Under the closed form the answer is the FLOOR of the two-sided norm guard,
     which is what the measured residual's `dq = inf` used to do implicitly. The
     floor also rose, from 2**-63 to 2**-40, and that is not cosmetic: it is
-    what makes Lemma 2's absolute term smaller than the 2**-44 reserve `C(d)`
-    carries, what makes (R4)'s fold tight enough for `kappa`'s
+    what makes the accumulation model's absolute term smaller than the 2**-44 reserve `C(d)`
+    carries, what makes the norm error model's fold tight enough for `kappa`'s
     `(1 + d 2**-70)` factor, and what keeps `1/N` normal so the scalings cannot
     themselves overflow. So the refusal is asserted as well as the safety.
     """
@@ -1350,7 +1350,7 @@ def test_the_overflow_guard_refuses_a_slice_that_would_overflow_on_conversion():
     MONOTONE in the norm, which is what makes one scalar comparison settle a
     whole axis — and why this can be a per-file check rather than a per-vector
     one. Evaluated with the INFLATED `kappa_bar` rather than a re-rounded
-    `kappa`: an inward-rounded comparison would not establish Theorem 1's
+    `kappa`: an inward-rounded comparison would not establish the cosine bound's
     hypothesis, and the `2**-40` margin absorbs the single binary64 rounding of
     the product itself.
     """
@@ -1768,7 +1768,7 @@ def test_a_pass_one_that_cannot_allocate_skips_the_slice_instead_of_retrying_big
     the two-pass can only lose ground truth by calling a row DEAD.
     """
     twopass.reset()
-    # `DIM`, not 16: P6 refuses anything below 64 BEFORE pass one is reached,
+    # `DIM`, not 16: the bound refuses anything below 64 BEFORE pass one is reached,
     # so a narrow fixture would exercise the dimension guard and never touch
     # the allocation handler under test.
     Q = torch.randn(8, DIM)
@@ -2438,7 +2438,7 @@ def test_a_dimension_below_the_proven_range_is_refused_not_approximated():
         torch.Tensor.__matmul__ = real_matmul
 
     assert bool(torch.isinf(upper).all()) and bool((upper > 0).all()), (
-        "d = 32 is outside P6, so there is no bound to evaluate and every row "
+        "d = 32 is outside the admitted dimensions, so there is no bound to evaluate and every row "
         "must be live")
     assert not seen, (
         f"pass one ran at an unproven dimension: {seen}")
@@ -2502,7 +2502,7 @@ def test_certification_state_is_three_valued_and_per_run():
 
 def test_a_scale_that_is_not_the_reciprocal_of_its_own_norm_is_refused():
     """
-    P1 is `(1-u)/N_i <= s_i <= (1+u)/N_i`, ELEMENTWISE, against the norm the
+    The scale-factor band is `(1-u)/N_i <= s_i <= (1+u)/N_i`, ELEMENTWISE, against the norm the
     exact pass divides by. An earlier version of this checked only
     `max(s) <= (1+u)/min(N)` — an upper bound on the largest scale — and that
     is not a technicality. It admits `row_scale = 0`, which is what this test
@@ -2552,7 +2552,7 @@ def test_a_scale_that_is_not_the_reciprocal_of_its_own_norm_is_refused():
 
     # A UNIFORM scale at the largest admitted value is also refused: it is a
     # valid bound on the maximum but is not `fl(1/N_i)` for any other row, and
-    # P1 is a statement about each entry against its OWN norm.
+    # The band is a statement about each entry against its OWN norm.
     uniform = torch.full_like(cn, float((1.0 + cf.U) / float(cn.min())))
     assert twopass.probe_scales(uniform, cn) is not None
 
@@ -2563,7 +2563,7 @@ def test_a_scale_that_is_not_the_reciprocal_of_its_own_norm_is_refused():
         assert twopass.probe_scales(s_bad, cn) is not None, v
 
     # THE BAND HAS NO SLACK, and that is deliberate. A correctly-rounded
-    # `fl(1/N)` sits within `u` of `1/N` — exactly the width P1 admits — so it
+    # `fl(1/N)` sits within `u` of `1/N` — exactly the width the band admits — so it
     # is already AT the edge. One further ulp in either direction is `~3u` from
     # `1/N` and is genuinely outside the hypothesis, so it is refused:
     for direction in (0.0, float("inf")):
@@ -2602,7 +2602,7 @@ def test_a_mismatched_scale_cannot_prune_because_the_guard_is_per_slice():
     assert float(exact[0]) > 0.99
     assert not bool((upper < 0.5).any()), (
         "a row with a perfect match in the slice was pruned on a zero query "
-        "scale — the P1 guard is not firing")
+        "scale — the scale-factor guard is not firing")
     assert bool(torch.isinf(upper).all()), "the refusal must be +inf (live)"
 
     # And the honest scale still prunes, so the guard has not simply disabled
@@ -2846,7 +2846,7 @@ def test_bound_refuses_the_two_argument_combinations_that_understate_eps():
     with pytest.raises(ValueError, match="row scale"):
         twopass.bound(qs_unscaled, DIM, 1.0, False, "cosine")
 
-    # dot with no `cn_max`: under Theorem 1' `E` is PROPORTIONAL to
+    # dot with no `cn_max`: under the dot bound `E` is PROPORTIONAL to
     # `max_S N_c`, so a default of 1.0 understates `eps` by exactly that
     # factor — ~28x at production norms.
     with pytest.raises(ValueError, match="cn_max"):
@@ -2862,7 +2862,7 @@ def test_bound_refuses_the_two_argument_combinations_that_understate_eps():
 
 def test_a_row_max_above_what_theorem_1_admits_is_recorded_and_warned(caplog):
     """`_check_rowmax_magnitude` is described as "a necessary condition of
-    Theorem 1's hypotheses" and could be deleted with no test failing.
+    the cosine bound's hypotheses" and could be deleted with no test failing.
 
     It is the only thing that notices a scale too LARGE on the corpus axis
     after the guards have passed — `probe_scales` catches it at certification,
@@ -2880,28 +2880,28 @@ def test_a_row_max_above_what_theorem_1_admits_is_recorded_and_warned(caplog):
     assert 0.0 < healthy < 1.0, healthy
 
     # Now feed the ROW MAX an inflated scale directly. `upper_bounds` would
-    # refuse an out-of-band `col_scale` at the P1 guard, so the magnitude check
+    # refuse an out-of-band `col_scale` at the scale-factor guard, so the magnitude check
     # is exercised through `_check_rowmax_magnitude` itself — which is exactly
-    # the layer that has to notice when P1 has been satisfied and the arithmetic
-    # is still not what the theorem describes.
+    # the layer that has to notice when the scale-factor band has been satisfied and the arithmetic
+    # is still not what the bound describes.
     twopass.reset()
     with caplog.at_level("WARNING"):
         twopass._check_rowmax_magnitude(
             torch.full((64,), 5.0), DIM, cf.FP16, cf.EXACT, False, "cosine")
     assert twopass.stats()["rowmax_worst_ratio"] > 1.0, (
-        "a row max far above what Theorem 1 admits was not recorded")
+        "a row max far above what the cosine bound admits was not recorded")
     assert any("exceeds" in r.message for r in caplog.records), (
-        "nothing warned about a row max outside the theorem's range")
+        "nothing warned about a row max outside the bound's range")
 
 
 def test_p3_refuses_every_way_the_exact_pass_can_stop_being_ieee_binary32(monkeypatch):
-    """P3 — (R2) and the `gamma_d` term are stated for IEEE binary32
+    """The exact-pass error model and the `gamma_d` term are stated for IEEE binary32
     round-to-nearest. If the "exact" pass is TF32, its inputs carry an extra
     ~2**-11 conversion error the bound does not model.
 
     `_verify_shape` cannot catch this: it compares a padded GEMM to a
     full-height one, and both would run TF32, agree with each other perfectly,
-    and differ together from the binary32 arithmetic the theorem defines.
+    and differ together from the binary32 arithmetic the bound assumes.
 
     Four ways it can go wrong, all checked. The env-var pair is the important
     one: `CUBLAS_EMULATE_SINGLE_PRECISION` is what ENABLES emulation, while
@@ -3031,7 +3031,7 @@ def _tiny(metric, col_scale, row_scale, norm=1.0):
 
 
 def test_dot_refuses_a_column_scale():
-    """Theorem 1' is stated at sigma = 1 and `eps_dot` never reads sigma_max.
+    """The dot bound is stated at sigma = 1 and `eps_dot` never reads sigma_max.
 
     Pass one's epilogue applies whatever `col_scale` it is given, so handing
     dot a `1/||c||` scales the row max down while `eps` stays sized for the raw
@@ -3144,7 +3144,7 @@ def test_an_in_place_write_to_Q_invalidates_the_cached_query_side():
 
 
 def test_an_in_place_write_to_row_scale_invalidates_it_too():
-    """P1's failure shape, and the one the cache is least likely to be
+    """The scale-factor band's failure shape, and the one the cache is least likely to be
     watched for: `probe_scales` reads the live tensor while `bound()` reads
     the cached `rho_a`, so a stale `rho_a` is a scale mismatch nothing sees.
     """
@@ -3195,8 +3195,8 @@ def test_a_nan_from_the_probed_kernel_refuses_rather_than_passes():
     number at all.
 
     Same shape as this function's own "DECLINED IS NOT PASSED" case, one step
-    later: there the kernel never ran, here it ran and said nothing. (R5) is
-    the one hardware premise the bound rests on and this probe is its only
+    later: there the kernel never ran, here it ran and said nothing. The tensor-core
+    accumulation model is the one hardware premise the bound rests on and this probe is its only
     in-process backstop.
     """
     import torch
@@ -3295,7 +3295,7 @@ def test_the_accepted_fp32_precision_values_match_this_torch():
     IF THIS TEST FAILS after a torch upgrade, do not widen the accepted set to
     make it pass. Work out what the new state MEANS first: accepting a mode
     that is not binary32 round-to-nearest silently invalidates `gamma_d` and
-    the (R2) term, which is an under-bound.
+    the exact-pass error term, which is an under-bound.
     """
     import torch
     from nova_bf import twopass
@@ -3334,7 +3334,7 @@ def test_the_accepted_fp32_precision_values_match_this_torch():
 
 def test_a_non_binary32_precision_mode_refuses_the_exact_path():
     """Whatever the mode is called, anything that is not full binary32 has to
-    refuse: `gamma_d` and the (R2) term are stated for IEEE round-to-nearest,
+    refuse: `gamma_d` and the exact-pass error model are stated for IEEE round-to-nearest,
     and a narrower input format adds a conversion error the bound does not
     carry.
 

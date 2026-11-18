@@ -1025,7 +1025,7 @@ def test_the_streak_is_cleared_by_a_conclusive_certification(monkeypatch):
 def test_no_unmeasured_generation_can_prune():
     """Every admitted capability must have a committed probe result ON DISK.
 
-    Theorem 1 is conditional on (R5). A capability in `_R5_GENERATIONS` that no
+    The bound assumes the tensor-core accumulation model. A capability in `_R5_GENERATIONS` that no
     probe has run on is an assumption about silicon we have never touched, and
     the two-pass would prune on it in production. The T4 is why this is not
     paranoia: it measured (8,1) where the published Turing row says (4,0), so

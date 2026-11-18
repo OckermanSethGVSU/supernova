@@ -242,8 +242,7 @@ def kernel_usage(
     tp = twopass.stats()
     # `rows_live / rows_full` is what the two-pass actually skipped; the gap
     # between it and `rows_padded / rows_full` is what the GEMM-height padding
-    # cost to keep cuBLAS on one kernel (see
-    # docs/brute-force/claude_only/two-pass-bound.md). Tiles-mode slices are
+    # cost to keep cuBLAS on one kernel. Tiles-mode slices are
     # not padded (they book `rows_padded = rows_live`), so in a tiles run
     # `padded_fraction` reflects only the slice-mode slices' padding.
     tp["live_fraction"] = (

@@ -17,14 +17,11 @@ from nova_bf import closed_form as cf
 # --- the oracle ---------------------------------------------------------------
 
 def _find_oracle():
-    """Locate the document's companion script.
+    """Locate the independent closed-form checker, preferring
+    NOVA_BF_CF_ORACLE when set.
 
-    Searched rather than hard-coded, because this file is run from two
-    layouts: the repo (where it sits three levels under the root) and a GPU box
-    where only `python/nova-bf` and `docs/brute-force/tc-probe` are mounted, at
-    paths that have nothing to do with each other. `NOVA_BF_CF_ORACLE` wins if
-    set, so a caller can always say where it is.
-    """
+    Search the current tests directory first, then older documentation
+    locations for compatibility."""
     import os
 
     env = os.environ.get("NOVA_BF_CF_ORACLE")
@@ -46,7 +43,7 @@ _ORACLE_PATH = _find_oracle()
 
 
 def _load_oracle():
-    """Load the companion script, or return `None` if it is not present.
+    """Load the independent closed-form checker, or return `None` if it is not present.
 
     A module-level `pytest.skip` used to live here, and it took the WHOLE FILE
     with it — including the published-table, guard, structural and empirical
@@ -67,7 +64,7 @@ def _load_oracle():
 ORACLE = _load_oracle()
 needs_oracle = pytest.mark.skipif(
     ORACLE is None,
-    reason=f"the document's companion script is not at {_ORACLE_PATH}; set "
+    reason=f"the independent closed-form checker (tests/two-pass-closed-form-check.py) is not at {_ORACLE_PATH}; set "
            f"NOVA_BF_CF_ORACLE to point at it")
 
 
@@ -75,11 +72,11 @@ def test_the_oracle_is_present():
     """A visible FAILURE rather than a silent skip when the differential layer
     is not running. Skips are easy to miss in a green run; this is not."""
     assert ORACLE is not None, (
-        f"the document's companion script was not found at {_ORACLE_PATH}, so "
+        f"the independent closed-form checker (tests/two-pass-closed-form-check.py) was not found at {_ORACLE_PATH}, so "
         f"every differential test in this file is being skipped. Set "
-        f"NOVA_BF_CF_ORACLE, or mount docs/brute-force alongside the package")
+        f"NOVA_BF_CF_ORACLE (it normally ships in tests/ next to this file)")
 
-# The four storage cases of the Sec.0.1 table, as
+# The four storage cases of the reference table in section 2, as
 # (label, u_q, u_c, eta_q, eta_c, lambda_t).
 CASES = [
     ("fp32 q, fp32 c", cf.U16, cf.U16, cf.ETA16, cf.ETA16, cf.LAMBDA16),
@@ -93,7 +90,7 @@ SCALES = [(1.0, 1.0), (3.7, 11.9), (1e2, 1e3), (1e-3, 1e-2), (1e5, 1.0)]
 
 
 # =============================================================================
-# 1. Differential against the document's own script
+# 1. Differential against the independent closed-form checker
 # =============================================================================
 
 @needs_oracle
@@ -141,7 +138,7 @@ def test_eps_matches_the_oracle_bit_for_bit(d, case, half_out):
 def test_the_vectorised_psi_agrees_with_the_scalar_one_elementwise():
     # `Psi` is evaluated per query, so the production path hands it an array.
     # Broadcasting must not reassociate anything: same operations, same order,
-    # same results, or Lemma 5's weight count stops describing what ran.
+    # same results, or the binary64 evaluation-error weight count stops describing what ran.
     rho = np.array([1.0, 3.7, 1e2, 1e-3, 1e5], dtype=np.float64)
     vec = cf.eps_cos(768, cf.U16, 0.0, eta_q=cf.ETA16, rho_q=rho, sigma_max=11.9)
     for i, r in enumerate(rho):
@@ -173,7 +170,7 @@ def test_eps_dot_matches_the_oracle_bit_for_bit(d, case, half_out):
 
 # Hard-coded, so the module and the oracle cannot drift TOGETHER. These are not
 # independent of the implementation on their own — the differential test above
-# is what establishes agreement with the document's transcription, and these
+# is what establishes agreement with the independent checker, and these
 # freeze the agreed value so a later edit to both must be deliberate. The
 # structural test below is the independent check: `E` is proportional to
 # `Qn*Cn`, so scaling both norms by 10 must scale `eps` by ~100, and that is
@@ -198,9 +195,9 @@ def test_the_dot_bound_reproduces_its_frozen_values(key):
 
 def test_the_dot_bound_scales_with_the_norm_product():
     """
-    Theorem 1' has `E` proportional to `Qn*Cn = kappa^2 N_q max N_c`. If the
-    absolute terms lose their norm factors — which is what borrowing Theorem
-    1's `Psi` does — `eps` stops tracking the product and the shortfall grows
+    The dot bound has `E` proportional to `Qn*Cn = kappa^2 N_q max N_c`. If the
+    absolute terms lose their norm factors — which is what borrowing the
+    cosine bound's `Psi` does — `eps` stops tracking the product and the shortfall grows
     with the norms. A golden table alone would not catch that at other norms;
     this does.
     """
@@ -219,11 +216,11 @@ def test_the_dot_bound_scales_with_the_norm_product():
 
 
 # =============================================================================
-# 2. The document's published numbers
+# 2. Hand-transcribed reference numbers
 # =============================================================================
 
-# Sec.0.1, "eps at unit norms and unit applied scales, fused first pass,
-# envelope". Transcribed by hand from the document, NOT generated.
+# "eps at unit norms and unit applied scales, fused first pass,
+# envelope". Transcribed by hand, NOT generated.
 PUBLISHED = {
     384: (1.093e-3, 6.039e-4, 1.150e-4, 7.944e-3),
     768: (1.208e-3, 7.187e-4, 2.295e-4, 8.059e-3),
@@ -259,9 +256,9 @@ def test_the_load_time_self_test_passes():
 
 
 def test_no_power_operator_survives_in_the_certified_path():
-    # P8: IEEE 754 requires correct rounding for + - * / sqrt but NOT for a
+    # The bound is evaluated in binary64: IEEE 754 requires correct rounding for + - * / sqrt but NOT for a
     # generic library `pow`, so a `**` inside any of these would be an
-    # unstated premise about libm rather than a rounding Lemma 5 can charge.
+    # unstated premise about libm rather than a rounding the evaluation-error bound can charge.
     assert cf._binary_power_users() == []
 
 
@@ -271,7 +268,7 @@ def test_eps_is_increasing_in_every_argument_it_must_be():
     assert float(cf.eps_cos(768, cf.U16, cf.U16, eta_q=cf.ETA16,
                             eta_c=cf.ETA16)) > base
     # `Psi` increasing in both scales is what makes an UPPER bound on the
-    # applied scales admissible and a lower one inadmissible (P1).
+    # applied scales admissible and a lower one inadmissible.
     assert float(cf.eps_cos(768, cf.U16, 0.0, eta_q=cf.ETA16, rho_q=2.0)) > base
     assert float(cf.eps_cos(768, cf.U16, 0.0, eta_q=cf.ETA16, sigma_max=2.0)) > base
     assert float(cf.eps_cos(768, cf.U16, 0.0, cf.C_HW_ENVELOPE, True,
@@ -279,7 +276,7 @@ def test_eps_is_increasing_in_every_argument_it_must_be():
 
 
 def test_eps_can_never_go_below_the_conversion_floor():
-    # Sec.7 exhibits a vector attaining `u_q + u_c` to 0.999, so no data-free
+    # `sharpness()` exhibits a vector attaining `u_q + u_c` to 0.999, so no data-free
     # constant smaller than this exists — including at tiny `d`.
     for d in (64, 128, 768):
         assert cf.C_const(d, cf.U16, cf.U16) > cf.U16 + cf.U16 + cf.U16 * cf.U16
@@ -289,7 +286,7 @@ def test_eps_can_never_go_below_the_conversion_floor():
 @needs_oracle
 @needs_oracle
 def test_the_envelope_dominates_every_published_generation():
-    # Lemma 2': `c_hw = 4` must cover every row of the hardware table, with
+    # The accumulation envelope: `c_hw = 4` must cover every row of the hardware table, with
     # `m <= ceil(d/b) + s_x` blocks and `s_x <= d/16` extra additions.
     for d in (64, 128, 768, 4096, 65536, 2 ** 20):
         env = cf.kappa_acc(d, cf.C_HW_ENVELOPE)
@@ -353,7 +350,7 @@ def test_the_norm_range_guard_is_two_sided_at_the_documented_thresholds():
     assert not cf.norm_range_ok(math.nextafter(cf.NORM_MIN, 0.0))
     assert not cf.norm_range_ok(math.nextafter(cf.NORM_MAX, math.inf))
     # The shipped bound's threshold was 2**-63 and one-sided. Both halves of
-    # that changed, and the raise is what makes Lemma 2's floor term negligible.
+    # that changed, and the raise is what makes the accumulation model's floor term negligible.
     assert cf.NORM_MIN > math.ldexp(1.0, -63)
 
 
@@ -427,7 +424,7 @@ def _two_passes_torch(Q, C, corpus_is_fp16):
                reciprocal, as `_gemm_rowmax`'s epilogue applies it), row max,
                then times `row_scale` on the host.
     Pass two:  the float32 Gram, DIVIDED by the same computed norms — the
-               asymmetry (reciprocal vs divide) is what P1 allows and what
+               asymmetry (reciprocal vs divide) is what the scale-factor band allows and what
                `bracket`'s `(1+u)^4/(1-u)^2` mismatch factor pays for.
     """
     qn = Q.norm(dim=1)
@@ -497,7 +494,7 @@ def test_safe_holds_when_the_components_straddle_the_fp16_subnormal_range(d):
 
 @pytest.mark.parametrize("d", [64, 128, 768])
 def test_safe_holds_with_one_dominant_component_and_a_tail_of_tiny_ones(d):
-    # The adversarial case for the ANCHOR term of Lemma 2: the block's largest
+    # The adversarial case for the accumulation model's ANCHOR term: the block's largest
     # product sets the alignment, and everything more than 24 + nu bits below it
     # is chopped entirely. This is the construction that annihilates the tail.
     g = torch.Generator().manual_seed(7 + d)
@@ -553,7 +550,7 @@ def test_safe_holds_against_the_emulated_tensor_core_accumulator(model, kind):
     """(SAFE) end to end with pass one replaced by the published hardware model.
 
     `d` is small because every product is an exact `Fraction`; the terms that
-    scale with `d` are checked by `envelope_check()` in the doc's script over
+    scale with `d` are checked by `envelope_check()` in the independent checker over
     the whole admitted range, so what this adds is the END-TO-END composition —
     conversion, truncating accumulation, both scalings and the wrapper together,
     against a float64 reference for the exact pass.
@@ -635,7 +632,7 @@ def test_the_emulated_accumulator_really_is_worse_than_a_rounding_one():
 # --------------------------------------------------------------------------
 
 def test_eps_final_evaluates_in_binary64_whatever_dtype_it_is_handed():
-    """P8 says the bound is computed in binary64. That has to be true of the
+    """The bound is specified to be computed in binary64. That has to be true of the
     FUNCTION, not of its callers.
 
     numpy takes the dtype from the operands, so a float32 `E` or `B` evaluated

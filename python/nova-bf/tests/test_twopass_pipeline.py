@@ -39,8 +39,8 @@ from nova_bf.config import (
     SearchSpec,
 )
 
-# DIM is 64 and not 32 because the closed-form bound's P6 requires
-# `64 <= d <= 2**20`: Lemma 2' needs `d >= 64` for its block count, and below
+# DIM is 64 and not 32 because the closed-form bound admits only
+# `64 <= d <= 2**20`: the accumulation model needs `d >= 64` for its block count, and below
 # it there is no bound to evaluate, so `upper_bounds` refuses every row and the
 # two-pass never engages. A fixture under the floor would test nothing.
 DIM, K, NQ = 64, 5, 64
@@ -815,6 +815,9 @@ def test_shared_gram_is_kept_where_no_group_can_two_pass(
 
     params = {}
     if how == "cpu_without_debug_env":
+        # This case is about the CPU default: on a GPU box run_compute would
+        # pick CUDA, where two-pass is (correctly) on.
+        monkeypatch.setenv("NOVA_BF_DEVICE", "cpu")
         monkeypatch.delenv("NOVA_BF_TWOPASS_ON_CPU")
     elif how == "no_twopass_env":
         monkeypatch.setenv("NOVA_BF_NO_TWOPASS", "1")
@@ -2369,7 +2372,7 @@ def test_tf32_does_not_veto_the_cpu_opt_in_path(monkeypatch):
     precisely so a GPU-less suite can exercise this plumbing.
 
     That is the silent-non-engagement shape that has already cost this feature
-    two separate suites' worth of coverage — a d=16 parity fixture below P6,
+    two separate suites' worth of coverage — a d=16 parity fixture below the admitted dimensions,
     and an audit that reported zero violations over zero rows.
     """
     import torch

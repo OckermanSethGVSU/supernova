@@ -2,8 +2,8 @@
 
 Tiles mode (`params.two_pass_rescore: tiles`) sums exact scores in a
 different order from the one-pass GEMM. Each side is an fp32 dot within
-`gamma_d * sum_i |q_i c_i|` of the real value (Higham's order-free bound,
-(R2) in the two-pass proof), so the two can differ by up to
+`gamma_d * sum_i |q_i c_i|` of the real value (Higham's order-free bound
+for IEEE binary32 round-to-nearest), so the two can differ by up to
 
     tol = 2 * gamma_d * B  (+ a few ulp of the score for the divides)
 

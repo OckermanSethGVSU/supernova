@@ -111,7 +111,7 @@ def test_the_row_max_plus_the_bound_never_falls_below_the_float64_max(
     BOTH SIDES ARE ROW-SCALED, which they were not before the closed form. The
     kernel returns `max_c (q_h . c_h) / ||c||`, whose magnitude is ~||q||, and
     the old measured-residual `eps` scaled with `Qn` so it tracked that. The
-    closed form's `eps` is in COSINE units — Theorem 1 bounds a quantity of
+    closed form's `eps` is in COSINE units — the cosine bound covers a quantity of
     magnitude at most `Lambda(d)` — so comparing it against an unscaled row max
     would charge a unit-norm bound to a quantity ||q|| times larger. Applying
     `row_scale` to both sides is what `upper_bounds` itself does, and it makes
@@ -125,7 +125,7 @@ def test_the_row_max_plus_the_bound_never_falls_below_the_float64_max(
     got = twopass.fused_rowmax(qs["Qh"], Ch, cs)
     assert got is not None, twopass.fused_off()
     # `fmt_c=EXACT`: `_operands` stores the corpus as fineweb does, so the
-    # half copy is exact and Lemma 1 charges the corpus axis nothing.
+    # half copy is exact and the conversion error model charges the corpus axis nothing.
     eps = torch.from_numpy(twopass.bound(
         qs, dim, sigma_max, False, "cosine",
         fmt_c=twopass._cf.EXACT, cn_max=cn_max)).to(got.device)
