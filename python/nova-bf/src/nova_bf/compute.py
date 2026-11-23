@@ -77,6 +77,7 @@ from nova_bf.results import (
     vector_dtype,
     warn_if_short,
 )
+from nova_bf.timing_hooks import NO_HOOKS
 from nova_bf.tiebreak import (
     MAX_ROWS_PER_WORKER,
     NEUTRAL_KEY,
@@ -6929,6 +6930,7 @@ def run_compute(
     io_thread_count: int | None = None,
     cpu_thread_count: int | None = None,
     max_files: int | None = None,
+    timing_hooks=None,
 ) -> dict[str, str]:
     """Runs every search in `cfg.searches` — independent vector_type/metric/k/
     filter combinations — against the corpus in ONE pass: each file is read
@@ -6940,7 +6942,13 @@ def run_compute(
     rows (`_union_keep`) — see this module's docstring. Only each search's
     own scoring and top-K accumulation stay independent. Returns
     `{spec.name: output_path}`.
+
+    `timing_hooks`: an optional object with `corpus_start`, `pause`, `resume`
+    and `done` methods, called at fixed points for an outside clock (see
+    `nova_bf.timing_hooks`). None means no hooks.
     """
+    hooks = timing_hooks if timing_hooks is not None else NO_HOOKS
+    hooks_started = False  # set by the multivector token sample's corpus_start()
     try:
         import torch
     except ImportError:
@@ -7200,9 +7208,12 @@ def run_compute(
     if "multivector" in vts_needed:
         mv_budget_elements = _multivector_budget_elements(cfg.params.multivector_budget_mib)
         mean_q_tok = float(mv_q_offsets[-1]) / max(1, n_q) if n_q else 1.0
+        hooks.corpus_start()  # timing hook: this sample reads corpus data
         mean_doc_tok = _sample_mean_doc_tokens(
             cstore, mine, cfg.corpus.multivector_column
         )
+        hooks.pause()  # timing hook: query-only setup follows until the scan
+        hooks_started = True
         mv_docs_per_slice, mv_queries_per_tile = _resolve_multivector_tiles(
             mv_budget_elements, mean_q_tok, mean_doc_tok,
         )
@@ -8156,6 +8167,11 @@ def run_compute(
         max_workers=cpu_n, thread_name_prefix="bf-scan",
     )
 
+    # Timing hook (observe only): the scan's corpus readers start below.
+    if hooks_started:
+        hooks.resume()
+    else:
+        hooks.corpus_start()
     # Shut down the shared filter pool on any scan exit; wait for in-flight tasks
     # because they may still be writing into arrays owned by this process.
     rank_thread = id_rank.get("thread")
@@ -9157,6 +9173,7 @@ def run_compute(
             # The `.cpu()` copies above waited for the device, so this interval
             # also covers any scan work still queued when `wall` was taken.
             result_sort_secs += time.perf_counter() - sort_t0
+            hooks.pause()  # timing hook: this search's decode + write follow
             valid = sc > float("-inf")
             nan_hits = np.isnan(sc).sum(axis=1).astype(np.int32) if num_jobs is not None else None
             if trim_key is not None:
@@ -9311,6 +9328,8 @@ def run_compute(
             del table
             if len(pending_writes) >= 32:
                 _collect_write(pending_writes.pop(0))
+            hooks.resume()  # timing hook
+        hooks.done()  # timing hook: every search's sorted top-K is on the host
         for item in pending_writes:
             _collect_write(item)
     finally:
