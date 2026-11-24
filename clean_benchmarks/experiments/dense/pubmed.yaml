@@ -1,0 +1,35 @@
+# PubMed-VE dense (bge-m3, 1024-d), exact top-1000 cosine: nova-bf vs FAISS vs cuVS.
+# The corpus is still being uploaded; the io values are placeholders until tuned.
+name: dense_pubmed
+modality: dense
+corpus:
+  path: ${READ}/data/                   # PubMed-VE (bge-m3): data/<NNN>/*.parquet
+  column: bge_m3_dense_embedding
+  recursive: true
+  region: us-east-1
+queries:
+  path: ~/data/queries_pubmed_dense.parquet   # copied there by prep
+  column: bge_m3_dense_embedding
+  nq: 10000                                   # every query in the file
+search: {k: 1000, metric: cosine}
+io:
+  # placeholders until tuned (a sweep over io.*)
+  files_in_flight: TODO
+  gets: TODO
+  part_mib: TODO
+  read_mode: native
+  range_scope: total
+threads: 32
+copies: {h2d: pinned, h2d_overlap: true, d2h: pinned, d2h_overlap: true}
+search_name: pubmed   # legs are pubmed__<system>__r<N>
+systems:
+  novabf: {system: novabf, config: ../novabf/pubmed_bge_m3_dense_k1000.yaml}
+  faiss: {system: faiss, preset: stock}
+  cuvs: {system: cuvs, preset: stock}
+novabf_output: ${WRITE}
+protocol: {rounds: 3}
+checks:
+  oracle_queries: 500
+prep:
+  # copy the queries file (10,000 queries + their published top-1000) to queries.path
+  queries_src: "${READ}/queries/bf_queries_dense_cosine_k1000.parquet"

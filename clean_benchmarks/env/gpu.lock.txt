@@ -1,0 +1,2 @@
+name, driver_version, uuid
+NVIDIA A10G, 580.159.04, GPU-63981a17-a68a-5ff1-079b-a2ecd39f7b6c

@@ -1,0 +1,37 @@
+# FineWeb-10B filtered, per-query TEXT filters (a keyword phrase, plus URL domains) plus one
+# fixed text filter for all queries. Exact top-1000 cosine.
+name: filtered_text
+modality: filtered
+corpus:
+  path: ${READ}/
+  column: dense_embedding
+  recursive: true
+  region: us-east-1
+queries:
+  path: data/queries/queries.parquet          # staged by prep (the shared MS MARCO queries)
+  column: dense_embedding
+search: {k: 1000, metric: cosine}
+# shared I/O: placeholders until tuned (a sweep over io.*)
+io: {files_in_flight: TODO, gets: TODO, part_mib: TODO, read_mode: native, range_scope: total}
+threads: 32
+filter:
+  config: ../novabf/fineweb_filtered_k1000.yaml               # the filter definitions (the leg sets corpus.path)
+# text_per_query: each query must contain its keyword phrase, and should match one of its URL domains.
+# text_fixed: one fixed text match ("health") for the structured query set.
+# FAISS has no per-query filter, so it runs the fixed-filter search only.
+searches:
+  - {name: text_per_query, systems: [novabf, cuvs_bitmap, cuvs_union]}
+  - {name: text_fixed, systems: [novabf, cuvs_bitmap, cuvs_gather, faiss_gather]}
+systems:
+  novabf: {system: novabf, config: ../novabf/fineweb_filtered_k1000.yaml}
+  cuvs_bitmap: {system: cuvs, filter_mode: bitmap}                        # bitmap prefilter
+  cuvs_union: {system: cuvs, filter_mode: bitmap, filter_compact: union}  # + union compaction
+  cuvs_gather: {system: cuvs, filter_mode: gather}                        # passing rows only
+  faiss_gather: {system: faiss, filter_mode: gather}
+protocol: {rounds: 3}
+prep:
+  # the shared queries, without the sparse column (source relative to the repo root)
+  stage:
+    - {key: FILTERED_QUERIES_SRC, path: data/queries/queries.parquet,
+       source: data/ms_marco/ms_marco_shared_queries.parquet, how: filtered_queries,
+       drop_columns: [sparse_embedding]}

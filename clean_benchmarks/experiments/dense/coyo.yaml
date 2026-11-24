@@ -1,0 +1,56 @@
+# Coyo-VE dense, exact top-1000 cosine: nova-bf vs FAISS vs cuVS
+name: dense_coyo
+modality: dense
+corpus:
+  path: ${READ}/data/
+  column: qwen_multimodal_embedding
+  recursive: true                                                # the files sit in sub-prefixes
+  region: us-east-1                                              # the bucket's region
+queries:
+  # built by the `queries` step (prep/prep_queries_coyo.py from
+  # Coyo-VE/queries/queries_gt_k1000.parquet); `bench launch` stages it. GT: ~/data/gt_25k.parquet.
+  path: ~/data/queries_25k.parquet
+  column: qwen_multimodal_embedding
+  nq: 25000                                                      # every query in the file
+search: {k: 1000, metric: cosine}
+io:
+  # one setting for every system: 64 files in flight (Coyo's files are small, ~20k rows each),
+  # 512 ranged GETs of 16 MiB parts, the native reader, the GET limit over all files in flight;
+  # nova-bf gets the same three through its config's ${NOVABF_IO_WORKERS} / _RUST_FETCH_CONC / _PART_MIB
+  files_in_flight: 64
+  gets: 512
+  part_mib: 16
+  read_mode: native
+  range_scope: total
+threads: 32          # one per vCPU of the g5.8xlarge, for every leg
+copies:              # pinned and overlapped both ways, for every GPU baseline
+  h2d: pinned
+  h2d_overlap: true
+  d2h: pinned
+  d2h_overlap: true
+search_name: coyo    # legs are coyo__<system>__r<N>
+systems:             # round-1 order
+  novabf:
+    system: novabf
+    # stock nova-bf: no NOVABF_RANGED_CONC / NOVABF_TWOPASS_MIN_ROWS override
+    config: ../novabf/coyo_ve_k1000.yaml
+  faiss: {system: faiss, preset: stock}     # stock faiss.knn_gpu
+  cuvs: {system: cuvs, preset: stock}       # stock cuVS brute force, cuVS's own recipe
+# legs write <this>/<run id>/<tag>
+novabf_output: ${WRITE}
+# e2e: the cold first nova-bf process (Triton + CUDA JIT caches cleared, no
+# warmup), through the same nova-bf leg path (NOVA_BF_DEVICE=cuda, stock).
+e2e:
+  system: novabf
+  # ties ordered by the corpus `id` field, so the cold run is reproducible however the files
+  # are listed or split; only its scores are compared with round 1 (hits are named by id)
+  tiebreak: {mode: id, field: id}
+protocol: {rounds: 3}                       # the reported value is the median of 3 rotated rounds
+checks:
+  oracle_queries: 500                       # queries sampled for the float64 oracle
+  gt: ~/data/gt_25k.parquet               # the dataset GT (the `queries` step writes it; `bench launch` stages it)
+# the node's data prep (bench launch runs it before env/paper_run.sh): the `queries` step.
+prep:
+  queries:
+    script: bench/prep/prep_queries_coyo.py
+    args: ["${READ}/queries/queries_gt_k1000.parquet", ~/data]

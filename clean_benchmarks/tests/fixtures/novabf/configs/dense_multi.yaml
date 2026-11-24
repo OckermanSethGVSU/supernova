@@ -1,0 +1,24 @@
+# Several dense searches in one pass (work sharing), small slices (dense_batch_size 256
+# < 1000 rows per file -> 4 slices per file), a contiguous query-row subset (query_set == head: the first 60),
+# all three metrics.
+corpus:
+  path: ${NOVABF_FIX}/dense/corpus
+  dense_column: embedding
+queries:
+  path: ${NOVABF_FIX}/dense/queries.parquet
+  dense_column: embedding
+  id_column: query_id
+output:
+  path: ${NOVABF_OUT}
+params:
+  io_workers: 2
+  io_ranged_get: false
+  cpu_thread_count: 4
+  dense_batch_size: 256
+  allow_tf32: false
+  tiebreak: ordinal
+searches:
+  - {name: cos50, vector_type: dense, metric: cosine, k: 50}
+  - {name: dot10, vector_type: dense, metric: dot, k: 10}
+  - {name: euc10, vector_type: dense, metric: euclidean, k: 10}
+  - {name: cos20_head, vector_type: dense, metric: cosine, k: 20, rows: {column: query_set, isin: [head]}}

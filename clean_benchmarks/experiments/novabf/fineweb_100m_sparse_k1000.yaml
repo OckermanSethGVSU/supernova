@@ -1,0 +1,30 @@
+# nova-bf: exact top-1000 dot-product search over the FineWeb gte sparse vectors.
+corpus:
+  path: ${NOVABF_CORPUS:-s3://TODO/fineweb_100m/corpus/}
+  sparse_column: ${NOVABF_VCOL:-sparse_embedding}
+
+queries:
+  path: ${NOVABF_QUERIES:-/home/ubuntu/data/queries.parquet}
+  sparse_column: ${NOVABF_QCOL:-sparse_embedding}
+  id_column: query_id
+
+output:
+  path: ${NOVABF_OUT:-/home/ubuntu/res/out}
+
+params:
+  io_workers: ${NOVABF_IO_WORKERS:-4}
+  rust_fetch_columns: true
+  rust_fetch_concurrency: ${NOVABF_RUST_FETCH_CONC:-512}
+  rust_fetch_part_mib: ${NOVABF_RUST_FETCH_PART_MIB:-16}
+  io_ranged_get: false
+  io_thread_count: 128
+  cpu_thread_count: 32
+  sparse_batch_size: ${NOVABF_SPARSE_BATCH:-4096}
+  allow_tf32: false
+  tiebreak: ordinal
+
+searches:
+  - name: sparse_dot
+    vector_type: sparse
+    metric: dot
+    k: 1000

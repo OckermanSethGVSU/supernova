@@ -1,0 +1,10 @@
+# a small CPU sweep: the cpu reference with and without the query-vocabulary projection, plus
+# nova-bf unchanged in the rotation, on a 2-file subset, 1 round
+name: s4_sweep_sparse
+base: sparse.yaml
+sweep:
+  - system: novabf
+  - system: cpu
+    grid: {sparse_project: ["off", query-vocab]}
+subset: {files: 2}
+protocol: {rounds: 1}

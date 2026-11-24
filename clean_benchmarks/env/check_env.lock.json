@@ -1,0 +1,672 @@
+{
+ "stack": "paper-cu132-faiss116",
+ "stack_sha": "077b190e46f85da2a3318c940abeed9151c2ee1a763f3f4982ee79d01da71ecb",
+ "ok": true,
+ "mismatches": [],
+ "checks": [
+  {
+   "name": "python",
+   "got": "3.12",
+   "expected": "3.12",
+   "ok": true
+  },
+  {
+   "name": "torch",
+   "got": "2.15.0+cu132",
+   "expected": "2.15.0+cu132",
+   "ok": true
+  },
+  {
+   "name": "torch CUDA",
+   "got": "13.2",
+   "expected": "13.2",
+   "ok": true
+  },
+  {
+   "name": "CUDA device available",
+   "got": "True",
+   "expected": "True",
+   "ok": true
+  },
+  {
+   "name": "GPU model",
+   "got": "NVIDIA A10G",
+   "expected": "NVIDIA A10G",
+   "ok": true
+  },
+  {
+   "name": "EC2 instance type",
+   "got": "g5.8xlarge",
+   "expected": "g5.8xlarge",
+   "ok": true
+  },
+  {
+   "name": "EC2 instance",
+   "got": "i-0adf9a4a80c68c728 us-east-1a",
+   "expected": "(recorded)",
+   "ok": true
+  },
+  {
+   "name": "numpy",
+   "got": "2.5.4",
+   "expected": "2.5.4",
+   "ok": true
+  },
+  {
+   "name": "pyarrow",
+   "got": "26.0.1",
+   "expected": "26.0.1",
+   "ok": true
+  },
+  {
+   "name": "duckdb",
+   "got": "1.5.3",
+   "expected": "1.5.3",
+   "ok": true
+  },
+  {
+   "name": "faiss (merge + baseline)",
+   "got": "1.16.0",
+   "expected": "1.16.0",
+   "ok": true
+  },
+  {
+   "name": "faiss compile options",
+   "got": "OPTIMIZE AVX2 GPU ",
+   "expected": "(recorded)",
+   "ok": true
+  },
+  {
+   "name": "faiss GPU build",
+   "got": "True",
+   "expected": "True",
+   "ok": true
+  },
+  {
+   "name": "faiss conda packages",
+   "got": "faiss-gpu-1.16.0-py3.12_hc84be16_0_cuda13.2.json, libfaiss-1.16.0-hc84be16_0_cuda13.2.json",
+   "expected": "(recorded)",
+   "ok": true
+  },
+  {
+   "name": "faiss is NOT a cuVS-enabled build",
+   "got": "True",
+   "expected": "True",
+   "ok": true
+  },
+  {
+   "name": "faiss conda build (exact)",
+   "got": "faiss-gpu-1.16.0-py3.12_hc84be16_0_cuda13.2",
+   "expected": "faiss-gpu-1.16.0-py3.12_hc84be16_0_cuda13.2",
+   "ok": true
+  },
+  {
+   "name": "faiss conda channel",
+   "got": "https://conda.anaconda.org/pytorch/linux-64",
+   "expected": "https://conda.anaconda.org/pytorch/linux-64",
+   "ok": true
+  },
+  {
+   "name": "cuvs",
+   "got": "26.10.00",
+   "expected": "26.10.00",
+   "ok": true
+  },
+  {
+   "name": "rmm",
+   "got": "26.10.00",
+   "expected": "26.10",
+   "ok": true
+  },
+  {
+   "name": "cuvs module",
+   "got": "/home/ubuntu/miniforge3/envs/paper/lib/python3.12/site-packages/cuvs",
+   "expected": "(recorded)",
+   "ok": true
+  },
+  {
+   "name": "cuvs patches applied (build stamp vs CUVS_PATCH_SHA256)",
+   "got": "0001-sparse-knn-ip-merge-and-short-batch.diff=077cdf9abd5e48795579930154f99951267b0f4e5bc0f76a112fe7e66e4f2900;0002-cutile-opt-out.diff=9b23fc6b917520a9829a5b3d0eed20731267144ebf8814b67eb1608ea1a81ca7",
+   "expected": "0001-sparse-knn-ip-merge-and-short-batch.diff=077cdf9abd5e48795579930154f99951267b0f4e5bc0f76a112fe7e66e4f2900;0002-cutile-opt-out.diff=9b23fc6b917520a9829a5b3d0eed20731267144ebf8814b67eb1608ea1a81ca7",
+   "ok": true
+  },
+  {
+   "name": "cuvs patch files (vs CUVS_PATCH_SHA256)",
+   "got": "0001-sparse-knn-ip-merge-and-short-batch.diff=077cdf9abd5e48795579930154f99951267b0f4e5bc0f76a112fe7e66e4f2900;0002-cutile-opt-out.diff=9b23fc6b917520a9829a5b3d0eed20731267144ebf8814b67eb1608ea1a81ca7",
+   "expected": "0001-sparse-knn-ip-merge-and-short-batch.diff=077cdf9abd5e48795579930154f99951267b0f4e5bc0f76a112fe7e66e4f2900;0002-cutile-opt-out.diff=9b23fc6b917520a9829a5b3d0eed20731267144ebf8814b67eb1608ea1a81ca7",
+   "ok": true
+  },
+  {
+   "name": "cuvs sparse shim",
+   "got": "/home/ubuntu/miniforge3/envs/paper/lib/libnova_cuvs_sparse.so",
+   "expected": "(recorded)",
+   "ok": true
+  },
+  {
+   "name": "torch GPU ops (cuBLAS / cuSOLVER / cuFFT)",
+   "got": "ok",
+   "expected": "ok",
+   "ok": true
+  },
+  {
+   "name": "faiss.knn_gpu",
+   "got": "ok",
+   "expected": "ok",
+   "ok": true
+  },
+  {
+   "name": "cuvs brute_force",
+   "got": "ok",
+   "expected": "ok",
+   "ok": true
+  },
+  {
+   "name": "spare commit",
+   "got": "e7f4ad13696233ee10720aafe65d8aa2325f320e",
+   "expected": "e7f4ad1",
+   "ok": true
+  },
+  {
+   "name": "spare.backend_torch importable",
+   "got": "True",
+   "expected": "True",
+   "ok": true
+  },
+  {
+   "name": "pylate",
+   "got": "1.6.0",
+   "expected": "1.6.0",
+   "ok": true
+  },
+  {
+   "name": "pylate.rank importable",
+   "got": "True",
+   "expected": "True",
+   "ok": true
+  },
+  {
+   "name": "pylate.scores importable",
+   "got": "True",
+   "expected": "True",
+   "ok": true
+  },
+  {
+   "name": "pylate commit",
+   "got": "3389837ce465ee66e46f369a3f821a96788b7f29",
+   "expected": "3389837",
+   "ok": true
+  },
+  {
+   "name": "nova_bf importable",
+   "got": "True",
+   "expected": "True",
+   "ok": true
+  },
+  {
+   "name": "rust_fetch importable",
+   "got": "True",
+   "expected": "True",
+   "ok": true
+  },
+  {
+   "name": "nova-bf commit",
+   "got": "(not a git checkout)",
+   "expected": "(recorded)",
+   "ok": true
+  },
+  {
+   "name": "nova-bf tree",
+   "got": "clean",
+   "expected": "(recorded)",
+   "ok": true
+  },
+  {
+   "name": "OpenMP runtimes mapped",
+   "got": "libgomp",
+   "expected": "(recorded; more than one: one thread pool each)",
+   "ok": true
+  },
+  {
+   "name": "mapped libgomp",
+   "got": "/home/ubuntu/miniforge3/envs/paper/lib/python3.12/site-packages/torch/lib/libgomp.so.1",
+   "expected": "(recorded)",
+   "ok": true
+  },
+  {
+   "name": "mapped libmkl_core",
+   "got": "/home/ubuntu/miniforge3/envs/paper/lib/libmkl_core.so.2",
+   "expected": "(recorded)",
+   "ok": true
+  },
+  {
+   "name": "mapped libmkl_gnu_thread",
+   "got": "/home/ubuntu/miniforge3/envs/paper/lib/libmkl_gnu_thread.so.2",
+   "expected": "(recorded)",
+   "ok": true
+  },
+  {
+   "name": "mapped libmkl_intel_lp64",
+   "got": "/home/ubuntu/miniforge3/envs/paper/lib/libmkl_intel_lp64.so.2",
+   "expected": "(recorded)",
+   "ok": true
+  },
+  {
+   "name": "OMP / KMP / MKL environment",
+   "got": "OMP_NUM_THREADS=1",
+   "expected": "(recorded)",
+   "ok": true
+  },
+  {
+   "name": "CUDA / torch environment",
+   "got": "CUBLAS_VERSION=13.4.1.3;CUDA_VERSION=13.2;CUDA_VISIBLE_DEVICES=0;TORCH_INDEX_URL=https://download.pytorch.org/whl/cu132;TORCH_VERSION=2.15.0+cu132",
+   "expected": "(recorded)",
+   "ok": true
+  },
+  {
+   "name": "NVIDIA driver",
+   "got": "580.159.04",
+   "expected": "580.159.04",
+   "ok": true
+  },
+  {
+   "name": "conda libcublas + -dev (installed, never loaded)",
+   "got": "13.3.0.5",
+   "expected": "(recorded)",
+   "ok": true
+  },
+  {
+   "name": "pip nvidia-cublas",
+   "got": "13.4.1.3",
+   "expected": "13.4.1.3",
+   "ok": true
+  },
+  {
+   "name": "conda libcusparse + -dev (installed, never loaded)",
+   "got": "12.7.10.12",
+   "expected": "(recorded)",
+   "ok": true
+  },
+  {
+   "name": "pip nvidia-cusparse",
+   "got": "12.7.10.12",
+   "expected": "12.7.10.12",
+   "ok": true
+  },
+  {
+   "name": "conda libcusolver + -dev (installed, never loaded)",
+   "got": "12.2.0.11",
+   "expected": "(recorded)",
+   "ok": true
+  },
+  {
+   "name": "pip nvidia-cusolver",
+   "got": "12.2.0.11",
+   "expected": "12.2.0.11",
+   "ok": true
+  },
+  {
+   "name": "conda libcufft + -dev (installed, never loaded)",
+   "got": "12.2.0.57",
+   "expected": "(recorded)",
+   "ok": true
+  },
+  {
+   "name": "pip nvidia-cufft",
+   "got": "12.2.0.57",
+   "expected": "12.2.0.57",
+   "ok": true
+  },
+  {
+   "name": "conda libcurand + -dev (installed, never loaded)",
+   "got": "10.4.2.66",
+   "expected": "(recorded)",
+   "ok": true
+  },
+  {
+   "name": "pip nvidia-curand",
+   "got": "10.4.2.66",
+   "expected": "10.4.2.66",
+   "ok": true
+  },
+  {
+   "name": "conda cuda-cudart + -dev (installed, never loaded)",
+   "got": "13.2.86",
+   "expected": "(recorded)",
+   "ok": true
+  },
+  {
+   "name": "pip nvidia-cuda-runtime",
+   "got": "13.2.86",
+   "expected": "13.2.86",
+   "ok": true
+  },
+  {
+   "name": "conda cuda-nvrtc + -dev (installed, never loaded)",
+   "got": "13.2.86",
+   "expected": "(recorded)",
+   "ok": true
+  },
+  {
+   "name": "pip nvidia-cuda-nvrtc",
+   "got": "13.2.86",
+   "expected": "13.2.86",
+   "ok": true
+  },
+  {
+   "name": "conda libnvjitlink + -dev (installed, never loaded)",
+   "got": "13.2.86",
+   "expected": "(recorded)",
+   "ok": true
+  },
+  {
+   "name": "pip nvidia-nvjitlink",
+   "got": "13.2.86",
+   "expected": "13.2.86",
+   "ok": true
+  },
+  {
+   "name": "conda librmm",
+   "got": "26.10.00",
+   "expected": "26.10",
+   "ok": true
+  },
+  {
+   "name": "conda libraft",
+   "got": "26.10.00",
+   "expected": "26.10",
+   "ok": true
+  },
+  {
+   "name": "conda libraft-headers",
+   "got": "26.10.00",
+   "expected": "26.10",
+   "ok": true
+  },
+  {
+   "name": "conda libraft-headers-only",
+   "got": "26.10.00",
+   "expected": "26.10",
+   "ok": true
+  },
+  {
+   "name": "conda rmm",
+   "got": "26.10.00",
+   "expected": "26.10",
+   "ok": true
+  },
+  {
+   "name": "conda pylibraft",
+   "got": "26.10.00",
+   "expected": "26.10",
+   "ok": true
+  },
+  {
+   "name": "torch's pip nvidia/ dir",
+   "got": "/home/ubuntu/miniforge3/envs/paper/lib/python3.12/site-packages/nvidia",
+   "expected": "/home/ubuntu/miniforge3/envs/paper/lib/python3.12/site-packages/nvidia",
+   "ok": true
+  },
+  {
+   "name": "loaded libcublas is the pip copy",
+   "got": "/home/ubuntu/miniforge3/envs/paper/lib/python3.12/site-packages/nvidia/cu13/lib/libcublas.so.13",
+   "expected": "/home/ubuntu/miniforge3/envs/paper/lib/python3.12/site-packages/nvidia/cu13/lib/libcublas.so.13",
+   "ok": true
+  },
+  {
+   "name": "loaded libcublas version",
+   "got": "13.4.1",
+   "expected": "13.4.1",
+   "ok": true
+  },
+  {
+   "name": "loaded libcublasLt is the pip copy",
+   "got": "/home/ubuntu/miniforge3/envs/paper/lib/python3.12/site-packages/nvidia/cu13/lib/libcublasLt.so.13",
+   "expected": "/home/ubuntu/miniforge3/envs/paper/lib/python3.12/site-packages/nvidia/cu13/lib/libcublasLt.so.13",
+   "ok": true
+  },
+  {
+   "name": "loaded libcublasLt version",
+   "got": "13.4.1",
+   "expected": "13.4.1",
+   "ok": true
+  },
+  {
+   "name": "loaded libcusparse is the pip copy",
+   "got": "/home/ubuntu/miniforge3/envs/paper/lib/python3.12/site-packages/nvidia/cu13/lib/libcusparse.so.12",
+   "expected": "/home/ubuntu/miniforge3/envs/paper/lib/python3.12/site-packages/nvidia/cu13/lib/libcusparse.so.12",
+   "ok": true
+  },
+  {
+   "name": "loaded libcusparse version",
+   "got": "12.7.10",
+   "expected": "12.7.10",
+   "ok": true
+  },
+  {
+   "name": "loaded libcusolver is the pip copy",
+   "got": "/home/ubuntu/miniforge3/envs/paper/lib/python3.12/site-packages/nvidia/cu13/lib/libcusolver.so.12",
+   "expected": "/home/ubuntu/miniforge3/envs/paper/lib/python3.12/site-packages/nvidia/cu13/lib/libcusolver.so.12",
+   "ok": true
+  },
+  {
+   "name": "loaded libcusolver version",
+   "got": "12.2.0",
+   "expected": "12.2.0",
+   "ok": true
+  },
+  {
+   "name": "loaded libcufft is the pip copy",
+   "got": "/home/ubuntu/miniforge3/envs/paper/lib/python3.12/site-packages/nvidia/cu13/lib/libcufft.so.12",
+   "expected": "/home/ubuntu/miniforge3/envs/paper/lib/python3.12/site-packages/nvidia/cu13/lib/libcufft.so.12",
+   "ok": true
+  },
+  {
+   "name": "loaded libcufft version",
+   "got": "12.2.0",
+   "expected": "12.2.0",
+   "ok": true
+  },
+  {
+   "name": "loaded libcurand is the pip copy",
+   "got": "/home/ubuntu/miniforge3/envs/paper/lib/python3.12/site-packages/nvidia/cu13/lib/libcurand.so.10",
+   "expected": "/home/ubuntu/miniforge3/envs/paper/lib/python3.12/site-packages/nvidia/cu13/lib/libcurand.so.10",
+   "ok": true
+  },
+  {
+   "name": "loaded libcurand version",
+   "got": "10.4.2",
+   "expected": "10.4.2",
+   "ok": true
+  },
+  {
+   "name": "loaded libcudart is the pip copy",
+   "got": "/home/ubuntu/miniforge3/envs/paper/lib/python3.12/site-packages/nvidia/cu13/lib/libcudart.so.13",
+   "expected": "/home/ubuntu/miniforge3/envs/paper/lib/python3.12/site-packages/nvidia/cu13/lib/libcudart.so.13",
+   "ok": true
+  },
+  {
+   "name": "loaded libcudart version",
+   "got": "13.2",
+   "expected": "13.2",
+   "ok": true
+  },
+  {
+   "name": "loaded libnvrtc is the pip copy",
+   "got": "/home/ubuntu/miniforge3/envs/paper/lib/python3.12/site-packages/nvidia/cu13/lib/libnvrtc.so.13",
+   "expected": "/home/ubuntu/miniforge3/envs/paper/lib/python3.12/site-packages/nvidia/cu13/lib/libnvrtc.so.13",
+   "ok": true
+  },
+  {
+   "name": "loaded libnvrtc version",
+   "got": "13.2",
+   "expected": "13.2",
+   "ok": true
+  },
+  {
+   "name": "loaded libnvrtc-builtins is the pip copy",
+   "got": "/home/ubuntu/miniforge3/envs/paper/lib/python3.12/site-packages/nvidia/cu13/lib/libnvrtc-builtins.so.13.2",
+   "expected": "/home/ubuntu/miniforge3/envs/paper/lib/python3.12/site-packages/nvidia/cu13/lib/libnvrtc-builtins.so.13.2",
+   "ok": true
+  },
+  {
+   "name": "loaded libnvJitLink is the pip copy",
+   "got": "/home/ubuntu/miniforge3/envs/paper/lib/python3.12/site-packages/nvidia/cu13/lib/libnvJitLink.so.13",
+   "expected": "/home/ubuntu/miniforge3/envs/paper/lib/python3.12/site-packages/nvidia/cu13/lib/libnvJitLink.so.13",
+   "ok": true
+  },
+  {
+   "name": "loaded libnvJitLink version",
+   "got": "13.2",
+   "expected": "13.2",
+   "ok": true
+  },
+  {
+   "name": "each CUDA / RAPIDS library loaded from ONE file",
+   "got": "True",
+   "expected": "True",
+   "ok": true
+  }
+ ],
+ "cuda_libraries": {
+  "libraries": {
+   "libcublas": {
+    "path": "/home/ubuntu/miniforge3/envs/paper/lib/python3.12/site-packages/nvidia/cu13/lib/libcublas.so.13",
+    "version": "13.4.1"
+   },
+   "libcublasLt": {
+    "path": "/home/ubuntu/miniforge3/envs/paper/lib/python3.12/site-packages/nvidia/cu13/lib/libcublasLt.so.13",
+    "version": "13.4.1"
+   },
+   "libcudart": {
+    "path": "/home/ubuntu/miniforge3/envs/paper/lib/python3.12/site-packages/nvidia/cu13/lib/libcudart.so.13",
+    "version": "13.2"
+   },
+   "libcufft": {
+    "path": "/home/ubuntu/miniforge3/envs/paper/lib/python3.12/site-packages/nvidia/cu13/lib/libcufft.so.12",
+    "version": "12.2.0"
+   },
+   "libcurand": {
+    "path": "/home/ubuntu/miniforge3/envs/paper/lib/python3.12/site-packages/nvidia/cu13/lib/libcurand.so.10",
+    "version": "10.4.2"
+   },
+   "libcusolver": {
+    "path": "/home/ubuntu/miniforge3/envs/paper/lib/python3.12/site-packages/nvidia/cu13/lib/libcusolver.so.12",
+    "version": "12.2.0"
+   },
+   "libcusparse": {
+    "path": "/home/ubuntu/miniforge3/envs/paper/lib/python3.12/site-packages/nvidia/cu13/lib/libcusparse.so.12",
+    "version": "12.7.10"
+   },
+   "libnvJitLink": {
+    "path": "/home/ubuntu/miniforge3/envs/paper/lib/python3.12/site-packages/nvidia/cu13/lib/libnvJitLink.so.13",
+    "version": "13.2"
+   },
+   "libnvrtc": {
+    "path": "/home/ubuntu/miniforge3/envs/paper/lib/python3.12/site-packages/nvidia/cu13/lib/libnvrtc.so.13",
+    "version": "13.2"
+   },
+   "libnvrtc-builtins": {
+    "path": "/home/ubuntu/miniforge3/envs/paper/lib/python3.12/site-packages/nvidia/cu13/lib/libnvrtc-builtins.so.13.2",
+    "version": ""
+   }
+  },
+  "duplicates": {}
+ },
+ "loaded_libraries": {
+  "libcublas": [
+   "/home/ubuntu/miniforge3/envs/paper/lib/python3.12/site-packages/nvidia/cu13/lib/libcublas.so.13"
+  ],
+  "libcublasLt": [
+   "/home/ubuntu/miniforge3/envs/paper/lib/python3.12/site-packages/nvidia/cu13/lib/libcublasLt.so.13"
+  ],
+  "libcudart": [
+   "/home/ubuntu/miniforge3/envs/paper/lib/python3.12/site-packages/nvidia/cu13/lib/libcudart.so.13"
+  ],
+  "libcudnn": [
+   "/home/ubuntu/miniforge3/envs/paper/lib/python3.12/site-packages/nvidia/cudnn/lib/libcudnn.so.9"
+  ],
+  "libcufft": [
+   "/home/ubuntu/miniforge3/envs/paper/lib/python3.12/site-packages/nvidia/cu13/lib/libcufft.so.12"
+  ],
+  "libcurand": [
+   "/home/ubuntu/miniforge3/envs/paper/lib/python3.12/site-packages/nvidia/cu13/lib/libcurand.so.10"
+  ],
+  "libcusolver": [
+   "/home/ubuntu/miniforge3/envs/paper/lib/python3.12/site-packages/nvidia/cu13/lib/libcusolver.so.12"
+  ],
+  "libcusparse": [
+   "/home/ubuntu/miniforge3/envs/paper/lib/python3.12/site-packages/nvidia/cu13/lib/libcusparse.so.12"
+  ],
+  "libcusparseLt": [
+   "/home/ubuntu/miniforge3/envs/paper/lib/python3.12/site-packages/nvidia/cusparselt/lib/libcusparseLt.so.0"
+  ],
+  "libcuvs": [
+   "/home/ubuntu/miniforge3/envs/paper/lib/libcuvs.so"
+  ],
+  "libcuvs_c": [
+   "/home/ubuntu/miniforge3/envs/paper/lib/libcuvs_c.so"
+  ],
+  "libfaiss_avx2": [
+   "/home/ubuntu/miniforge3/envs/paper/lib/libfaiss_avx2.so"
+  ],
+  "libnova_cuvs_sparse": [
+   "/home/ubuntu/miniforge3/envs/paper/lib/libnova_cuvs_sparse.so"
+  ],
+  "libnvJitLink": [
+   "/home/ubuntu/miniforge3/envs/paper/lib/python3.12/site-packages/nvidia/cu13/lib/libnvJitLink.so.13"
+  ],
+  "libnvrtc": [
+   "/home/ubuntu/miniforge3/envs/paper/lib/python3.12/site-packages/nvidia/cu13/lib/libnvrtc.so.13"
+  ],
+  "libnvrtc-builtins": [
+   "/home/ubuntu/miniforge3/envs/paper/lib/python3.12/site-packages/nvidia/cu13/lib/libnvrtc-builtins.so.13.2"
+  ],
+  "librmm": [
+   "/home/ubuntu/miniforge3/envs/paper/lib/librmm.so"
+  ]
+ },
+ "thread_libraries": {
+  "libgomp": [
+   "/home/ubuntu/miniforge3/envs/paper/lib/python3.12/site-packages/torch/lib/libgomp.so.1"
+  ],
+  "libmkl_core": [
+   "/home/ubuntu/miniforge3/envs/paper/lib/libmkl_core.so.2"
+  ],
+  "libmkl_gnu_thread": [
+   "/home/ubuntu/miniforge3/envs/paper/lib/libmkl_gnu_thread.so.2"
+  ],
+  "libmkl_intel_lp64": [
+   "/home/ubuntu/miniforge3/envs/paper/lib/libmkl_intel_lp64.so.2"
+  ]
+ },
+ "openmp_runtimes": [
+  "libgomp"
+ ],
+ "thread_env": {
+  "OMP_NUM_THREADS": "1"
+ },
+ "cuda_env": {
+  "CUBLAS_VERSION": "13.4.1.3",
+  "CUDA_VERSION": "13.2",
+  "CUDA_VISIBLE_DEVICES": "0",
+  "TORCH_INDEX_URL": "https://download.pytorch.org/whl/cu132",
+  "TORCH_VERSION": "2.15.0+cu132"
+ },
+ "ec2": {
+  "instance_id": "i-0adf9a4a80c68c728",
+  "instance_type": "g5.8xlarge",
+  "availability_zone": "us-east-1a"
+ },
+ "gpu": {
+  "name": "NVIDIA A10G",
+  "uuid": "GPU-63981a17-a68a-5ff1-079b-a2ecd39f7b6c"
+ },
+ "sha256": {
+  "/home/ubuntu/miniforge3/envs/paper/lib/libcuvs.so": "d885d44d9e706e9915e2479b23d8cfa71efc50ea7e4ecb6a3d578a7a6580d2c0",
+  "/home/ubuntu/miniforge3/envs/paper/lib/libcuvs_c.so": "669be2521504e96f63f246c439ea3afaecafb177e2ed4abf7eba98622f6348fb",
+  "/home/ubuntu/miniforge3/envs/paper/lib/libfaiss_avx2.so": "9e520c21f367031c622cdfafd8a65ef51e41c7c9141f460e471cf173033c944d",
+  "/home/ubuntu/miniforge3/envs/paper/lib/libnova_cuvs_sparse.so": "b2d6f71c4a15aefcae5b1034f49f316fb489203682a3017de4a36968b1ad783c"
+ },
+ "prefix": "/home/ubuntu/miniforge3/envs/paper",
+ "ld_library_path": "/home/ubuntu/miniforge3/envs/paper/lib/python3.12/site-packages/nvidia/cu13/lib:/home/ubuntu/miniforge3/envs/paper/lib:/home/ubuntu/miniforge3/envs/paper/lib/python3.12/site-packages/nvidia/cu13/lib:/home/ubuntu/miniforge3/envs/paper/lib"
+}

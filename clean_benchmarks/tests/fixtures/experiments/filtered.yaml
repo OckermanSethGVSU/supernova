@@ -1,0 +1,16 @@
+name: s4_filtered
+modality: filtered
+corpus: {path: tests/fixtures/novabf/filtered/corpus, column: dense_embedding}
+queries: {path: tests/fixtures/novabf/filtered/queries/queries.parquet, column: dense_embedding}
+search: {k: 20, metric: cosine}
+io: {files_in_flight: 2, gets: 64, part_mib: 16}
+threads: 2
+filter: {config: nb_filtered.yaml}
+searches:
+  - {name: filtered_text, systems: [novabf, masked_bitmap, masked_files]}
+  - {name: static_struct, systems: [novabf, masked_bitmap]}
+systems:
+  novabf: {system: novabf, config: nb_filtered.yaml}
+  masked_bitmap: {system: masked, filter_mode: bitmap}
+  masked_files: {system: masked, filter_mode: bitmap, filter_skip: files}
+protocol: {rounds: 2}

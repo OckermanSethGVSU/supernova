@@ -1,0 +1,30 @@
+# Mirrors runs/multivector/configs/pubmed_mv_multivector_k1000.yaml (params verbatim
+# except io_workers, k and multivector_kernel), tiny local fixture. No id_column.
+corpus:
+  path: ${NOVABF_FIX}/multivector/corpus
+  multivector_column: multivector_embedding
+queries:
+  path: ${NOVABF_FIX}/multivector/queries.parquet
+  multivector_column: multivector_embedding
+  id_column: query_id
+output:
+  path: ${NOVABF_OUT}
+params:
+  io_workers: 4
+  rust_fetch_columns: true
+  rust_fetch_concurrency: 512
+  rust_fetch_part_mib: 16
+  io_ranged_get: false
+  io_thread_count: 128
+  cpu_thread_count: 32
+  multivector_budget_mib: 648.5
+  # old config: triton_reduce, which run_compute refuses without CUDA; auto = torch on CPU
+  multivector_kernel: auto
+  multivector_double_buffer: true
+  allow_tf32: false
+  tiebreak: ordinal
+searches:
+  - name: multivector_maxsim
+    vector_type: multivector
+    metric: dot
+    k: 10

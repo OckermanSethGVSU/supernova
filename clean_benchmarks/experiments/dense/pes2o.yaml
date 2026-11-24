@@ -1,0 +1,51 @@
+# Pes2o-VE dense, exact top-1000 cosine: nova-bf vs FAISS vs cuVS (the paper's dense comparison).
+name: dense_pes2o
+modality: dense
+corpus:
+  path: ${READ}/
+  column: embedding
+  recursive: false                                               # flat: 216 objects
+  region: us-east-1                                              # the bucket's region
+queries:
+  path: ~/data/queries_22723.parquet
+  column: query
+  nq: 22723                                                      # every labelled query
+search: {k: 1000, metric: cosine}
+io:
+  # one setting for every system: 4 files in flight (Pes2o's files are large), 512 ranged GETs
+  # of 16 MiB parts, the native reader, the GET limit over all files in flight; nova-bf gets
+  # the same three through its config's ${NOVABF_IO_WORKERS} / _RUST_FETCH_CONC / _PART_MIB
+  files_in_flight: 4
+  gets: 512
+  part_mib: 16
+  read_mode: native
+  range_scope: total
+threads: 32          # one per vCPU of the g5.8xlarge, for every leg
+copies:              # pinned and overlapped both ways, for every GPU baseline
+  h2d: pinned
+  h2d_overlap: true
+  d2h: pinned
+  d2h_overlap: true
+search_name: pes2o   # legs are pes2o__<system>__r<N>
+systems:             # round-1 order
+  novabf:
+    system: novabf
+    # stock nova-bf: no NOVABF_RANGED_CONC / NOVABF_TWOPASS_MIN_ROWS override
+    config: ../novabf/pes2o_ve_k1000.yaml
+  faiss: {system: faiss, preset: stock}     # stock faiss.knn_gpu
+  cuvs: {system: cuvs, preset: stock}       # stock cuVS brute force, cuVS's own recipe
+# legs write <this>/<run id>/<tag>
+novabf_output: ${WRITE}
+# no cold e2e leg here: the dense cold-start cost is measured once, on Coyo
+protocol: {rounds: 3}                       # the reported value is the median of 3 rotated rounds
+checks:
+  oracle_queries: 500                       # queries sampled for the float64 oracle
+  gt: ~/data/gt_22723.npz             # the dataset GT, all 22,723 rows (the `queries` step writes it)
+
+prep:
+  stage:
+    - {key: PES2O_QUERIES, path: data/labelled_queries.parquet,
+       source: ../pes2o_sample/labelled_queries.parquet, how: copy}
+  queries:
+    script: bench/prep/prep_queries_pes2o.py
+    args: [~/sky_workdir/data/labelled_queries.parquet, ~/data, 22723]

@@ -1,0 +1,31 @@
+# dense.yaml with dense_batch_size 128 (8 slices per 1000-row file) so a two-pass group sees
+# several slices per file: the diagnostic NOVA_BF_TWOPASS_ON_CPU cases can engage two-pass.
+# Otherwise mirrors runs/dense/configs/coyo_ve_k1000.yaml (params verbatim except io_workers, k),
+# tiny local fixture. No id_column: position-based md5 ids, as the old config.
+corpus:
+  path: ${NOVABF_FIX}/dense/corpus
+  dense_column: embedding
+queries:
+  path: ${NOVABF_FIX}/dense/queries.parquet
+  dense_column: embedding
+  id_column: query_id
+output:
+  path: ${NOVABF_OUT}
+params:
+  io_workers: 4
+  rust_fetch_dense: true
+  rust_fetch_columns: true
+  rust_fetch_concurrency: 512
+  rust_fetch_part_mib: 16
+  io_ranged_get: false
+  io_thread_count: 128
+  cpu_thread_count: 32
+  dense_batch_size: 128
+  allow_tf32: false
+  two_pass: auto
+  tiebreak: ordinal
+searches:
+  - name: dense_cosine
+    vector_type: dense
+    metric: cosine
+    k: 50

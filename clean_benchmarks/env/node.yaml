@@ -1,0 +1,15 @@
+# Shared SkyPilot configuration for all paper experiments.
+# bench launch adds experiment-specific settings.
+# image_id pins the prebuilt, verified paper environment.
+
+resources:
+  cloud: aws
+  region: us-east-1
+  image_id: ami-04dcd7b67b2c57a66
+  instance_type: g5.8xlarge
+  use_spot: false
+  disk_size: 200
+secrets:
+  AWS_ACCESS_KEY_ID: null
+  AWS_SECRET_ACCESS_KEY: null
+  AWS_SESSION_TOKEN: null

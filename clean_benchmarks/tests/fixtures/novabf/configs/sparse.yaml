@@ -1,0 +1,27 @@
+# Mirrors runs/sparse/configs/fineweb_100m_sparse_k1000.yaml (params verbatim except
+# io_workers and k), tiny local fixture. No id_column.
+corpus:
+  path: ${NOVABF_FIX}/sparse/corpus
+  sparse_column: sparse_embedding
+queries:
+  path: ${NOVABF_FIX}/sparse/queries.parquet
+  sparse_column: sparse_embedding
+  id_column: query_id
+output:
+  path: ${NOVABF_OUT}
+params:
+  io_workers: 4
+  rust_fetch_columns: true
+  rust_fetch_concurrency: 512
+  rust_fetch_part_mib: 16
+  io_ranged_get: false
+  io_thread_count: 128
+  cpu_thread_count: 32
+  sparse_batch_size: 4096
+  allow_tf32: false
+  tiebreak: ordinal
+searches:
+  - name: sparse_dot
+    vector_type: sparse
+    metric: dot
+    k: 20

@@ -1,0 +1,60 @@
+# Mirrors runs/filtered/configs/bf_gpu.yaml verbatim (four filtered searches in one pass,
+# no params block = nova-bf defaults) except k 1000 -> 20 and local fixture paths.
+corpus:
+  path: ${NOVABF_FIX}/filtered/corpus
+  dense_column: dense_embedding
+  id_column: id
+  date_fields: {date: rfc3339}
+queries:
+  path: ${NOVABF_FIX}/filtered/queries/queries.parquet
+  dense_column: dense_embedding
+  id_column: query_id
+  date_fields: {date_gte: rfc3339, date_lt: rfc3339}
+output:
+  path: ${NOVABF_OUT}
+searches:
+  - name: filtered_text
+    vector_type: dense
+    metric: cosine
+    k: 20
+    rows: {column: query_set, isin: [filtered_text]}
+    filter:
+      must:
+        - {field: text, match_text_from_query: keyword_phrase}
+      should:
+        - {field: url, match_text_from_query: domain_slot_1}
+        - {field: url, match_text_from_query: domain_slot_2}
+        - {field: url, match_text_from_query: domain_slot_3}
+        - {field: url, match_text_from_query: domain_slot_4}
+        - {field: url, match_text_from_query: domain_slot_5}
+        - {field: url, match_text_from_query: domain_slot_6}
+        - {field: url, match_text_from_query: domain_slot_7}
+        - {field: url, match_text_from_query: domain_slot_8}
+        - {field: url, match_text_from_query: domain_slot_9}
+  - name: structured
+    vector_type: dense
+    metric: cosine
+    k: 20
+    rows: {column: query_set, isin: [structured]}
+    filter:
+      must:
+        - {field: language_score, range_from_query: {gte: ls_gte}}
+        - {field: date, range_from_query: {gte: date_gte, lt: date_lt}}
+        - {field: dump, match_from_query: dump_set}
+  - name: static_struct
+    vector_type: dense
+    metric: cosine
+    k: 20
+    rows: {column: query_set, isin: [structured]}
+    filter:
+      must:
+        - {field: language_score, range: {gte: 0.9}}
+        - {field: dump, match: CC-MAIN-2013-20}
+  - name: static_text
+    vector_type: dense
+    metric: cosine
+    k: 20
+    rows: {column: query_set, isin: [structured]}
+    filter:
+      must:
+        - {field: text, match_text: health}

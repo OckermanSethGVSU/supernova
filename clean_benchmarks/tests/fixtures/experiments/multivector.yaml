@@ -1,0 +1,12 @@
+name: s4_multivector
+modality: multivector
+corpus: {path: tests/fixtures/novabf/multivector/corpus, column: multivector_embedding}
+queries: {path: tests/fixtures/novabf/multivector/queries.parquet, column: multivector_embedding, nq: 40}
+search: {k: 10, metric: ip}
+io: {files_in_flight: 2, gets: 64, part_mib: 16}
+threads: 2
+search_name: multivector
+systems:
+  novabf: {system: novabf, config: nb_mv.yaml}
+  cpu: stock
+protocol: {rounds: 2}

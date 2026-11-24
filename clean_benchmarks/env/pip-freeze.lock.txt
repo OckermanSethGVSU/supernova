@@ -1,0 +1,113 @@
+annotated-doc==0.0.6
+annotated-types==0.8.0
+anyio==4.16.0
+attrs @ file:///home/conda/feedstock_root/build_artifacts/bld/rattler-build_attrs_1773935801/work
+certifi==2026.10.23
+click==8.5.1
+cloudpickle @ file:///home/conda/feedstock_root/build_artifacts/bld/rattler-build_cloudpickle_1765303462/work
+colorama @ file:///home/conda/feedstock_root/build_artifacts/colorama_1733218098505/work
+coverage @ file:///home/conda/feedstock_root/build_artifacts/bld/rattler-build_coverage_h8b7ec3f_1794493831/work
+cuda-bindings @ file:///home/conda/feedstock_root/build_artifacts/bld/rattler-build_cuda-bindings_h80505a6_1793910350/work/cuda_bindings_13
+cuda-core @ file:///home/conda/feedstock_root/build_artifacts/bld/rattler-build_cuda-core_hb8f5ef8_1794359573/work/cuda_core
+cuda-pathfinder @ file:///home/conda/feedstock_root/build_artifacts/bld/rattler-build_cuda-pathfinder_h5ded981_1794590831/work/cuda_pathfinder
+cuda-tile @ file:///home/conda/feedstock_root/build_artifacts/bld/rattler-build_cutile-python_1786462186/work
+cuda-toolkit==13.2.2
+cupy @ file:///home/conda/feedstock_root/build_artifacts/bld/rattler-build_cupy-core_hae06e9d_1793229406/work
+cuvs @ file:///home/ubuntu/paper_env_build/cuvs/python/cuvs
+Cython @ file:///home/conda/feedstock_root/build_artifacts/cython_1793621982015/work
+datasets==5.2.0
+dill==0.4.1
+duckdb==1.5.3
+exceptiongroup @ file:///home/conda/feedstock_root/build_artifacts/exceptiongroup_1763918002538/work
+faiss==1.16.0
+filelock==4.2.10
+fsspec==2026.9.0
+h11==0.16.0
+hf-xet==1.8.0
+httpcore==1.0.9
+httpcore2==2.16.0
+httpx==0.28.1
+httpx2==2.16.0
+huggingface_hub==1.33.0
+idna==3.20
+iniconfig @ file:///home/conda/feedstock_root/build_artifacts/iniconfig_1791588459171/work
+Jinja2==3.1.6
+joblib @ file:///home/conda/feedstock_root/build_artifacts/bld/rattler-build_joblib_1788177170/work
+jsonpickle==4.1.4
+jsonschema @ file:///home/conda/feedstock_root/build_artifacts/bld/rattler-build_jsonschema_1787579299/work
+jsonschema-specifications @ file:///tmp/tmptzik3dqa/src
+markdown-it-py==4.3.0
+MarkupSafe==3.0.4
+mdurl==0.1.2
+mpmath==1.3.0
+multiprocess==0.70.19
+narwhals @ file:///home/conda/feedstock_root/build_artifacts/bld/rattler-build_narwhals_h5ded981_1793137426/work
+networkx==3.7
+# Editable install with no version control (nova-bf==0.0.1)
+-e /home/ubuntu/paper_src/python/nova-bf
+numpy @ file:///home/conda/feedstock_root/build_artifacts/bld/rattler-build_numpy_1791675329/work/dist/numpy-2.5.4-cp312-cp312-linux_x86_64.whl#sha256=178b27cd788a1fd47a724c4a529ca6054a72d95a6db1aea709048b7bbad60010
+nvidia-cublas==13.4.1.3
+nvidia-cuda-cccl==13.3.5.0.6
+nvidia-cuda-cupti==13.2.86
+nvidia-cuda-nvrtc==13.2.86
+nvidia-cuda-runtime==13.2.86
+nvidia-cudnn-cu13==9.26.0.51
+nvidia-cufft==12.2.0.57
+nvidia-cufile==1.17.1.22
+nvidia-curand==10.4.2.66
+nvidia-cusolver==12.2.0.11
+nvidia-cusparse==12.7.10.12
+nvidia-cusparselt-cu13==0.8.1
+nvidia-ml-py @ file:///home/conda/feedstock_root/build_artifacts/nvidia-ml-py_1790360033711/work
+nvidia-nccl-cu13==2.30.7
+nvidia-nvjitlink==13.2.86
+nvidia-nvshmem-cu13==3.7.2
+nvidia-nvtx==13.2.86
+packaging @ file:///home/conda/feedstock_root/build_artifacts/bld/rattler-build_packaging_1785888127/work
+pandas==3.1.1
+pathspec @ file:///home/conda/feedstock_root/build_artifacts/pathspec_1777271521463/work
+pluggy @ file:///home/conda/feedstock_root/build_artifacts/bld/rattler-build_pluggy_1792063298/work
+psutil==7.2.2
+pyarrow==26.0.1
+pydantic==2.14.3
+pydantic_core==2.50.4
+Pygments @ file:///home/conda/feedstock_root/build_artifacts/bld/rattler-build_pygments_1786995678/work
+pylate @ git+https://github.com/lightonai/pylate.git@3389837ce465ee66e46f369a3f821a96788b7f29
+pylibraft @ file:///tmp/conda-bld-output/bld/rattler-build_pylibraft/work/python/pylibraft
+pytest @ file:///home/conda/feedstock_root/build_artifacts/bld/rattler-build_pytest_hc364b38_1793214631/work
+pytest-cov @ file:///home/conda/feedstock_root/build_artifacts/bld/rattler-build_pytest-cov_1774139250/work
+python-dateutil==4.0.0
+PyYAML @ file:///home/conda/feedstock_root/build_artifacts/bld/rattler-build_pyyaml_h7575043_1793655133/work
+rapids-build-backend @ file:///opt/conda/conda-bld/work
+rapids-dependency-file-generator @ file:///opt/conda/conda-bld/rapids-dependency-file-generator_1785952083784/work
+referencing @ file:///home/conda/feedstock_root/build_artifacts/bld/rattler-build_referencing_1760379115/work
+regex==2026.11.9
+rich==15.0.0
+rmm @ file:///tmp/conda-bld-output/bld/rattler-build_rmm/work/python/rmm
+rpds-py @ file:///home/conda/feedstock_root/build_artifacts/bld/rattler-build_rpds-py_1791202435/work
+rust_fetch @ file:///home/ubuntu/paper_src/python/nova-bf/rust_io
+safetensors==0.8.0
+scikit-learn @ file:///home/conda/feedstock_root/build_artifacts/bld/rattler-build_scikit-learn_1790072954/work/dist/scikit_learn-1.9.1-cp312-cp312-linux_x86_64.whl#sha256=dbb573cd8e4936b82af641a64a2fc3f1136c059e98c32f437ee045b346ef8e11
+scikit_build_core @ file:///home/conda/feedstock_root/build_artifacts/bld/rattler-build_scikit-build-core_hcb39dcd_1793712521/work
+scipy @ file:///home/conda/feedstock_root/build_artifacts/scipy-split_1779873994017/work/dist/scipy-1.17.1-cp312-cp312-linux_x86_64.whl#sha256=8a80a2a1584252bc5753f7a19c86f8a8c7729dacc98f5845c78b4205f8eae632
+sentence-transformers==5.3.0
+setuptools==84.2.1
+shellingham==1.5.4
+spare @ git+https://github.com/ieeta-pt/SPARe.git@e7f4ad13696233ee10720aafe65d8aa2325f320e
+sympy==1.14.0
+threadpoolctl @ file:///home/conda/feedstock_root/build_artifacts/threadpoolctl_1794306916735/work
+tokenizers==0.22.2
+tomli @ file:///home/conda/feedstock_root/build_artifacts/bld/rattler-build_tomli_1791394576/work
+tomlkit @ file:///home/conda/feedstock_root/build_artifacts/bld/rattler-build_tomlkit_1792143573/work
+torch==2.15.0+cu132
+tqdm==4.70.1
+transformers==5.3.0
+triton==3.9.0
+truststore==0.10.5
+typer==0.29.1
+typing-inspection==0.4.5
+typing_extensions @ file:///home/conda/feedstock_root/build_artifacts/bld/rattler-build_typing_extensions_1783002732/work
+tzdata==2026.6
+ucxx @ file:///tmp/conda-bld-output/bld/rattler-build_ucxx/work/python/ucxx
+wheel==0.48.0
+xxhash==4.1.0

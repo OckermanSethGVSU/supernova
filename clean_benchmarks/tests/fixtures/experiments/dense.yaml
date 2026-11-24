@@ -1,0 +1,13 @@
+name: s4_dense
+modality: dense
+corpus: {path: tests/fixtures/novabf/dense/corpus, column: embedding}
+queries: {path: tests/fixtures/novabf/dense/queries.parquet, column: embedding, nq: 300}
+search: {k: 10, metric: cosine}
+io: {files_in_flight: 2, gets: 64, part_mib: 16}
+threads: 2
+search_name: dense
+systems:
+  novabf: {system: novabf, config: nb_dense.yaml}
+  cpu: stock
+e2e: {system: novabf, keep_cache: true}   # the cold-leg path; keep_cache: never clear this box's caches
+protocol: {rounds: 2}

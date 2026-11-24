@@ -1,0 +1,23 @@
+diff --git a/cpp/cmake/modules/generate_cutile_kernels.cmake b/cpp/cmake/modules/generate_cutile_kernels.cmake
+index d580395..5d100f3 100644
+--- a/cpp/cmake/modules/generate_cutile_kernels.cmake
++++ b/cpp/cmake/modules/generate_cutile_kernels.cmake
+@@ -31,6 +31,18 @@ function(_cutile_kernels_setup)
+ 
+   find_package(CUDAToolkit REQUIRED)
+ 
++  # nova-bf paper stack patch 0002: CUVS_ENABLE_CUTILE=OFF takes the same path as a CUDA < 13
++  # build (no cuTile kernels; CUVS_CUTILE_ENABLED=0, the classic fused 1-NN kernels are used).
++  # Needed at CUDA 13.2: tileiras 13.2 has no sm_90 target, which the fused_1nn matrix requires.
++  if(DEFINED CUVS_ENABLE_CUTILE AND NOT CUVS_ENABLE_CUTILE)
++    message(STATUS "cuTile embedded kernels disabled (CUVS_ENABLE_CUTILE=OFF)")
++    set(_CUTILE_SETUP_OK
++        FALSE
++        PARENT_SCOPE
++    )
++    return()
++  endif()
++
+   if(CUDAToolkit_VERSION VERSION_LESS 13.0)
+     message(
+       STATUS

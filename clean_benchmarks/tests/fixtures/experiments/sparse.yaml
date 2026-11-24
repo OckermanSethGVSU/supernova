@@ -1,0 +1,12 @@
+name: s4_sparse
+modality: sparse
+corpus: {path: tests/fixtures/novabf/sparse/corpus, column: sparse_embedding}
+queries: {path: tests/fixtures/novabf/sparse/queries.parquet, column: sparse_embedding, nq: 120}
+search: {k: 10, metric: ip}
+io: {files_in_flight: 2, gets: 64, part_mib: 16}
+threads: 2
+search_name: sparse
+systems:
+  novabf: {system: novabf, config: nb_sparse.yaml}
+  cpu: stock
+protocol: {rounds: 2}

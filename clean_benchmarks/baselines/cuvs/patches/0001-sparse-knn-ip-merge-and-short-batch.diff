@@ -1,0 +1,338 @@
+diff --git a/cpp/src/neighbors/detail/sparse_knn.cuh b/cpp/src/neighbors/detail/sparse_knn.cuh
+index 2f206178..2ca875cb 100644
+--- a/cpp/src/neighbors/detail/sparse_knn.cuh
++++ b/cpp/src/neighbors/detail/sparse_knn.cuh
+@@ -10,7 +10,10 @@
+ #include <raft/core/copy.cuh>
+ #include <raft/core/device_mdspan.hpp>
+ #include <raft/core/host_mdspan.hpp>
++#include <raft/core/operators.hpp>
+ #include <raft/core/resource/cuda_stream.hpp>
++#include <raft/linalg/map.cuh>
++#include <raft/matrix/init.cuh>
+ 
+ #include <cuvs/neighbors/knn_merge_parts.hpp>
+ #include <cuvs/selection/select_k.hpp>
+@@ -25,6 +28,7 @@
+ #include <rmm/device_uvector.hpp>
+ 
+ #include <algorithm>
++#include <limits>
+ 
+ namespace cuvs::neighbors::detail {
+ 
+@@ -336,13 +340,40 @@ class sparse_knn_t {
+ 
+     // combine merge buffers only if there's more than 1 partition to combine
+     auto rows = query_batcher.batch_rows();
++
++    // knn_merge_parts always keeps the SMALLEST values (BlockSelect Dir=false, kInit=max), which
++    // is only correct for metrics where smaller is closer. For similarities such as InnerProduct
++    // (larger is closer, and perform_k_selection below selects descending for them) the merge
++    // would keep the worst of the two per-batch top-k lists once there is more than one index
++    // batch. Same workaround the other knn_merge_parts callers already use: negate the inputs,
++    // merge, then negate the merged output back -- see tiered_index.cuh (search, "knn_merge_parts
++    // doesn't currently support InnerProduct distances etc / instead negate here and then undo
++    // after") and mg/snmg.cuh (the `if (!select_min)` mul_const_op(-1) blocks around its
++    // knn_merge_parts calls). The input partitions are scratch (slot 0 is overwritten by the
++    // merged result and slot 1 by the next batch's selection), so they are not negated back.
++    bool const select_min = cuvs::distance::is_min_close(metric);
++    auto in_dists =
++      raft::make_device_matrix_view<value_t, int64_t>(merge_buffer_dists, rows, 2 * k);
++    auto merged_dists = raft::make_device_matrix_view<value_t, int64_t>(out_dists, rows, k);
++    if (!select_min) {
++      raft::linalg::map(
++        handle, in_dists, raft::mul_const_op<value_t>(-1), raft::make_const_mdspan(in_dists));
++    }
++
+     knn_merge_parts(
+       handle,
+-      raft::make_device_matrix_view<const value_t, int64_t>(merge_buffer_dists, rows, 2 * k),
++      raft::make_const_mdspan(in_dists),
+       raft::make_device_matrix_view<const value_idx, int64_t>(merge_buffer_indices, rows, 2 * k),
+-      raft::make_device_matrix_view<value_t, int64_t>(out_dists, rows, k),
++      merged_dists,
+       raft::make_device_matrix_view<value_idx, int64_t>(out_indices, rows, k),
+       raft::make_device_vector_view<value_idx, int64_t>(trans.data(), id_ranges.size()));
++
++    if (!select_min) {
++      raft::linalg::map(handle,
++                        merged_dists,
++                        raft::mul_const_op<value_t>(-1),
++                        raft::make_const_mdspan(merged_dists));
++    }
+   }
+ 
+   void perform_k_selection(csr_batcher_t<value_idx, value_t> idx_batcher,
+@@ -366,16 +397,78 @@ class sparse_knn_t {
+ 
+     bool ascending = cuvs::distance::is_min_close(metric);
+ 
+-    // kernel to slice first (min) k cols and copy into batched merge buffer
++    auto in_dists_view =
++      raft::make_device_matrix_view<const value_t, int64_t>(batch_dists, batch_rows, batch_cols);
++    auto in_indices_view = raft::make_device_matrix_view<const value_idx, int64_t>(
++      batch_indices, batch_rows, batch_cols);
++
++    if (n_neighbors == static_cast<value_idx>(k)) {
++      // kernel to slice first (min) k cols and copy into batched merge buffer
++      cuvs::selection::select_k(
++        handle,
++        in_dists_view,
++        in_indices_view,
++        raft::make_device_matrix_view<value_t, int64_t>(out_dists, batch_rows, n_neighbors),
++        raft::make_device_matrix_view<value_idx, int64_t>(out_indices, batch_rows, n_neighbors),
++        ascending,
++        true);
++      return;
++    }
++
++    // Short batch (fewer than k index rows, e.g. the last index batch when n_idx_rows %
++    // batch_size_index < k, or every batch when batch_size_index < k). Every consumer of out_* --
++    // knn_merge_parts (reads part p, row r at p * n_samples * k + r * k), the copy back into merge
++    // slot 0 and the final copy to the output (batch_rows * k each) -- assumes a row stride of k.
++    // Writing the select_k result densely as (batch_rows, n_neighbors) would make every row after
++    // the first read other queries' candidates, and leave the tail of the slot holding the
++    // previous batch's (already merged, possibly sign-flipped) entries with wrong ids. So: select
++    // into a dense temporary, fill the whole (batch_rows, k) slot with a sentinel that never
++    // wins, then copy the temporary in with a row pitch of k.
++    //
++    // Sentinel: the worst possible value in the selection direction, with id -1 -- the same
++    // (kInit, vInit) padding knn_merge_parts itself uses (detail/knn_merge_parts.cuh:
++    // kInit = numeric_limits::max(), vInit = -1). For similarity metrics it is lowest(), which
++    // the sign flip in merge_batches turns into max(), so it also never displaces a real entry
++    // there. Fill idiom: raft::matrix::fill as in refine/refine_device.cuh and mg/snmg.cuh;
++    // pitched device copy: cudaMemcpy2DAsync on the handle's raw stream (.get(), as elsewhere in
++    // this file) as in ivf_rabitq.cu.
++    auto stream = raft::resource::get_cuda_stream(handle);
++    rmm::device_uvector<value_t> tmp_dists((size_t)batch_rows * n_neighbors, stream);
++    rmm::device_uvector<value_idx> tmp_indices((size_t)batch_rows * n_neighbors, stream);
++
+     cuvs::selection::select_k(
+       handle,
+-      raft::make_device_matrix_view<const value_t, int64_t>(batch_dists, batch_rows, batch_cols),
+-      raft::make_device_matrix_view<const value_idx, int64_t>(
+-        batch_indices, batch_rows, batch_cols),
+-      raft::make_device_matrix_view<value_t, int64_t>(out_dists, batch_rows, n_neighbors),
+-      raft::make_device_matrix_view<value_idx, int64_t>(out_indices, batch_rows, n_neighbors),
++      in_dists_view,
++      in_indices_view,
++      raft::make_device_matrix_view<value_t, int64_t>(tmp_dists.data(), batch_rows, n_neighbors),
++      raft::make_device_matrix_view<value_idx, int64_t>(
++        tmp_indices.data(), batch_rows, n_neighbors),
+       ascending,
+       true);
++
++    value_t const sentinel = ascending ? std::numeric_limits<value_t>::max()
++                                       : std::numeric_limits<value_t>::lowest();
++    raft::matrix::fill(
++      handle, raft::make_device_vector_view(out_dists, (size_t)batch_rows * k), sentinel);
++    raft::matrix::fill(
++      handle, raft::make_device_vector_view(out_indices, (size_t)batch_rows * k), value_idx(-1));
++
++    RAFT_CUDA_TRY(cudaMemcpy2DAsync(out_dists,
++                                    sizeof(value_t) * k,
++                                    tmp_dists.data(),
++                                    sizeof(value_t) * n_neighbors,
++                                    sizeof(value_t) * n_neighbors,
++                                    batch_rows,
++                                    cudaMemcpyDefault,
++                                    stream.get()));
++    RAFT_CUDA_TRY(cudaMemcpy2DAsync(out_indices,
++                                    sizeof(value_idx) * k,
++                                    tmp_indices.data(),
++                                    sizeof(value_idx) * n_neighbors,
++                                    sizeof(value_idx) * n_neighbors,
++                                    batch_rows,
++                                    cudaMemcpyDefault,
++                                    stream.get()));
+   }
+ 
+   void compute_distances(csr_batcher_t<value_idx, value_t>& idx_batcher,
+diff --git a/cpp/tests/neighbors/sparse_brute_force.cu b/cpp/tests/neighbors/sparse_brute_force.cu
+index c73d4c37..f0d0dbac 100644
+--- a/cpp/tests/neighbors/sparse_brute_force.cu
++++ b/cpp/tests/neighbors/sparse_brute_force.cu
+@@ -12,6 +12,11 @@
+ #include <cusparse_v2.h>
+ #include <gtest/gtest.h>
+ 
++#include <algorithm>
++#include <cstdint>
++#include <numeric>
++#include <vector>
++
+ namespace cuvs {
+ namespace neighbors {
+ 
+@@ -155,10 +160,169 @@ const std::vector<SparseKNNInputs<int, float>> inputs_i32_f = {
+    2,
+    2,
+    2,
+-   cuvs::distance::DistanceType::L2SqrtExpanded}};
++   cuvs::distance::DistanceType::L2SqrtExpanded},
++  // Similarity metric across MORE THAN ONE index batch (4 rows, batch_size_index 2), so the
++  // per-batch top-k lists go through knn_merge_parts. Rows r0=(1,0) r1=(2,1) r2=(3,3) r3=(0,4);
++  // every query's inner products are distinct, largest first. Before the sign flip in
++  // sparse_knn_t::merge_batches the min-only merge returned e.g. {r3: 0, r0: 1} for q0.
++  {2,                                   // ncols
++   {0, 1, 3, 5, 6},                     // indptr
++   {0, 0, 1, 0, 1, 1},                  // indices
++   {1.0f, 2.0f, 1.0f, 3.0f, 3.0f, 4.0f},  // data
++   {3, 2, 9, 5, 18, 12, 16, 12},        // dists (raw dot products, descending)
++   {2, 1, 2, 1, 2, 3, 3, 2},            // inds
++   2,
++   2,
++   2,
++   cuvs::distance::DistanceType::InnerProduct},
++  // Same data, a distance metric (1 - cos, ascending) across two index batches: the merge must
++  // stay as-is for min-close metrics (no sign flip).
++  {2,                                   // ncols
++   {0, 1, 3, 5, 6},                     // indptr
++   {0, 0, 1, 0, 1, 1},                  // indices
++   {1.0f, 2.0f, 1.0f, 3.0f, 3.0f, 4.0f},  // data
++   {0, 0.105573, 0, 0.0513167, 0, 0.0513167, 0, 0.292893},  // dists
++   {0, 1, 1, 2, 2, 1, 3, 2},            // inds
++   2,
++   2,
++   2,
++   cuvs::distance::DistanceType::CosineExpanded},
++  // Index batches with FEWER than k rows (perform_k_selection pads its output to row stride k).
++  // Generated with integer data so every score is exact and no query ties at the k-th place;
++  // each case returns wrong neighbours on the unpatched code.
++  // short last index batch (5 rows, bi 4 -> last batch 1 row < k), uneven query batches
++  {3,
++   {0, 3, 6, 9, 12, 15},
++   {0, 1, 2, 0, 1, 2, 0, 1, 2, 0, 1, 2, 0, 1, 2},
++   {1.0f, -3.0f, -3.0f, -3.0f, 4.0f, 1.0f, -1.0f, 2.0f, 2.0f, 4.0f, -1.0f, 2.0f, 2.0f, 4.0f, 2.0f},
++   {19, 1, -13, 26, 13, 12, 13, 10, 9, 21, 8, 1, 24, 12, 10},
++   {0, 3, 2, 1, 2, 4, 1, 4, 2, 3, 4, 0, 4, 1, 2},
++   3,
++   4,
++   2,
++   cuvs::distance::DistanceType::InnerProduct},
++  // same, distance metric
++  {3,
++   {0, 3, 6, 9, 12, 15},
++   {0, 1, 2, 0, 1, 2, 0, 1, 2, 0, 1, 2, 0, 1, 2},
++   {1.0f, -3.0f, -3.0f, -3.0f, 4.0f, 1.0f, -1.0f, 2.0f, 2.0f, 4.0f, -1.0f, 2.0f, 2.0f, 4.0f, 2.0f},
++   {0, 38, 54, 0, 9, 26, 0, 9, 13, 0, 29, 34, 0, 13, 26},
++   {0, 3, 2, 1, 2, 4, 2, 1, 4, 3, 4, 2, 4, 2, 1},
++   3,
++   4,
++   2,
++   cuvs::distance::DistanceType::L2Expanded},
++  // 3 index batches (4, 4, 1) > k then short; signed IP, 2 merges carry the flip
++  {3,
++   {0, 3, 6, 9, 12, 15, 18, 21, 24, 27},
++   {0, 1, 2, 0, 1, 2, 0, 1, 2, 0, 1, 2, 0, 1, 2, 0, 1, 2, 0, 1, 2, 0, 1, 2, 0, 1, 2},
++   {3.0f, -4.0f, -4.0f, 1.0f, 3.0f, -3.0f, 1.0f, -3.0f, -3.0f, 3.0f, -1.0f, -2.0f, -2.0f, -2.0f,
++    -4.0f, 3.0f, 4.0f, 2.0f, 4.0f, 4.0f, 4.0f, -1.0f, 3.0f, 3.0f, 4.0f, -4.0f, 3.0f},
++   {41, 27, 21, 19, 9, 6, 27, 19, 16, 21, 14, 12, 24, 18, 16, 36, 29, 15, 48, 36, 20, 20, 19, 15,
++    41, 16, 12},
++   {0, 2, 3, 1, 5, 3, 0, 2, 4, 0, 3, 2, 4, 0, 2, 6, 5, 7, 6, 5, 7, 6, 7, 5, 8, 0, 6},
++   3,
++   4,
++   4,
++   cuvs::distance::DistanceType::InnerProduct},
++  // same, distance metric
++  {3,
++   {0, 3, 6, 9, 12, 15, 18, 21, 24, 27},
++   {0, 1, 2, 0, 1, 2, 0, 1, 2, 0, 1, 2, 0, 1, 2, 0, 1, 2, 0, 1, 2, 0, 1, 2, 0, 1, 2},
++   {3.0f, -4.0f, -4.0f, 1.0f, 3.0f, -3.0f, 1.0f, -3.0f, -3.0f, 3.0f, -1.0f, -2.0f, -2.0f, -2.0f,
++    -4.0f, 3.0f, 4.0f, 2.0f, 4.0f, 4.0f, 4.0f, -1.0f, 3.0f, 3.0f, 4.0f, -4.0f, 3.0f},
++   {0, 6, 13, 0, 21, 30, 0, 6, 9, 0, 9, 13, 0, 11, 29, 0, 5, 18, 0, 5, 27, 0, 18, 27, 0, 35, 46},
++   {0, 2, 3, 1, 3, 5, 2, 0, 3, 3, 2, 0, 4, 2, 0, 5, 6, 7, 6, 5, 7, 7, 5, 6, 8, 3, 2},
++   3,
++   4,
++   4,
++   cuvs::distance::DistanceType::L2Expanded},
++  // batch_size_index < k: every index batch short
++  {3,
++   {0, 3, 6, 9, 12, 15, 18},
++   {0, 1, 2, 0, 1, 2, 0, 1, 2, 0, 1, 2, 0, 1, 2, 0, 1, 2},
++   {3.0f, 1.0f, 1.0f, -1.0f, -2.0f, 4.0f, -4.0f, -2.0f, 2.0f, 1.0f, -4.0f, 4.0f, -1.0f, -1.0f,
++    -3.0f, 2.0f, 2.0f, -1.0f},
++   {11, 7, 3, 23, 21, 16, 24, 16, 12, 33, 23, 12, 11, 0, -1, 9, 7, -1},
++   {0, 5, 3, 3, 1, 2, 2, 1, 3, 3, 1, 2, 4, 2, 5, 5, 0, 4},
++   3,
++   2,
++   3,
++   cuvs::distance::DistanceType::InnerProduct}};
++// Larger generated cases. k = 40 runs knn_merge_parts' main warp-strided loop (2k >= 32), which
++// the k <= 3 cases above never reach, through several merges, with a short last index batch
++// and uneven query batches. Data: a fixed 64-bit LCG -> integers in [-500, 500] \ {0}, every
++// row dense. Every score is an exact float32 integer (|score| < 2^24) and, for seed 3, no query
++// has a tie at or above its (k+1)-th place (checked offline), so the expected order is unique.
++static SparseKNNInputs<int, float> make_lcg_case(int n_rows,
++                                                 int n_cols,
++                                                 int k,
++                                                 int batch_size_index,
++                                                 int batch_size_query,
++                                                 cuvs::distance::DistanceType metric,
++                                                 uint64_t seed)
++{
++  std::vector<double> x(static_cast<size_t>(n_rows) * n_cols);
++  uint64_t state = seed;
++  for (auto& v : x) {
++    state = state * 6364136223846793005ULL + 1442695040888963407ULL;
++    int r = static_cast<int>((state >> 33) % 1000);
++    v     = r < 500 ? r - 500 : r - 499;
++  }
++
++  SparseKNNInputs<int, float> in;
++  in.n_cols = n_cols;
++  for (int i = 0; i <= n_rows; i++) {
++    in.indptr_h.push_back(i * n_cols);
++  }
++  for (size_t i = 0; i < x.size(); i++) {
++    in.indices_h.push_back(static_cast<int>(i % n_cols));
++    in.data_h.push_back(static_cast<float>(x[i]));
++  }
++
++  bool const ip = metric == cuvs::distance::DistanceType::InnerProduct;
++  std::vector<double> sq(n_rows, 0.0);
++  for (int i = 0; i < n_rows; i++) {
++    for (int j = 0; j < n_cols; j++) {
++      sq[i] += x[i * n_cols + j] * x[i * n_cols + j];
++    }
++  }
++  std::vector<double> score(n_rows);
++  std::vector<int> order(n_rows);
++  for (int q = 0; q < n_rows; q++) {
++    for (int r = 0; r < n_rows; r++) {
++      double dot = 0.0;
++      for (int j = 0; j < n_cols; j++) {
++        dot += x[q * n_cols + j] * x[r * n_cols + j];
++      }
++      score[r] = ip ? dot : sq[q] + sq[r] - 2.0 * dot;  // InnerProduct / L2Expanded
++    }
++    std::iota(order.begin(), order.end(), 0);
++    std::stable_sort(order.begin(), order.end(), [&](int a, int b) {
++      return ip ? score[a] > score[b] : score[a] < score[b];
++    });
++    for (int i = 0; i < k; i++) {
++      in.out_dists_ref_h.push_back(static_cast<float>(score[order[i]]));
++      in.out_indices_ref_h.push_back(order[i]);
++    }
++  }
++  in.k                = k;
++  in.batch_size_index = batch_size_index;
++  in.batch_size_query = batch_size_query;
++  in.metric           = metric;
++  return in;
++}
++
++// 200 rows: index batches of 48 (48, 48, 48, 48, 8 -- last one short of k) or 32 (every batch
++// short of k), query batches of 64 (64, 64, 64, 8).
++const std::vector<SparseKNNInputs<int, float>> inputs_lcg = {
++  make_lcg_case(200, 8, 40, 48, 64, cuvs::distance::DistanceType::InnerProduct, 3),
++  make_lcg_case(200, 8, 40, 48, 64, cuvs::distance::DistanceType::L2Expanded, 3),
++  make_lcg_case(200, 8, 40, 32, 64, cuvs::distance::DistanceType::InnerProduct, 3)};
+ typedef SparseKNNTest<int, float> SparseKNNTestF;
+ TEST_P(SparseKNNTestF, Result) { compare(); }
+ INSTANTIATE_TEST_CASE_P(SparseKNNTest, SparseKNNTestF, ::testing::ValuesIn(inputs_i32_f));
++INSTANTIATE_TEST_CASE_P(SparseKNNTestLarge, SparseKNNTestF, ::testing::ValuesIn(inputs_lcg));
+ 
+ };  // end namespace neighbors
+ };  // end namespace cuvs

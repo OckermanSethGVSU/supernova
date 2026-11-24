@@ -1,0 +1,43 @@
+# results/: written only by bench; the data is ignored, the summaries are tracked
+# and so are the files that say what ran: manifest / experiment / checks / launch;
+# legs/ and logs/ stay ignored
+/results/**
+!/results/**/
+!/results/**/summary.csv
+!/results/**/summary.md
+!/results/**/manifest.json
+!/results/**/experiment.json
+!/results/**/checks.json
+!/results/**/launch.json
+# the evidence a `chosen_from:` points at: a sweep's grid and table, and an events
+# sweep's table (their manifest.json is tracked by the rule above)
+!/results/sweeps/**/sweep.json
+!/results/sweeps/**/sweep_table.csv
+!/results/sweeps/**/sweep_table.md
+!/results/sweeps/**/events_table.md
+!/results/sweeps/**/events_table.json
+/results/**/legs/**
+/results/**/logs/**
+# in a launch dir only launch.json is tracked (the rule above); its staged code
+# copy (stage/) and the node's rsynced ~/res and run.log (node/) never are, whatever a file in
+# them is named (last match wins: after every negation above)
+/results/**/launch/*/stage/**
+/results/**/launch/*/node/**
+!/results/.gitkeep
+# built artifacts
+__pycache__/
+*.egg-info/
+/baselines/cuvs/sparse_binding/libnova_cuvs_sparse.so
+# the repo root's .gitignore ignores every `env/` (virtualenvs); this one is code:
+# the pinned environment
+!/env/
+/.review_scratch/
+# the private path values (local_paths.env.example lists the names)
+/experiments/local_paths.env
+# test fixture data: generated on demand by tests/fixtures/novabf/make_fixtures.py
+/tests/fixtures/novabf/dense/
+/tests/fixtures/novabf/sparse/
+/tests/fixtures/novabf/multivector/
+/tests/fixtures/novabf/filtered/
+
+/tests/fixtures/novabf/.generate.lock

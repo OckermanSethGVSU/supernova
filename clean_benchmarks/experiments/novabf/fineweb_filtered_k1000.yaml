@@ -1,0 +1,64 @@
+# nova-bf: exact top-1000 cosine search over FineWeb, restricted by a filter. Four searches:
+# text_per_query and structured_per_query give each query its own text or structured filter;
+# structured_fixed and text_fixed use one filter for every query. A leg runs one of them.
+corpus:
+  path: data/corpus
+  dense_column: dense_embedding
+  date_fields: {date: rfc3339}
+queries:
+  path: data/queries/queries.parquet
+  dense_column: dense_embedding
+  id_column: query_id
+  date_fields: {date_gte: rfc3339, date_lt: rfc3339}
+output:
+  path: out/nova
+searches:
+  - name: text_per_query
+    vector_type: dense
+    metric: cosine
+    k: 1000
+    rows: {column: query_set, isin: [filtered_text]}
+    filter:
+      must:
+        - {field: text, match_text_from_query: keyword_phrase}
+      should:
+        - {field: url, match_text_from_query: domain_slot_1}
+        - {field: url, match_text_from_query: domain_slot_2}
+        - {field: url, match_text_from_query: domain_slot_3}
+        - {field: url, match_text_from_query: domain_slot_4}
+        - {field: url, match_text_from_query: domain_slot_5}
+        - {field: url, match_text_from_query: domain_slot_6}
+        - {field: url, match_text_from_query: domain_slot_7}
+        - {field: url, match_text_from_query: domain_slot_8}
+        - {field: url, match_text_from_query: domain_slot_9}
+  - name: structured_per_query
+    vector_type: dense
+    metric: cosine
+    k: 1000
+    rows: {column: query_set, isin: [structured]}
+    filter:
+      must:
+        - {field: language_score, range_from_query: {gte: ls_gte}}
+        - {field: date, range_from_query: {gte: date_gte, lt: date_lt}}
+        - {field: dump, match_from_query: dump_set}
+  - name: structured_fixed
+    vector_type: dense
+    metric: cosine
+    k: 1000
+    rows: {column: query_set, isin: [structured]}
+    filter:
+      must:
+        - {field: language_score, range: {gte: 0.9}}
+        - {field: dump, match: CC-MAIN-2013-20}
+  - name: text_fixed
+    vector_type: dense
+    metric: cosine
+    k: 1000
+    rows: {column: query_set, isin: [structured]}
+    filter:
+      must:
+        - {field: text, match_text: health}
+params:
+  io_workers: ${NOVABF_IO_WORKERS:-16}
+  rust_fetch_concurrency: ${NOVABF_RUST_FETCH_CONC:-128}
+  rust_fetch_part_mib: ${NOVABF_RUST_FETCH_PART_MIB:-16}
