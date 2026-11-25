@@ -155,6 +155,9 @@ def compare_args(exp: dict, search: dict, novabf_path: str | None, id_mode: str)
     gt = (exp.get("checks") or {}).get("gt")
     if gt:
         argv += ["--gt", _abs(gt)]
+    rmg = (exp.get("checks") or {}).get("rescore_max_gib")
+    if rmg is not None:   # the rescoring's memory cap (the pairs' and the oracle's)
+        argv += ["--rescore-max-gib", f"{float(rmg):g}"]
     qr = _query_rows(exp, search)
     if qr:
         argv += ["--query-rows", qr]

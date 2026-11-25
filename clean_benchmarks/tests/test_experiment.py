@@ -374,3 +374,15 @@ def test_an_unpinned_files_in_flight_sweep_prepares(tmp_path):
     from bench import experiment as E
     _, v, _ = E.load_sweep(_sweep(tmp_path, "{system: cuvs, preset: stock}"))
     assert len(v) == 3
+
+
+def test_checks_rescore_max_gib_reaches_compare():
+    from bench.verify import agree
+    e = _exp("dense_coyo", ["checks.rescore_max_gib=100"])
+    argv = agree.compare_args(e, e["searches"][0], None, "md5")
+    assert argv[argv.index("--rescore-max-gib") + 1] == "100"
+    e = _exp("dense_coyo")
+    assert "--rescore-max-gib" not in agree.compare_args(e, e["searches"][0], None, "md5")
+    for bad in ("0", "true", "x"):
+        with pytest.raises(E.ExperimentError, match="rescore_max_gib"):
+            _exp("dense_coyo", [f"checks.rescore_max_gib={bad}"])

@@ -31,9 +31,11 @@ Top-level fields:
   e2e         {system, keep_cache: false, tiebreak}: cold end-to-end nova-bf run;
               tiebreak {mode: ordinal | id, field} (id: ties ordered by that corpus field)
   protocol    {rounds: 3}
-  checks      {oracle_queries: 500, gt: null, exact_scan: false, max_score_ulps}
+  checks      {oracle_queries: 500, gt: null, exact_scan: false, max_score_ulps, rescore_max_gib}
               gt is reference-only; exact_scan uses a full float64 scan.
               max_score_ulps enables failure on excessive score error.
+              rescore_max_gib: the float64 rescoring's memory cap (compare.py's default 32 GiB);
+              a wide corpus on a big node raises it rather than checking fewer queries.
               copies_files / verify_files / check_repeats: bench check-copies /
               check-verify's corpus files and timed passes (their flags override them).
   prep        Data preparation steps used by bench launch:
@@ -82,7 +84,7 @@ SECTIONS = {
     "copies": (set(), {"h2d", "h2d_overlap", "d2h", "d2h_overlap"}),
     "filter": ({"config"}, {"config"}),
     "protocol": (set(), {"rounds"}),
-    "checks": (set(), {"oracle_queries", "gt", "exact_scan", "max_score_ulps",
+    "checks": (set(), {"oracle_queries", "gt", "exact_scan", "max_score_ulps", "rescore_max_gib",
                        "copies_files", "verify_files", "check_repeats"}),
     "e2e": ({"system"}, {"system", "keep_cache", "tiebreak"}),
     "subset": ({"files"}, {"files"}),
@@ -200,6 +202,9 @@ def validate(doc: dict, where: str = "") -> dict:
     msu = e["checks"].get("max_score_ulps")
     if msu is not None and (isinstance(msu, bool) or not isinstance(msu, (int, float)) or not msu >= 0):
         raise ExperimentError(f"{where}checks.max_score_ulps: a number >= 0 (or unset)")
+    rmg = e["checks"].get("rescore_max_gib")
+    if rmg is not None and (isinstance(rmg, bool) or not isinstance(rmg, (int, float)) or not rmg > 0):
+        raise ExperimentError(f"{where}checks.rescore_max_gib: a number > 0 (or unset)")
     for k in ("copies_files", "verify_files", "check_repeats"):
         if k in e["checks"]:
             _int(e["checks"][k], f"{where}checks.{k}")
