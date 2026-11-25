@@ -532,10 +532,10 @@ def test_cpu_sweep_writes_its_table_and_pick_prints_the_yaml_change(tmp_path):
 
 @pytest.mark.slow
 def test_placeholders_and_dev_refusals(tmp_path):
-    p = bench("run", os.path.join(CB, "experiments", "sparse", "fineweb.yaml"), "--dev",
+    p = bench("run", os.path.join(CB, "tests", "fixtures", "experiments", "sparse", "fineweb.yaml"), "--dev",
               "--results", str(tmp_path))
     assert p.returncode == 2 and "placeholder" in p.stderr
-    p = bench("run", os.path.join(CB, "experiments", "dense", "coyo.yaml"), "--dev",
+    p = bench("run", os.path.join(CB, "tests", "fixtures", "experiments", "dense", "coyo.yaml"), "--dev",
               "--results", str(tmp_path))
     assert p.returncode == 2 and "does not run on a CPU dev box" in p.stderr
     assert not os.listdir(tmp_path)   # nothing started
@@ -569,5 +569,5 @@ def test_summary_and_manifest_carry_the_s7_fields(runs, shape):
     md = open(os.path.join(d, "summary.md")).read()
     assert "median footer read s" in md and "Where the time goes" in md and "never added to median_s" in md
     m = json.load(open(os.path.join(d, "manifest.json")))
-    assert set(m["prep"]) == {"stage", "queries", "queries_src", "replicate", "download", "textscan"}
+    assert set(m["prep"]) == {"stage", "queries", "queries_src"}
     assert m["novabf_native_textscan"] and "dirty_paths" in m

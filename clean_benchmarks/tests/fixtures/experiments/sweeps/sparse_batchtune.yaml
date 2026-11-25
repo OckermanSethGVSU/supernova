@@ -1,0 +1,12 @@
+# Batch sizes on the first 8 files: cuVS --cuvs-sparse-batches (index x query rows; stock =
+# cuVS's own), then batched SPARe (dot) --spare-max-mib. Leg order: the cuVS grid, then SPARe's.
+name: sparse_batchtune
+base: ../sparse/fineweb.yaml
+sweep:
+  - system: cuvs
+    grid: {cuvs_sparse_batches: [stockxstock, filexstock, 8192x32768, 65536x32768]}
+  - system: spare
+    grid: {spare_max_mib: [2048, 4096, 8192]}
+subset: {files: 8}
+# protocol: one warm run per variant by default (`bench sweep --rounds 3` for 3 rounds and a
+# spread)

@@ -12,7 +12,8 @@ queries:
   nq: 22723                                                      # every labelled query
 search: {k: 1000, metric: cosine}
 io:
-  # one setting for every system: 4 files in flight (Pes2o's files are large), 512 ranged GETs
+  # the default for every system (a system's own `io:`, its I/O sweep winner, overrides it):
+  # 4 files in flight (Pes2o's files are large), 512 ranged GETs
   # of 16 MiB parts, the native reader, the GET limit over all files in flight; nova-bf gets
   # the same three through its config's ${NOVABF_IO_WORKERS} / _RUST_FETCH_CONC / _PART_MIB
   files_in_flight: 4

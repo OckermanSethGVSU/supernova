@@ -252,9 +252,6 @@ def data_identity(exp: dict) -> dict:
                 out["corpus"]["hashed"] = (f"not hashed: {tot} bytes > the {LOCAL_CORPUS_SHA_MAX_BYTES}"
                                            "-byte cap (runner.LOCAL_CORPUS_SHA_MAX_BYTES); size + "
                                            "mtime only")
-            dl = (exp.get("prep") or {}).get("download")
-            if dl:
-                out["corpus"]["downloaded_from"] = download_identity(dl, files)
     except Exception as exc:  # noqa: BLE001  provenance never fails a run
         out["corpus"] = {"path": c["path"], "error": f"{type(exc).__name__}: {exc}"}
     q = exp["queries"]
@@ -301,27 +298,6 @@ def prep_source_identity(exp: dict) -> list[dict]:
         rec["from"] = rec.pop("from_")
         out.append(rec)
     return out
-
-
-def download_identity(dl: dict, local: list[dict]) -> dict:
-    """The S3 objects prep.download fetched (the realfile corpus), with ETag and size, each
-    matched to its local file by name and size. Uses the same keys the download script picks
-    (the first `per_dir` *.parquet of each dir, sorted). Listed when the run starts, right after
-    the download in a launched job; a skipped or failed listing is recorded as such."""
-    try:
-        objs = []
-        src = paths.expand(dl["src"]).rstrip("/")
-        for dd in dl["dirs"]:
-            got = _s3_listing(f"{src}/{dd}/", dl.get("region"), False)
-            objs += got[:int(dl["per_dir"])]
-    except Exception as exc:  # noqa: BLE001
-        return {"error": f"{type(exc).__name__}: {exc}"}
-    by_name = {os.path.basename(f["key"]): f for f in local}
-    for o in objs:
-        f = by_name.get(os.path.basename(o["key"]))
-        o["local"] = None if f is None else f["key"]
-        o["local_size_matches"] = f is not None and f["size"] == o["size"]
-    return {"objects": objs}
 
 
 def import_origins() -> dict:
@@ -539,10 +515,10 @@ def _prepare(path, a, sweep=False):
     if "sweep" in raw:
         raise experiment_mod.ExperimentError(f"{path}: a sweep file: use `bench sweep`")
     raw = _set(raw, a.set)
-    for nm, sy in (raw.get("systems") or {}).items():   # per-system io is for sweeps only
+    for nm, sy in (raw.get("systems") or {}).items():   # a system's own io is `io:`
         if isinstance(sy, dict) and "sweep_io" in sy:
             raise experiment_mod.ExperimentError(f"{path}: systems.{nm}.sweep_io: set by `bench "
-                                                 "sweep` only (a paper run shares one `io:`)")
+                                                 "sweep` only (a system's own io is systems.{nm}.io)")
     return _paths_known(experiment_mod.finish(raw, path)), None, None
 
 
@@ -1067,6 +1043,7 @@ def pick(target: str, results: str = RESULTS) -> int:
             k: v for k, v in knobs.items()
             if k not in systems_base.SYSTEMS[entry["system"]].presets[entry["preset"]]
             or systems_base.SYSTEMS[entry["system"]].presets[entry["preset"]][k] != v},
+            **({"io": entry["io"]} if entry.get("io") else {}),   # the system's own io
             "chosen_from": rel}
         if "config" in y and base_file:
             y["config"] = os.path.relpath(y["config"], os.path.dirname(base_file))
@@ -1075,9 +1052,6 @@ def pick(target: str, results: str = RESULTS) -> int:
               f"apply by hand and record why):")
         print("  systems:")
         print(f"    {base_sys}: {{{flow}}}")
-        if entry.get("io"):   # an io grid's winner changes the io shared by every system
-            print(f"  io: {{{', '.join(f'{k}: {_yv(v)}' for k, v in entry['io'].items())}, "
-                  f"chosen_from: {rel}}}   # shared by every system: compare the systems' winners")
     return rc
 
 

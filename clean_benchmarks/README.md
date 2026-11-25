@@ -13,8 +13,8 @@ bench sweep  experiments/sweeps/<s>.yaml [--pick]   # a grid of variants; --pick
 bench launch experiments/<name>.yaml [--dry-run]    # run on a SkyPilot node (env/node.yaml) under
                                                 #   env/paper_run.sh; results synced back
                                                 #   (a sweep file with --job sweep: bench sweep there)
-bench sweep  experiments/sweeps/<name>_io.yaml --pick   # the shared I/O settings: an io grid on the
-                                                #   leg runner; prints the `io:` change, never edits
+bench sweep  experiments/sweeps/<name>_io.yaml --pick   # I/O settings: an io grid on the leg
+                                                #   runner; prints each system's own `io:`, never edits
 bench sweep  experiments/sweeps/<name>_events.yaml      # GPU events on vs off per engine (report only)
 bench check                                     # is this the pinned paper environment?
 bench run tests/fixtures/experiments/dense.yaml --dev # CPU dev box: tiny fixtures, env check report-only
@@ -69,7 +69,7 @@ Every run checks each system against a float64 oracle on a sample of queries
 | `bench/` | HOW it is measured: the one Python package (`pip install -e .`, no dependencies) |
 | `baselines/` | every change made to third-party libraries (`baselines/README.md` lists them) |
 | `env/` | the pinned environment: `versions.env`, `build.sh`, `activate.sh`, `check.py`, `node.yaml`, lock files |
-| `tests/` | correctness tests, CPU by default; `tests/fixtures/` their tiny experiments and data (the data is not committed: `make_fixtures.py` writes it, and pytest does so when it is missing) |
+| `tests/` | correctness tests, CPU by default; `tests/fixtures/` their experiment files (`experiments/`: tiny CPU ones plus copies of the real ones; tests never read the top-level `experiments/`) and data (not committed: `make_fixtures.py` writes it, and pytest does so when it is missing) |
 | `results/` | written only by bench: `results/<experiment>/<UTC>_<sha>/` (data git-ignored, summaries tracked) |
 
 

@@ -13,7 +13,7 @@ from bench import experiment as E
 CB = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
-@pytest.mark.parametrize("base,textscan", [("filtered_fineweb_smoke", True), ("sparse_fineweb", False)])
+@pytest.mark.parametrize("base,textscan", [("filtered_structured", True), ("sparse_fineweb", False)])
 def test_paper_run_hashes_textscan_for_a_filtered_sweep_file(tmp_path, base, textscan):
     """A sweep file names no `modality:` itself (its base does): the old grep missed it."""
     repo = os.path.dirname(CB)

@@ -1,0 +1,51 @@
+# PubMed-MV sparse (bge-m3 sparse head), exact top-1000 dot: nova-bf vs cuVS (patched sparse) vs SPARe.
+
+name: sparse_pubmed
+modality: sparse
+corpus:
+  path: ${READ}/data/                   # PubMed-VE (bge-m3): data/<NNN>/*.parquet
+  column: bge_m3_sparse_embedding
+  recursive: true                             # the files sit in sub-prefixes
+  region: us-east-1                           # the bucket's region
+queries:
+  path: ~/data/queries_pubmed_sparse.parquet  # copied there by prep
+  column: bge_m3_sparse_embedding
+  nq: 10000                                   # every query in the file
+search: {k: 1000, metric: ip}                 # nova-bf config: dot
+io:
+  # one setting for every system (4 files in flight, 512 ranged GETs of 16 MiB parts)
+  files_in_flight: 4
+  gets: 512
+  part_mib: 16
+  read_mode: native
+  range_scope: total
+threads: 32          # one per vCPU of the g5.8xlarge, for every leg
+copies:              # pinned and overlapped both ways, for every GPU baseline
+  h2d: pinned
+  h2d_overlap: true
+  d2h: pinned
+  d2h_overlap: true
+search_name: sparse  # legs are sparse__<system>__r<N>
+systems:             # round-1 order: novabf, cuvs, spare, then the +proj lines
+  novabf:
+    system: novabf
+    # stock nova-bf: no NOVABF_RANGED_CONC / NOVABF_TWOPASS_MIN_ROWS override
+    # (its own defaults)
+    config: ../novabf/pubmed_mv_sparse_k1000.yaml
+  # cuVS's stock sparse batch sizes until tuned (no cuvs_sparse_batches knob set).
+  # A chosen value goes here with chosen_from (sweeps/sparse_batchtune).
+  cuvs: {system: cuvs, preset: stock}
+  # our batched SPARe, dot mode, at its default memory budget (spare_max_mib unset)
+  spare: {system: spare, preset: batched_dot}
+  # cuVS and SPARe also run with nova-bf's query-vocabulary projection (nova-bf always projects
+  # inside its timed scan), so the comparison covers both: the cuvs / spare lines plus
+  # sparse_project: query-vocab (labelled +proj in summary.md)
+  cuvs_proj: {system: cuvs, preset: stock, sparse_project: query-vocab}
+  spare_proj: {system: spare, preset: batched_dot, sparse_project: query-vocab}
+novabf_output: ${WRITE}    # legs write <this>/<run id>/<tag>
+protocol: {rounds: 3}                         # the reported value is the median of 3 rotated rounds
+# the `queries` step: copies queries_src to queries.path when set (default: the queries
+# file is used as is). Set with --set prep.queries_src=URI.
+prep:
+  # copy the queries file (10,000 queries + their published top-1000) to queries.path
+  queries_src: "${READ}/queries/bf_queries_sparse_dot_k1000.parquet"

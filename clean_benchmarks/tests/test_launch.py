@@ -18,15 +18,13 @@ from bench import launch as LA
 from bench import runner
 
 CB = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-EXP = os.path.join(CB, "experiments")
+EXP = os.path.join(CB, "tests", "fixtures", "experiments")
 DUMMIES = {"sparse_fineweb": ["corpus.path=s3://DUMMY/corpus/", "queries.nq=1000"],
-           "filtered_fineweb_smoke": ["io.files_in_flight=4", "io.gets=512", "io.part_mib=16"],
-           "filtered_realfile": ["io.files_in_flight=4", "io.gets=512", "io.part_mib=16"],
            "dense_pubmed": ["io.files_in_flight=4", "io.gets=512", "io.part_mib=16"],
            "filtered_structured": ["io.files_in_flight=4", "io.gets=512", "io.part_mib=16"],
            "filtered_text": ["io.files_in_flight=4", "io.gets=512", "io.part_mib=16"]}
 NAMES = ["dense_coyo", "dense_pes2o", "sparse_pubmed", "sparse_fineweb", "multivector_pubmed",
-         "filtered_fineweb_smoke", "filtered_realfile", "dense_pubmed", "filtered_structured",
+         "dense_pubmed", "filtered_structured",
          "filtered_text"]
 TODO = set()                    # experiments with TODO placeholders beyond io.* (not launchable yet)
 
@@ -145,11 +143,11 @@ def test_dirty_tree_is_refused_and_nothing_is_written(tmp_path):
 
 
 def test_placeholders_refused_and_a_sweep_launches_with_job_sweep(tmp_path):
-    p = bench("launch", os.path.join(CB, E.path_of("filtered_fineweb_smoke")), "--dry-run", "--allow-dirty",
+    p = bench("launch", os.path.join(CB, E.path_of("filtered_structured")), "--dry-run", "--allow-dirty",
               "--results", str(tmp_path))
     assert p.returncode == 2 and "TODO" in p.stderr
     assert "an io sweep over io.*" in p.stderr
-    sw = os.path.join(EXP, "sweeps", "filtered_io.yaml")
+    sw = os.path.join(EXP, "sweeps", "filtered_structured_io.yaml")
     p = bench("launch", sw, "--dry-run", "--allow-dirty", "--results", str(tmp_path / "t"))
     assert p.returncode == 2 and "--job sweep" in p.stderr
     p = bench("launch", os.path.join(CB, E.path_of("dense_coyo")), "--job", "sweep", "--dry-run",
@@ -158,10 +156,11 @@ def test_placeholders_refused_and_a_sweep_launches_with_job_sweep(tmp_path):
     p = bench("launch", sw, "--job", "sweep", "--dry-run", "--allow-dirty",
               "--results", str(tmp_path / "t"))
     assert p.returncode == 0, p.stderr
-    ld, = glob.glob(str(tmp_path / "t" / "sweeps" / "filtered_io" / "launch" / "*"))
+    ld, = glob.glob(str(tmp_path / "t" / "sweeps" / "filtered_structured_io" / "launch" / "*"))
     rec = json.load(open(os.path.join(ld, "launch.json")))
-    assert rec["job"] == "sweep" and rec["results_dir"] == "sweeps/filtered_io"
-    assert (f" python -m bench sweep experiments/sweeps/filtered_io.yaml --launch-id {rec['launch_id']} "
+    assert rec["job"] == "sweep" and rec["results_dir"] == "sweeps/filtered_structured_io"
+    assert (" python -m bench sweep tests/fixtures/experiments/sweeps/filtered_structured_io.yaml "
+            f"--launch-id {rec['launch_id']} "
             "--results ~/res") in rec["run_line"]
 
 

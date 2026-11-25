@@ -19,7 +19,7 @@ from bench.verify import steps
 from helpers.step_plans import _load
 
 CB = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-EXP = os.path.join(CB, "experiments")
+EXP = os.path.join(CB, "tests", "fixtures", "experiments")
 FIX = os.path.join(CB, "tests", "fixtures", "experiments")
 
 
@@ -71,7 +71,7 @@ def test_every_modality_gets_both_checks(tmp_path):
     filtered copy-checks its GPU ones."""
     exp, d = _load("dense_coyo", tmp_path)
     assert [r["name"] for r in steps.plan_verify(exp, d)] == ["faiss", "cuvs"]
-    exp, d = _load("filtered_fineweb_smoke", tmp_path)
+    exp, d = _load("filtered_structured", tmp_path)
     names = {r["system"] for r in steps.plan_copies(exp, d)}
     assert names == {n for n, sy in exp["systems"].items() if sy["kind"] == "harness"}
 

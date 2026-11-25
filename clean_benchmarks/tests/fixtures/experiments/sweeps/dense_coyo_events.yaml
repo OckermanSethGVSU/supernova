@@ -1,0 +1,16 @@
+# GPU events on vs off for every harness system of dense_coyo.yaml (REPORT ONLY): each
+# system swept over gpu_events alone, on the first 3 files, one run per variant. `bench sweep`
+# prints events_table.md (median on / off, difference, round spread, "worth a look" when
+# |diff| > max(0.5 %, spread); one run per side: "no spread: not decidable"; CPU backends n/a).
+# Nothing is picked or changed: set `gpu_events: off` by hand if needed. The on / off order
+# alternates per system (on, off; then off, on; ...), so neither mode is always first.
+# `bench sweep --rounds 3` for a spread; `--set subset.files=N` for more files.
+
+name: dense_coyo_events
+base: ../dense/coyo.yaml
+sweep:
+  - system: faiss
+    grid: {gpu_events: ["on", "off"]}
+  - system: cuvs
+    grid: {gpu_events: ["off", "on"]}
+subset: {files: 3}

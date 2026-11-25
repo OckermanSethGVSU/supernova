@@ -1,0 +1,32 @@
+# nova-bf: exact top-1000 MaxSim search over the PubMed bge-m3 token vectors.
+corpus:
+  path: ${NOVABF_CORPUS:-s3://pubmed_mv/corpus/}
+  multivector_column: ${NOVABF_VCOL:-bge_m3_multivector_embedding}
+
+queries:
+  path: ${NOVABF_QUERIES:-/home/ubuntu/data/queries.parquet}
+  multivector_column: ${NOVABF_QCOL:-bge_m3_multivector_embedding}
+  id_column: query_id
+
+output:
+  path: ${NOVABF_OUT:-/home/ubuntu/res/out}
+
+params:
+  io_workers: ${NOVABF_IO_WORKERS:-4}
+  rust_fetch_columns: true
+  rust_fetch_concurrency: ${NOVABF_RUST_FETCH_CONC:-512}
+  rust_fetch_part_mib: ${NOVABF_RUST_FETCH_PART_MIB:-16}
+  io_ranged_get: false
+  io_thread_count: 128
+  cpu_thread_count: 32
+  multivector_budget_mib: ${NOVABF_MV_BUDGET_MIB:-648.5}
+  multivector_kernel: triton_reduce
+  multivector_double_buffer: true
+  allow_tf32: false
+  tiebreak: ordinal
+
+searches:
+  - name: multivector_maxsim
+    vector_type: multivector
+    metric: dot
+    k: 1000

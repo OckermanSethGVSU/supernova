@@ -20,7 +20,7 @@ from helpers.leg_records import rd  # noqa: F401 (fixture)
 
 
 CB = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-EXP = os.path.join(CB, "experiments")
+EXP = os.path.join(CB, "tests", "fixtures", "experiments")
 FIX = os.path.join(CB, "tests", "fixtures", "experiments")
 
 
@@ -162,35 +162,12 @@ def test_the_data_block_hashes_corpus_gt_and_stage_source(tmp_path, monkeypatch)
     assert runner.data_identity(exp)["prep_sources"][0]["sha256"] == "e" * 64
 
 
-def test_the_realfile_download_records_the_s3_etags(tmp_path, monkeypatch):
-    from bench import runner
-    listed = []
-
-    def fake(uri, region, recursive):
-        listed.append(uri)
-        d = uri.rstrip("/").rsplit("/", 1)[1]
-        return [{"key": f"{uri}{d}_a.parquet", "size": 10, "etag": f"etag-{d}"},
-                {"key": f"{uri}{d}_b.parquet", "size": 11, "etag": "x"}]
-    monkeypatch.setattr(runner, "_s3_listing", fake)
-    local = [{"key": "/w/data/real/00_a.parquet", "size": 10}, {"key": "/w/data/real/01_a.parquet", "size": 9}]
-    got = runner.download_identity({"src": "s3://b/p/", "dirs": ["00", "01"], "per_dir": 1,
-                                    "region": "r"}, local)
-    assert listed == ["s3://b/p/00/", "s3://b/p/01/"]
-    assert [(o["etag"], o["local"], o["local_size_matches"]) for o in got["objects"]] == [
-        ("etag-00", "/w/data/real/00_a.parquet", True), ("etag-01", "/w/data/real/01_a.parquet", False)]
-    monkeypatch.setattr(runner, "_s3_listing", lambda *a: (_ for _ in ()).throw(RuntimeError("skipped")))
-    assert "skipped" in runner.download_identity({"src": "s3://b/p/", "dirs": ["00"],
-                                                  "per_dir": 1}, local)["error"]
-
-
 def _fixture_copy_of_filtered_io(tmp_path):
-    """filtered_io.yaml's sweep shape on the CPU filtered fixture: the same entries and grid keys,
+    """filtered_structured_io.yaml's sweep shape on the CPU filtered fixture: the same entries and grid keys,
     nova-bf on the fixture's config, cuVS / FAISS as the masked CPU reference (FAISS's entries
     keep their static-search restriction), the first two values of each grid, 1 file."""
     import yaml
-    f = os.path.join(CB, "experiments", "sweeps", "filtered_io.yaml")
-    if not os.path.isfile(f):
-        pytest.skip("sweeps are local tuning files (not committed)")
+    f = os.path.join(CB, "tests", "fixtures", "experiments", "sweeps", "filtered_structured_io.yaml")
     real = yaml.safe_load(open(f))
     fx = os.path.join(CB, "tests", "fixtures", "experiments")
     out = {"name": "fio_fixture", "base": os.path.join(fx, "filtered.yaml"),
@@ -226,7 +203,7 @@ def test_filtered_io_sweep_runs_on_the_cpu_filtered_fixture(tmp_path):
     d = os.path.join(res, "sweeps", "fio")
     d = os.path.join(d, sorted(os.listdir(d))[0])
     rows = list(csv.DictReader(open(os.path.join(d, "sweep_table.csv"))))
-    assert len(rows) == 2 + 2 + 2 + 2 + 2
+    assert len(rows) == 2 + 2 + 2
     assert all(x["complete"] == "True" and x["checks_ok"] == "True" for x in rows), rows
     exp = json.load(open(os.path.join(d, "experiment.json")))
     by = {s["name"]: s["systems"] for s in exp["searches"]}
@@ -278,7 +255,7 @@ def test_pick_refuses_a_variant_named_only_by_a_checks_problem(tmp_path, capsys)
 
 
 @pytest.mark.parametrize("name", ["sparse_fineweb", "sparse_pubmed", "multivector_pubmed",
-                                  "filtered_fineweb_smoke", "dense_coyo"])
+                                  "filtered_structured", "dense_coyo"])
 def test_an_io_placeholder_points_at_the_io_sweeps(name):
     from bench import runner
     e = E.load(os.path.join(CB, E.path_of(name)))
@@ -302,7 +279,9 @@ def test_a_cpu_io_sweep_runs_and_pick_prints_the_io_change(tmp_path):
         assert rec["ok"] and rec["argv"][rec["argv"].index("--prefetch") + 1] == str(fif)
     p = subprocess.run([sys.executable, "-m", "bench", "sweep", "--pick", run, "--results", str(res)],
                        cwd=CB, capture_output=True, text=True)
-    assert p.returncode == 0 and "  io: {files_in_flight: " in p.stdout, p.stdout + p.stderr
+    line = [x for x in p.stdout.splitlines() if x.startswith("    cpu: {")]   # the system's own io
+    assert p.returncode == 0 and line and "io: {files_in_flight: " in line[0], p.stdout + p.stderr
+    assert not any(x.startswith("  io: ") for x in p.stdout.splitlines()), p.stdout
 
 
 V3 = ["cuvs-b-1", "cuvs-b-2", "cuvs-b-3"]
@@ -555,18 +534,19 @@ def test_ambiguous_order_failures_blame_both():
     assert set(runner.order_blame(res, ["a", "b", "c"])) == {"a", "b"}
 
 
-BF_GPU = os.path.join(CB, "experiments", "novabf", "fineweb_filtered_k1000.yaml")
+BF_GPU = os.path.join(CB, "tests", "fixtures", "experiments", "novabf", "fineweb_filtered_k1000.yaml")
 
 
 def _sweep(tmp_path, body):
     p = tmp_path / "s.yaml"
-    p.write_text(f"name: s\nbase: {CB}/experiments/misc/filtered_realfile.yaml\n" + body)
+    p.write_text(f"name: s\nbase: {CB}/tests/fixtures/experiments/filtered/structured.yaml\n" + body)
     return str(p)
 
 
 @pytest.mark.parametrize("body,match", [
-    # p_io.py / rf_io.yaml: novabf_iw16's params.io_workers 16 shadows NOVABF_IO_WORKERS
-    ("sweep:\n  - system: novabf_iw16\n    grid: {io.files_in_flight: [2, 8]}\n",
+    # a nova-bf line whose params.io_workers 16 shadows NOVABF_IO_WORKERS
+    ("systems:\n  novabf_iw16: {system: novabf, config: " + BF_GPU + ", params: {io_workers: 16}}\n"
+     "sweep:\n  - system: novabf_iw16\n    grid: {io.files_in_flight: [2, 8]}\n",
      "params.io_workers=16"),
     ("systems:\n  nb: {system: novabf, config: " + BF_GPU + ", params: {rust_fetch_concurrency: 64}}\n"
      "sweep:\n  - system: nb\n    grid: {io.gets: [256, 512]}\n", "params.rust_fetch_concurrency=64"),
@@ -574,7 +554,8 @@ def _sweep(tmp_path, body):
      "sweep:\n  - system: cv\n    grid: {io.files_in_flight: [2, 8]}\n", "knob prefetch=4"),
     ("systems:\n  cv: {system: cuvs, filter_mode: bitmap, read_mode: native}\n"
      "sweep:\n  - system: cv\n    grid: {io.read_mode: [native, whole]}\n", "knob read_mode='native'"),
-    ("sweep:\n  - system: cuvs_stock\n    grid: {io.files_in_flight: [2, 8], workers: [2, 4]}\n",
+    ("systems:\n  cuvs_stock: {system: cuvs, filter_mode: bitmap, filter_threads: 8}\n"
+     "sweep:\n  - system: cuvs_stock\n    grid: {io.files_in_flight: [2, 8], workers: [2, 4]}\n",
      "the grid's own knob 'workers'"),
 ])
 def test_shadowed_io_keys_are_refused(tmp_path, body, match):

@@ -1,0 +1,32 @@
+# nova-bf: exact top-1000 cosine search over the PubMed bge-m3 dense embeddings.
+corpus:
+  path: ${NOVABF_CORPUS}
+  dense_column: ${NOVABF_VCOL}
+
+queries:
+  path: ${NOVABF_QUERIES}
+  dense_column: ${NOVABF_QCOL}
+  id_column: query_id
+
+output:
+  path: ${NOVABF_OUT:-/home/ubuntu/res/out}
+
+params:
+  io_workers: ${NOVABF_IO_WORKERS:-4}
+  rust_fetch_dense: true
+  rust_fetch_columns: true
+  rust_fetch_concurrency: ${NOVABF_RUST_FETCH_CONC:-512}
+  rust_fetch_part_mib: ${NOVABF_RUST_FETCH_PART_MIB:-16}
+  io_ranged_get: false
+  io_thread_count: 128
+  cpu_thread_count: 32
+  dense_batch_size: 8192
+  allow_tf32: false
+  two_pass: auto
+  tiebreak: ordinal
+
+searches:
+  - name: dense_cosine
+    vector_type: dense
+    metric: cosine
+    k: 1000

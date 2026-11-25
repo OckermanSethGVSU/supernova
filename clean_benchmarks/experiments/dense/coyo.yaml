@@ -14,7 +14,8 @@ queries:
   nq: 25000                                                      # every query in the file
 search: {k: 1000, metric: cosine}
 io:
-  # one setting for every system: 64 files in flight (Coyo's files are small, ~20k rows each),
+  # the default for every system (a system's own `io:`, its I/O sweep winner, overrides it):
+  # 64 files in flight (Coyo's files are small, ~20k rows each),
   # 512 ranged GETs of 16 MiB parts, the native reader, the GET limit over all files in flight;
   # nova-bf gets the same three through its config's ${NOVABF_IO_WORKERS} / _RUST_FETCH_CONC / _PART_MIB
   files_in_flight: 64

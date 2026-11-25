@@ -561,7 +561,7 @@ def test_launcher_repo_roots_add_the_text_scanner_for_a_filtered_experiment(stub
     tmp_path, env, _ = stub_env
     del env["PAPER_CODE_ROOTS"]
     run_dir = tmp_path / "run"
-    exp = os.path.join(os.path.dirname(ENV_DIR), "experiments", "misc", "filtered_smoke.yaml")
+    exp = os.path.join(os.path.dirname(ENV_DIR), "tests", "fixtures", "experiments", "filtered", "structured.yaml")
     r = subprocess.run(["bash", LAUNCHER, "--run-dir", str(run_dir), "true", exp], env=env,
                        capture_output=True, text=True, timeout=120)
     assert r.returncode == 0, r.stderr

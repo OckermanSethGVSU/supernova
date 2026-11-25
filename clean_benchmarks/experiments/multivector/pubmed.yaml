@@ -13,7 +13,7 @@ queries:
   nq: 10000                                   # every query in the file
 search: {k: 1000, metric: ip}                   # nova-bf config: dot
 io:
-  # one setting for every system: 4 files in flight (a decoded PubMed file is ~4 GB), 512 GETs x 16 MiB
+  # the default for every system (a system's own `io:` overrides it): 4 files in flight (a decoded PubMed file is ~4 GB), 512 GETs x 16 MiB
   files_in_flight: 4
   gets: 512
   part_mib: 16

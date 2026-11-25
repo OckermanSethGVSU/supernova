@@ -7,10 +7,10 @@ import os
 from bench import experiment as E
 from bench import leg as L
 from bench import timing as P
-from helpers.protocol_plans import _load, DROPPED
+from helpers.protocol_plans import _load
 
 CB = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-EXP = os.path.join(CB, "experiments")
+EXP = os.path.join(CB, "tests", "fixtures", "experiments")
 
 
 def test_rotated_is_timing_rotate():
@@ -41,14 +41,12 @@ def test_protocol_constants():
 
 
 def test_filtered_io_is_a_refused_placeholder_until_tuned():
-    """the filtered io numbers are TODO (bench run refuses them), the native duplicates gone."""
-    for name in ("filtered_fineweb_smoke", "filtered_realfile"):
+    """the filtered io numbers are TODO (bench run refuses them)."""
+    for name in ("filtered_structured", "filtered_text"):
         e = _load(name, [])
         ph = E.placeholders(e)
         assert sorted(p.split(" ")[0] for p in ph) == ["io.files_in_flight", "io.gets", "io.part_mib"], ph
         assert (e["io"]["read_mode"], e["io"]["range_scope"]) == ("native", "total")
-        names = {sy for s in e["searches"] for sy in s["systems"]} | set(e["systems"])
-        assert not names & DROPPED["filtered_fineweb_smoke"]
-    e = _load("filtered_fineweb_smoke", ["io.files_in_flight=4", "io.gets=512", "io.part_mib=16",
+    e = _load("filtered_structured", ["io.files_in_flight=4", "io.gets=512", "io.part_mib=16",
                                    "io.chosen_from=sweeps/x/y"])
     assert not E.placeholders(e) and e["io"]["chosen_from"] == "sweeps/x/y"

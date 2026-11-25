@@ -1,0 +1,13 @@
+# ONE file: cuVS and SPARe with nova-bf's query-vocabulary projection vs off, nova-bf in the
+# rotation. Leg order: novabf, cuvs off, cuvs proj, spare off, spare proj.
+name: sparse_project
+base: ../sparse/fineweb.yaml
+sweep:
+  - system: novabf
+  - system: cuvs
+    grid: {sparse_project: ["off", query-vocab]}
+  - system: spare
+    grid: {sparse_project: ["off", query-vocab]}
+subset: {files: 1}
+# protocol: one warm run per variant by default (`bench sweep --rounds 3` for 3 rounds and a
+# spread)

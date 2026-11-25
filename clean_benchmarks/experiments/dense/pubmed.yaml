@@ -8,7 +8,7 @@ corpus:
   recursive: true
   region: us-east-1
 queries:
-  path: ~/data/queries_pubmed_dense.parquet   # copied there by prep
+  path: ~/data/queries_pubmed_dense.parquet   # written by the `queries` prep step
   column: bge_m3_dense_embedding
   nq: 10000                                   # every query in the file
 search: {k: 1000, metric: cosine}
@@ -30,6 +30,9 @@ novabf_output: ${WRITE}
 protocol: {rounds: 3}
 checks:
   oracle_queries: 500
+  gt: ~/data/gt_pubmed_dense.parquet    # the published top-1000 (snippet ids), written by prep
 prep:
-  # copy the queries file (10,000 queries + their published top-1000) to queries.path
-  queries_src: "${READ}/queries/bf_queries_dense_cosine_k1000.parquet"
+  # split the published queries file (10,000 queries + their top-1000) into the queries and the GT
+  queries:
+    script: bench/prep/prep_queries_pubmed.py
+    args: ["${READ}/queries/bf_queries_dense_cosine_k1000.parquet", ~/data, dense]

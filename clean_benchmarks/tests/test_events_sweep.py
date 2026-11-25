@@ -17,7 +17,7 @@ from bench import runner as R
 from bench.systems import base as SB
 
 CB = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-EXP = os.path.join(CB, "experiments")
+EXP = os.path.join(CB, "tests", "fixtures", "experiments")
 FIX = os.path.join(CB, "tests", "fixtures", "experiments")
 
 
@@ -95,7 +95,7 @@ def test_every_experiment_has_an_events_sweep():
     names = {os.path.basename(p)[:-len("_events.yaml")] for p in EVENT_SWEEPS} - {"s8_pes2o_subset"}
     # the three new experiments still have TODO placeholders and no sweeps yet
     assert names == {E.load_raw(p)["name"] for p in E.experiment_files()} \
-        - {"filtered_fineweb_smoke", "dense_pubmed", "filtered_structured", "filtered_text"}
+        - {"dense_pubmed", "filtered_structured", "filtered_text"}
 
 
 def test_the_filtered_smoke_test_has_no_sweeps():

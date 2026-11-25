@@ -1,0 +1,16 @@
+# the Coyo dense experiment's shared I/O, swept on the leg runner: every system over the same
+# io grid, end to end. Grid: files in flight 4 / 8 / 16 / 32 and the experiment's own 64,
+# 512 / 1024 ranged GETs, 16 MiB parts. 128 files, so 64 in flight is two waves.
+# `bench sweep --pick` prints each system's winner as an `io:` change; the io is shared by
+# every system, so one setting is picked by hand.
+name: dense_coyo_io
+base: ../dense/coyo.yaml
+sweep:
+  - system: novabf
+    grid: {io.files_in_flight: [4, 8, 16, 32, 64], io.gets: [512, 1024], io.part_mib: [16]}
+  - system: faiss
+    grid: {io.files_in_flight: [4, 8, 16, 32, 64], io.gets: [512, 1024], io.part_mib: [16]}
+  - system: cuvs
+    grid: {io.files_in_flight: [4, 8, 16, 32, 64], io.gets: [512, 1024], io.part_mib: [16]}
+subset: {files: 128}
+# protocol: one warm run per variant by default (`bench sweep --rounds 3` for more)

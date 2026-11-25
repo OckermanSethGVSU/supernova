@@ -24,7 +24,7 @@ from helpers.leg_records import _harness_leg_files
 
 
 CB = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-EXP = os.path.join(CB, "experiments")
+EXP = os.path.join(CB, "tests", "fixtures", "experiments")
 FIX = os.path.join(CB, "tests", "fixtures", "experiments")
 
 
@@ -402,8 +402,8 @@ def test_a_novabf_clock_that_disagrees_with_its_search_seconds_fails(tmp_path):
 def test_the_e2e_leg_sets_no_warmup(tmp_path):
     """the cold e2e leg has NO NOVABF_WARMUP_FILES (a timed leg has it, last)."""
     from bench import experiment as E
-    e = E.finish(E.load_raw(os.path.join(CB, "experiments", "dense", "coyo.yaml")),
-                 os.path.join(CB, "experiments", "dense", "coyo.yaml"))
+    e = E.finish(E.load_raw(os.path.join(CB, "tests", "fixtures", "experiments", "dense", "coyo.yaml")),
+                 os.path.join(CB, "tests", "fixtures", "experiments", "dense", "coyo.yaml"))
     s = e["searches"][0]["name"]
     timed = L.plan(e, s, "novabf", 1, str(tmp_path / "r"))
     cold = L.plan(e, None, "novabf", None, str(tmp_path / "r"), e2e=True)

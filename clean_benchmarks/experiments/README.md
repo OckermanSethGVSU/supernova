@@ -14,7 +14,10 @@ to run on a GPU node.
 | `filtered/` | Structured and text-filtered search |
 | `novabf/` | nova-bf configurations |
 
-Data locations are written as `${READ}` and `${WRITE}`. 
+Data locations are written as `${READ}` and `${WRITE}`.
+
+These files are the record of each experiment's final settings, for anyone recreating the
+runs. Tests never read them: they use their own copies in `tests/fixtures/experiments/`.
 
 ## Experimental Workflow
 

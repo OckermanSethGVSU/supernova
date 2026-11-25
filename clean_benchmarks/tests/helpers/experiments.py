@@ -7,7 +7,7 @@ from bench import runner
 
 
 CB = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-EXP = os.path.join(CB, "experiments")
+EXP = os.path.join(CB, "tests", "fixtures", "experiments")
 
 
 def _exp(name="dense_coyo", sets=()):

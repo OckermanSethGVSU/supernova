@@ -11,7 +11,7 @@ queries:
   path: data/queries/queries.parquet          # staged by prep (the shared MS MARCO queries)
   column: dense_embedding
 search: {k: 1000, metric: cosine}
-# shared I/O: placeholders until tuned (a sweep over io.*)
+# default I/O for every system: placeholders until tuned (a sweep over io.*)
 io: {files_in_flight: TODO, gets: TODO, part_mib: TODO, read_mode: native, range_scope: total}
 threads: 32
 filter:

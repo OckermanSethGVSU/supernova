@@ -42,11 +42,11 @@ NOVABF_CONFIG_ENV = {
 
 
 def leg_io(exp: dict, sysr: dict) -> dict | None:
-    """The `io:` a leg uses: the experiment's, overlaid with a sweep variant's own `io` keys;
-    None when the experiment has none."""
-    if not exp["io"]:
+    """The `io:` a leg uses: the experiment's, overlaid with the system's own `io` keys (its
+    `io:`, and a sweep variant's grid io); None when neither has any."""
+    if not exp["io"] and not sysr.get("io"):
         return None
-    return {**exp["io"], **(sysr.get("io") or {})}
+    return {**(exp["io"] or {}), **(sysr.get("io") or {})}
 
 
 def _x(p):

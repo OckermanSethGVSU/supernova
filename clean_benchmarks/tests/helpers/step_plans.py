@@ -1,4 +1,4 @@
-"""An experiment of experiments/ planned into a run dir for the check steps."""
+"""A fixture experiment planned into a run dir for the check steps."""
 
 import json
 import os
@@ -8,12 +8,12 @@ from bench import runner
 
 
 CB = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-EXP = os.path.join(CB, "experiments")
+EXP = os.path.join(CB, "tests", "fixtures", "experiments")
 DUMMY = {"sparse_fineweb": ["corpus.path=s3://DUMMY-fineweb/corpus/", "queries.nq=1000"],
          # dummy values for experiments whose data is not set yet
          "multivector_pubmed": ["corpus.path=s3://DUMMY-pubmed/corpus/", "queries.nq=1000",
                                 "queries.path=~/data/queries_pubmed.parquet"],
-         "filtered_fineweb_smoke": ["io.files_in_flight=4", "io.gets=512", "io.part_mib=16"]}
+         "filtered_structured": ["io.files_in_flight=4", "io.gets=512", "io.part_mib=16"]}
 
 
 def _load(name, tmp_path):

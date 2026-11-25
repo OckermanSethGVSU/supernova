@@ -14,7 +14,7 @@ from bench.systems import base as SB
 from helpers.experiments import _exp
 
 CB = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-EXP = os.path.join(CB, "experiments")
+EXP = os.path.join(CB, "tests", "fixtures", "experiments")
 FIX = os.path.join(CB, "tests", "fixtures", "experiments")
 
 MIN = {"name": "x", "modality": "dense", "corpus": {"path": "c", "column": "v"},
@@ -53,7 +53,7 @@ def test_every_sweep_file_expands(path):
 def test_the_experiments_exist():
     names = {E.load_raw(p)["name"] for p in E.experiment_files()}
     assert names == {"dense_coyo", "dense_pes2o", "sparse_fineweb", "sparse_pubmed",
-                     "multivector_pubmed", "filtered_fineweb_smoke", "filtered_realfile",
+                     "multivector_pubmed",
                      "dense_pubmed", "filtered_structured", "filtered_text"}
 
 
@@ -254,46 +254,10 @@ def test_prep_schema_is_validated():
         _exp("dense_pes2o", ["prep.stage=[{key: K, path: p, source: s, how: copy, rows: 3}]"])
 
 
-def test_realfile_has_the_fineweb_variant_set():
-    from bench import experiment as E
-    rf = E.load(os.path.join(CB, "experiments", "misc", "filtered_realfile.yaml"))
-    ff = E.load(os.path.join(CB, "experiments", "misc", "filtered_smoke.yaml"))
-    added = ["cuvs_bitmap", "cuvs_union", "cuvs_gather", "faiss_gather"]
-    for n in added:
-        assert rf["systems"][n] == ff["systems"][n], n
-    old = ["novabf_iw16", "cuvs_stock", "novabf_iw3", "cuvs_pool"]
-    assert [s["name"] for s in rf["searches"]] == [s["name"] for s in ff["searches"]]
-    for r, f in zip(rf["searches"], ff["searches"]):
-        assert r["systems"][:4] == old
-        want = [x for x in f["systems"] if x in added]
-        assert r["systems"][4:] == want, r["name"]
-    # the realfile lines are unchanged
-    assert rf["systems"]["cuvs_stock"]["knobs"] == {"filter_mode": "bitmap", "filter_threads": 8}
-    assert rf["systems"]["novabf_iw3"]["knobs"]["params"] == {"io_workers": 3}
-
-
-def test_filtered_io_sweep_prepares():
-    from bench import experiment as E
-    f = os.path.join(CB, "experiments", "sweeps", "filtered_io.yaml")
-    if not os.path.isfile(f):
-        pytest.skip("sweeps are local tuning files (not committed)")
-    exp, variants, _ = E.load_sweep(f)
-    names = [v["variant"] for v in variants]
-    assert names[:3] == [f"novabf-io.files_in_flight-{n}" for n in (1, 2, 4)]
-    assert "cuvs_bitmap-io.files_in_flight-1" in names
-    assert "cuvs_bitmap-io.files_in_flight-2-filter_threads-4" in names
-    assert "faiss_gather-io.files_in_flight-4-filter_threads-2" in names
-    by = {s["name"]: s["systems"] for s in exp["searches"]}
-    assert not any(x.startswith("faiss") for x in by["text_per_query"] + by["structured_per_query"])
-    assert sum(x.startswith("faiss") for x in by["text_fixed"]) == 9
-    assert exp["subset"] == {"files": 4}
-    assert max(int(n.split("-")[2]) for n in names) <= exp["subset"]["files"]   # distinct reader counts
-
-
 def test_a_sweep_entry_searches_must_name_base_searches(tmp_path):
     from bench import experiment as E
     p = tmp_path / "s.yaml"
-    p.write_text(f"name: s\nbase: {os.path.join(CB, E.path_of('filtered_realfile'))}\n"
+    p.write_text(f"name: s\nbase: {os.path.join(CB, E.path_of('filtered_structured'))}\n"
                  "io: {files_in_flight: 4, gets: 512, part_mib: 16}\n"
                  "sweep:\n  - {system: faiss_gather, searches: [nope], grid: {io.files_in_flight: [2]}}\n")
     with pytest.raises(E.ExperimentError, match="searches"):
@@ -320,11 +284,34 @@ def test_io_grid_refusals(tmp_path):
                    "    grid: {io.prefetch: [2]}\nsubset: {files: 2}\n")
     with pytest.raises(E.ExperimentError, match="io keys are"):
         E.load_sweep(str(bad))
-    # a paper run never takes a per-system io
+    # sweep_io is bench sweep's own key; a run sets a system's io as systems.<name>.io
     p = subprocess.run([sys.executable, "-m", "bench", "run", os.path.join(FIX, "sparse.yaml"), "--dev",
                         "--set", "systems.cpu.sweep_io={files_in_flight: 3}", "--results", str(tmp_path)],
                        cwd=CB, capture_output=True, text=True)
     assert p.returncode == 2 and "set by `bench sweep` only" in p.stderr
+
+
+def test_a_systems_own_io_overrides_the_experiment_io(tmp_path):
+    """systems.<name>.io (an I/O sweep's winner) replaces the experiment's io key by key, for that
+    system's legs only; it reaches the harness and nova-bf."""
+    from bench import leg as L
+    path = os.path.join(FIX, "dense.yaml")
+    raw = E.load_raw(path)
+    raw["systems"]["cpu"] = {"system": "cpu", "io": {"files_in_flight": 7}}
+    raw["systems"]["novabf"]["io"] = {"gets": 128, "part_mib": 8}
+    e = E.finish(raw, path)
+    assert L.leg_io(e, e["systems"]["cpu"])["files_in_flight"] == 7
+    assert L.leg_io(e, e["systems"]["cpu"])["gets"] == 64                 # the experiment's
+    nb = L.leg_io(e, e["systems"]["novabf"])
+    assert (nb["files_in_flight"], nb["gets"], nb["part_mib"]) == (2, 128, 8)
+    cpu = L.plan(e, "dense", "cpu", 1, str(tmp_path))
+    assert cpu["argv"][cpu["argv"].index("--prefetch") + 1] == "7"
+    nbp = L.plan(e, "dense", "novabf", 1, str(tmp_path))
+    assert (nbp["env_add"]["NOVABF_RUST_FETCH_CONC"], nbp["env_add"]["NOVABF_RUST_FETCH_PART_MIB"],
+            nbp["env_add"]["NOVABF_IO_WORKERS"]) == ("128", "8", "2")
+    raw["systems"]["cpu"]["io"] = {"prefetch": 3}
+    with pytest.raises(Exception, match="systems.cpu.io"):
+        E.finish(raw, path)
 
 
 def test_an_io_grid_covers_an_io_todo():
@@ -337,7 +324,7 @@ def test_an_io_grid_covers_an_io_todo():
 
 def test_bench_experiment_get_reads_the_base_chain(tmp_path):
     sw = tmp_path / "sw.yaml"
-    sw.write_text(f"name: sw\nbase: {os.path.join(CB, E.path_of('filtered_fineweb_smoke'))}\n"
+    sw.write_text(f"name: sw\nbase: {os.path.join(CB, E.path_of('filtered_structured'))}\n"
                   "sweep: {system: novabf}\n")
     p = subprocess.run([sys.executable, "-m", "bench.experiment", str(sw), "--get", "modality"],
                        cwd=CB, capture_output=True, text=True)
@@ -349,7 +336,7 @@ def test_bench_experiment_get_reads_the_base_chain(tmp_path):
 
 def _sweep(tmp_path, systems, grid="{io.files_in_flight: [2, 4, 8]}"):
     p = tmp_path / "s.yaml"
-    p.write_text(f"name: s\nbase: {CB}/experiments/sparse/fineweb.yaml\n"
+    p.write_text(f"name: s\nbase: {CB}/tests/fixtures/experiments/sparse/fineweb.yaml\n"
                  f"systems:\n  cuvs: {systems}\n"
                  f"sweep:\n  - system: cuvs\n    grid: {grid}\n"
                  "subset: {files: 8}\n")

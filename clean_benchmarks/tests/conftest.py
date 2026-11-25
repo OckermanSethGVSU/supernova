@@ -108,5 +108,12 @@ def ensure_fixture_data():
                             FIXTURE_DATA], check=True, stdout=subprocess.DEVNULL)
 
 
+# the tests look experiments up by name in tests/fixtures/experiments, never in experiments/
+# (which changes as settings are tuned)
+EXPERIMENT_FIXTURES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures", "experiments")
+
+
 def pytest_configure(config):
+    from bench import experiment as _E
+    _E.EXPERIMENTS_DIR = EXPERIMENT_FIXTURES
     ensure_fixture_data()

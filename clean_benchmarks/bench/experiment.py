@@ -12,7 +12,8 @@ Top-level fields:
   queries     {path, column, nq: null}
               nq null: use the harness default.
   search      {k, metric}  metric: ip | cosine | l2
-  io          {files_in_flight, gets, part_mib, read_mode, range_scope, chosen_from}
+  io          {files_in_flight, gets, part_mib, read_mode, range_scope, chosen_from}: the
+              default for every system; a system's own `io:` overrides it key by key
               Shared across systems; chosen_from identifies the I/O sweep.
   threads     int, required: OMP threads for all systems (0 = the usable CPU count)
   copies      {h2d, h2d_overlap, d2h, d2h_overlap}
@@ -24,7 +25,8 @@ Top-level fields:
   searches    [{name, systems, filter_search}]
               Each search specifies its systems and initial execution order.
   search_name str: default search name when searches is omitted
-  systems     {name: preset | {system, preset, knobs..., chosen_from}}
+  systems     {name: preset | {system, preset, knobs..., io, chosen_from}}
+              io: the system's own {files_in_flight, gets, part_mib, read_mode, range_scope}
   novabf_output  str: nova-bf output directory or S3 prefix
   e2e         {system, keep_cache: false, tiebreak}: cold end-to-end nova-bf run;
               tiebreak {mode: ordinal | id, field} (id: ties ordered by that corpus field)
@@ -38,9 +40,6 @@ Top-level fields:
               stage: files to copy or transform
               queries: {script, args}
               queries_src: optional query source URI
-              replicate: {copies, src, dst}
-              download: {src, region, dirs, per_dir, dst, sha256}  (src: an s3:// prefix)
-              textscan: bool
 
 Sweep-only fields: base, sweep, subset.
 
@@ -87,7 +86,7 @@ SECTIONS = {
                        "copies_files", "verify_files", "check_repeats"}),
     "e2e": ({"system"}, {"system", "keep_cache", "tiebreak"}),
     "subset": ({"files"}, {"files"}),
-    "prep": (set(), {"stage", "queries", "queries_src", "replicate", "download", "textscan"}),
+    "prep": (set(), {"stage", "queries", "queries_src"}),
 }
 TOP = {"name", "modality", "corpus", "queries", "search", "io", "threads", "copies", "filter",
        "searches", "search_name", "systems", "novabf_output", "e2e", "protocol", "checks",
@@ -283,13 +282,11 @@ def validate(doc: dict, where: str = "") -> dict:
     return e
 
 
-PREP_HOW = {"copy": set(), "filtered_cut": {"rows", "cuts", "columns"},
-            "filtered_queries": {"drop_columns"}}
+PREP_HOW = {"copy": set(), "filtered_queries": {"drop_columns"}}
 
 
 def _prep(p: dict, where: str) -> dict:
-    out = {"stage": [], "queries": None, "queries_src": None, "replicate": None,
-           "download": None, "textscan": False}
+    out = {"stage": [], "queries": None, "queries_src": None}
     for i, d in enumerate(p.get("stage") or []):
         w = f"{where}.stage[{i}]"
         if not isinstance(d, dict) or {"key", "path", "source", "how"} - set(d):
@@ -309,24 +306,6 @@ def _prep(p: dict, where: str) -> dict:
         if not isinstance(p["queries_src"], str):
             raise ExperimentError(f"{where}.queries_src: a URI or null")
         out["queries_src"] = p["queries_src"]
-    if p.get("replicate") is not None:
-        r = p["replicate"]
-        if not isinstance(r, dict) or set(r) != {"copies", "src", "dst"}:
-            raise ExperimentError(f"{where}.replicate: {{copies, src, dst}}")
-        _int(r["copies"], f"{where}.replicate.copies")
-        out["replicate"] = dict(r)
-    if p.get("download") is not None:
-        d = p["download"]
-        need = {"src", "region", "dirs", "per_dir", "dst", "sha256"}
-        if not isinstance(d, dict) or set(d) != need:
-            raise ExperimentError(f"{where}.download: {sorted(need)}")
-        _int(d["per_dir"], f"{where}.download.per_dir")
-        if not isinstance(d["src"], str) or not d["src"].startswith(("s3://", "${")):
-            raise ExperimentError(f"{where}.download.src: an s3:// prefix")
-        out["download"] = {**d, "dirs": [str(x) for x in d["dirs"]]}
-    if not isinstance(p.get("textscan", False), bool):
-        raise ExperimentError(f"{where}.textscan: true / false")
-    out["textscan"] = bool(p.get("textscan", False))
     return out
 
 
@@ -418,7 +397,7 @@ def load_raw(path: str, _seen=None) -> dict:
 
 EXPERIMENTS_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "experiments")
 # experiment folders by modality; novabf/ holds nova-bf configs, sweeps/ tuning grids
-EXPERIMENT_FOLDERS = ("dense", "sparse", "multivector", "filtered", "misc")
+EXPERIMENT_FOLDERS = ("dense", "sparse", "multivector", "filtered")
 
 
 def experiment_files() -> list[str]:

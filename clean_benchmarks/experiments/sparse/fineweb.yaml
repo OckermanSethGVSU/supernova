@@ -14,7 +14,7 @@ queries:
   nq: TODO                                    # placeholder
 search: {k: 1000, metric: ip}                 # nova-bf config: dot
 io:
-  # one setting for every system (4 files in flight, 512 ranged GETs of 16 MiB parts)
+  # the default for every system (a system's own `io:` overrides it) (4 files in flight, 512 ranged GETs of 16 MiB parts)
   files_in_flight: 4
   gets: 512
   part_mib: 16

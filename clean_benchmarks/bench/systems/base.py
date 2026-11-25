@@ -69,7 +69,7 @@ COPY_KNOBS = {
     "d2h": Knob("--d2h", str, False, "GPU->host copy: pageable | pinned", ("pageable", "pinned")),
     "d2h_overlap": Knob("--d2h-overlap", bool, False, "overlap copy back + merge with the next search"),
 }
-# reader pipeline overrides of the experiment's shared `io:` (realfile's --prefetch 4 --workers 4;
+# reader pipeline overrides of the experiment's shared `io:` (--prefetch N --workers N;
 # filtered's per-variant --read-mode native). Not sweepable: a sweep sets shared I/O as `io.*`.
 IO_KNOBS = {
     "read_mode": Knob("--read-mode", str, False, "reader mode (overrides io.read_mode)"),
@@ -130,7 +130,7 @@ _add(_harness("cuvs", "cuvs", ("dense", "sparse", "filtered"), {
                       ("per-file", "none")),
     **SPARSE_PROJECT,
 }, {
-    # the 8 GiB RMM pool line (filtered_realfile's cuvs_pool)
+    # an 8 GiB RMM pool
     "rmm_pool_8g": {"cuvs_rmm_pool": "8GiB"},
     # a comparison variant: each file searched, its results copied back and merged on the host
     # (faiss.ResultHeap), the streaming pattern of NVIDIA's other exact tool (cuvs_bench
@@ -181,7 +181,7 @@ _add(SystemSpec("novabf", "novabf", None, ("dense", "sparse", "multivector", "fi
     # set through $NOVABF_MV_BUDGET_MIB (the multivector config: ${NOVABF_MV_BUDGET_MIB:-648.5})
     "mv_budget_mib": Knob(None, float, True, "multivector_budget_mib via $NOVABF_MV_BUDGET_MIB"),
     # merged into the config's params block (the base config has none), e.g. {"io_workers": N}
-    "params": Knob(None, dict, False, "params merged into the generated config (realfile io_workers)"),
+    "params": Knob(None, dict, False, "params merged into the generated config (e.g. io_workers)"),
 }, {"stock": {}}, cpu_ok=True, doc="nova-bf at its own defaults, 1-file warmup"))
 
 
@@ -250,7 +250,11 @@ def resolve(name: str, entry) -> dict:
         raise SystemError_(f"systems.{name}: {sysname} has no preset {preset!r} "
                            f"(presets: {sorted(spec.presets)})")
     chosen_from = entry.pop("chosen_from", None)
-    io = check_sweep_io(entry.pop("sweep_io", None), f"systems.{name}.sweep_io")
+    # the system's own io (`io:`, e.g. its I/O sweep's winner) over the experiment's `io:`; a
+    # sweep variant's grid io (sweep_io, set by bench sweep) over both
+    own_io = check_sweep_io(entry.pop("io", None), f"systems.{name}.io")
+    io = {**(own_io or {}), **(check_sweep_io(entry.pop("sweep_io", None),
+                                              f"systems.{name}.sweep_io") or {})}
     knobs = dict(spec.presets[preset])
     for k, v in entry.items():
         if k not in spec.knobs:
@@ -262,7 +266,7 @@ def resolve(name: str, entry) -> dict:
     out = {"name": name, "system": sysname, "kind": spec.kind, "preset": preset,
            "knobs": knobs, "chosen_from": chosen_from}
     if io:
-        out["io"] = io   # a sweep variant's own io (bench sweep only)
+        out["io"] = io   # overlaid on the experiment's io for this system's legs (leg.leg_io)
     return out
 
 

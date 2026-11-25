@@ -12,7 +12,7 @@ from bench import leg as L
 from bench.verify import agree
 
 CB = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-COYO = os.path.join(CB, "experiments", "dense", "coyo.yaml")
+COYO = os.path.join(CB, "tests", "fixtures", "experiments", "dense", "coyo.yaml")
 
 
 def _coyo(tiebreak):

@@ -1,0 +1,41 @@
+# PubMed-MV multivector (bge-m3 ColBERT head), exact top-1000 MaxSim (dot): nova-bf vs PyLate.
+
+name: multivector_pubmed
+modality: multivector
+corpus:
+  path: ${READ}/data/                   # PubMed-VE (bge-m3): data/<NNN>/*.parquet
+  column: bge_m3_multivector_embedding
+  recursive: true                               # the files sit in sub-prefixes
+  region: us-east-1                             # the bucket's region
+queries:
+  path: ~/data/queries_pubmed_mv.parquet        # copied there by prep
+  column: bge_m3_multivector_embedding
+  nq: 10000                                   # every query in the file
+search: {k: 1000, metric: ip}                   # nova-bf config: dot
+io:
+  # one setting for every system: 4 files in flight (a decoded PubMed file is ~4 GB), 512 GETs x 16 MiB
+  files_in_flight: 4
+  gets: 512
+  part_mib: 16
+  read_mode: native
+  range_scope: total
+threads: 32          # one per vCPU of the g5.8xlarge, for every leg
+copies:              # pinned and overlapped both ways, for every GPU baseline
+  h2d: pinned
+  h2d_overlap: true
+  d2h: pinned
+  d2h_overlap: true
+search_name: multivector   # legs are multivector__<system>__r<N>
+systems:                   # round-1 order
+  novabf:
+    system: novabf
+
+    config: ../novabf/pubmed_mv_multivector_k1000.yaml
+
+  pylate_scores-batched: {system: pylate, preset: scores_batched}
+novabf_output: ${WRITE}   # legs write <this>/<run id>/<tag>
+protocol: {rounds: 3}                           # the reported value is the median of 3 rotated rounds
+
+prep:
+  # copy the queries file (10,000 queries + their published top-1000) to queries.path
+  queries_src: "${READ}/queries/bf_queries_multivector_maxsim_k1000.parquet"

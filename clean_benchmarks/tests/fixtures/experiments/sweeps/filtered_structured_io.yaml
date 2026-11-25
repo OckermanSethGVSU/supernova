@@ -1,0 +1,13 @@
+# a small io sweep on the structured filtered experiment (tests only)
+name: filtered_structured_io
+base: ../filtered/structured.yaml
+io: {files_in_flight: 4, gets: 512, part_mib: 16}
+sweep:
+  - system: novabf
+    grid: {io.files_in_flight: [1, 2]}
+  - system: cuvs_bitmap
+    grid: {io.files_in_flight: [1, 2], filter_threads: [2, 4]}
+  - system: faiss_gather
+    searches: [structured_fixed]
+    grid: {io.files_in_flight: [1, 2]}
+subset: {files: 2}
