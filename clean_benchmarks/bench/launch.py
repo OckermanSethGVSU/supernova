@@ -47,6 +47,8 @@ STAGE_EXCLUDE_SUFFIX = (".so", ".pyc")
 STAGE_EXCLUDE_GLOB_DIRS = (".egg-info",)
 # local-only dirs (git-ignored) a stage ships when the working tree has them
 LOCAL_DIRS = ("s8",)
+# the stage's .skyignore (see stage_code): no patterns, so SkyPilot uploads every staged file
+SKYIGNORE = "# written by bench launch: upload the whole stage (SkyPilot reads this, not .gitignore)\n"
 # code dirs named data/ (code_sha.py skips that name) and the test fixtures, each hashed as
 # its own root (must match env/paper_run.sh DATA_CODE_DIRS)
 DATA_CODE_DIRS = ("bench/data", "tests/data", "tests/fixtures")
@@ -320,6 +322,11 @@ def stage_code(exp: dict, stage: str, rev: str, allow_dirty: bool) -> dict:
     # the private path values, beside the code (never through git; not in the code hash)
     with open(os.path.join(stage, os.path.relpath(private_paths.FILE, private_paths.CB)), "w") as f:
         f.write(private_paths.file_text(private_paths.values()))
+    # SkyPilot uploads the workdir minus what its .gitignore files exclude, and the stage's own
+    # .gitignore excludes the paths file just written. A .skyignore in the workdir replaces the
+    # .gitignore files: this one excludes nothing, so the whole stage reaches the node
+    with open(os.path.join(stage, ".skyignore"), "w") as f:
+        f.write(SKYIGNORE)
     local = {d: ship_local_dir(stage, d) for d in LOCAL_DIRS}
     return {"commit": commit, "rev": rev, "dirty": bool(dirty), "dirty_paths": dirty, "source": source,
             "local_dirs": {d: v for d, v in local.items() if v}}

@@ -28,7 +28,7 @@ EXCLUDE_DIRS = {"__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache", ".
                 "venv", "node_modules", "target", "build", "dist", "wheels", "data", "out",
                 "res", ".ipynb_checkpoints"}
 # never code: the private path values (bench/paths.py hashes them on their own)
-EXCLUDE_NAMES = {"local_paths.env"}
+EXCLUDE_NAMES = {"local_paths.env", ".skyignore"}   # both written by bench launch, not code
 
 
 def sha256_file(path):

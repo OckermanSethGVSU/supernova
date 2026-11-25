@@ -104,6 +104,12 @@ def test_dry_run_writes_the_task_and_launches_nothing(name, tmp_path, fake_cloud
     for f in ("task.yaml", "staged_files.txt", "STAGED", "launch.json", "sky_command.txt"):
         assert os.path.isfile(os.path.join(d, f)), f
     assert calls(log) == []                                    # nothing reached sky / rsync / aws
+    # SkyPilot uploads the workdir minus its .gitignore patterns; the stage's .skyignore (no
+    # patterns) replaces them, so the gitignored paths file reaches the node
+    st = os.path.join(d, "stage")
+    assert os.path.isfile(os.path.join(st, "experiments", "local_paths.env"))
+    sky = [x.strip() for x in open(os.path.join(st, ".skyignore")) if x.strip()]
+    assert sky and all(x.startswith("#") for x in sky)
     t = yaml.safe_load(open(os.path.join(d, "task.yaml")))
     node = yaml.safe_load(open(L.NODE_YAML))
     assert t["resources"] == node["resources"] and t["resources"]["use_spot"] is False
