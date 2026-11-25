@@ -278,3 +278,30 @@ def test_a_corpus_data_read_while_paused_is_flagged_and_a_footer_read_is_not():
     c.stop()
     assert len(g.violations) == 1 and "while the clock is paused" in g.violations[0]
     assert g.record()["corpus_reads"]["read_columns@paused"] == 1
+
+
+def test_the_boundary_guard_counts_s3_reads_given_as_bucket_and_key():
+    """nova-bf's Store reads an S3 corpus as `bucket/key` (pyarrow's form, no scheme): those
+    are corpus reads, not relative local paths. A local corpus still matches absolute paths."""
+    from bench.timing import LegClock
+    from bench.systems.novabf import BoundaryGuard
+    c = LegClock()
+    g = BoundaryGuard(c, "s3://bkt/corpus/")
+    r = g._read("read_dense_versioned", lambda store, *a, **k: None)
+    c.start()
+    r(None, "bkt/corpus/part-0.parquet")
+    r(None, "bkt/other/part-0.parquet")            # not the corpus
+    assert g.record()["corpus_reads"] == {"read_dense_versioned@running": 1}
+    g = BoundaryGuard(c, "tests/corpus")           # local and relative: made absolute
+    r = g._read("read_dense", lambda store, *a, **k: None)
+    r(None, os.path.abspath("tests/corpus/f.parquet"))
+    assert g.record()["corpus_reads"] == {"read_dense@running": 1}
+
+
+def test_result_paths_on_s3_are_recorded_as_uris():
+    """nova-bf names an S3 result `bucket/key`; the leg records `s3://bucket/key` so the checks,
+    the input hashes and the manifest lookup read it from S3, not as a relative local path."""
+    from bench.systems.novabf import result_uri
+    assert result_uri("bkt/run/tag/bf_q.parquet", "s3://bkt/run/tag") == "s3://bkt/run/tag/bf_q.parquet"
+    assert result_uri("s3://bkt/x.parquet", "s3://bkt/") == "s3://bkt/x.parquet"
+    assert result_uri("/res/out/x.parquet", "/res/out") == "/res/out/x.parquet"

@@ -190,7 +190,10 @@ def run(config_path: str, clock: LegClock | None = None, err=None, guard: dict |
             clock.fail(f"run_compute returned with the clock {clock.state} (no done())")
             raise ClockError(clock.failure)
         sample_s = multivector_sample_seconds(clock, cfg)
-    return {"results": results, "warmup_files": warmed,  # results: {search: output path}
+    # results: {search: output path}, as URIs: nova-bf names an S3 output `bucket/key` (pyarrow's
+    # form), which every later reader (checks, input hashes, manifest) would take as a local path
+    results = {k: result_uri(v, cfg.output.path) for k, v in (results or {}).items()}
+    return {"results": results, "warmup_files": warmed,
             "max_files": max_files if max_files > 0 else None, "novabf_timing": tap.values,
             "novabf_bench": tap.bench, "mv_sample_seconds": sample_s}
 
@@ -241,23 +244,31 @@ class BoundaryGuard:
     def __init__(self, clock: LegClock, corpus_path: str, sample_pauses: int = 0):
         self.clock = clock
         self.sample_pauses = sample_pauses   # pauses that are not a search's (mv sample)
-        self.corpus = self._norm(corpus_path).rstrip("/") + "/"
+        # an S3 corpus: nova-bf's read paths are `bucket/key` (pyarrow's S3 form), never local
+        self.s3 = str(corpus_path).startswith("s3://")
+        self.corpus = self._norm(corpus_path, self.s3).rstrip("/") + "/"
         self.reads: dict = {}        # (method, phase) -> count, corpus only
         self.writes: list = []       # (method, state, pauses at start)
         self.violations: list[str] = []
         self._orig: dict = {}
 
     @staticmethod
-    def _norm(p) -> str:
+    def _norm(p, s3: bool = False) -> str:
+        """A path as nova-bf's Store reads it: `bucket/key` for S3 (no scheme), absolute for a
+        local corpus. With an S3 corpus a scheme-less path is `bucket/key`, not a relative one."""
         p = str(p)
-        return p[5:] if p.startswith("s3://") else os.path.abspath(p) if not p.startswith("/") and "://" not in p else p
+        if p.startswith("s3://"):
+            return p[5:]
+        if s3 or p.startswith("/") or "://" in p:
+            return p
+        return os.path.abspath(p)
 
     def _read(self, name, orig):
         guard = self
 
         def w(store, *a, **kw):
             path = a[0] if a else kw.get("read_path")
-            if path is not None and guard._norm(path).startswith(guard.corpus):
+            if path is not None and guard._norm(path, guard.s3).startswith(guard.corpus):
                 st = guard.clock.state
                 key = (name, st)
                 guard.reads[key] = guard.reads.get(key, 0) + 1
@@ -307,6 +318,15 @@ class BoundaryGuard:
         return {"violations": list(self.violations),
                 "corpus_reads": {f"{m}@{s}": n for (m, s), n in sorted(self.reads.items())},
                 "writes": [{"method": m, "state": s, "pauses": p} for m, s, p in self.writes]}
+
+
+def result_uri(path, output_path) -> str:
+    """nova-bf's result path as a URI: `bucket/key` -> `s3://bucket/key` when the configured
+    output is on S3 (a URI or local path is returned as it is)."""
+    p = str(path)
+    if str(output_path).startswith("s3://") and "://" not in p:
+        return "s3://" + p.lstrip("/")
+    return p
 
 
 def warmup_output(path: str) -> str:
