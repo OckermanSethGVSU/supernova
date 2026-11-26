@@ -716,7 +716,8 @@ def test_the_checks_use_the_experiments_threads_not_omp_num_threads(monkeypatch)
     import pyarrow as pa
     monkeypatch.setenv("OMP_NUM_THREADS", "1")
     assert agree.check_threads({"threads": 7}) == 7
-    assert agree.check_threads({"threads": 0}) == (os.cpu_count() or 1)
+    from bench.data.sources import usable_cpu_count
+    assert agree.check_threads({"threads": 0}) == usable_cpu_count()
     before = pa.cpu_count()
     with agree._threads(3):
         assert pa.cpu_count() == 3 and pa.io_thread_count() >= 3
@@ -735,3 +736,285 @@ def test_the_checks_leave_the_process_environment_as_it_was(monkeypatch):
     with agree._threads(2):
         pass
     assert dict(os.environ) == before
+
+
+def _without_timing(x):
+    """A checks document with its timing and the score-sharing / pair-mode bookkeeping taken out
+    (what may differ between two runs of the same checks)."""
+    import re
+    if isinstance(x, dict):
+        return {k: _without_timing(v) for k, v in x.items()
+                if k not in ("log", "pair_mode") and not re.search(r"seconds|_s$|time", k)}
+    if isinstance(x, list):
+        return [_without_timing(v) for v in x]
+    if isinstance(x, str):
+        return re.sub(r"\(\d+ s\)", "(N s)", x)
+    return x
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("shape", SHAPES)
+def test_the_faster_checks_give_the_old_checks_document(runs, tmp_path, shape):
+    """numpy shared scores, row-group reads and shared scores (one pass per round, kept across
+    rounds) change no verdict and no number: the checks document equals the old code's (the
+    three switches off), every round and every system."""
+    d = copy_run(runs[shape], tmp_path / "run")
+    exp = json.load(open(os.path.join(d, "experiment.json")))
+    docs = {}
+    for new in (False, True):
+        C.VECTOR_SHARED, C.ROWGROUP_READ, agree.SHARE_SCORES = new, new, new
+        try:
+            docs[new] = json.loads(json.dumps(agree.run_checks(d, exp), default=str))
+        finally:
+            C.VECTOR_SHARED = C.ROWGROUP_READ = agree.SHARE_SCORES = True
+    assert _without_timing(docs[False]) == _without_timing(docs[True])
+    assert docs[True]["ok"] == docs[False]["ok"]
+
+
+def test_needed_rows_reads_only_the_holding_row_groups_with_the_same_values(tmp_path):
+    """a file of 7 row groups: the selected rows read through their row groups equal the rows
+    taken from the whole column, in the asked order; a row past the end is refused."""
+    vec = pa.array([[float(i), float(-i)] for i in range(70)], pa.list_(pa.float32()))
+    p = tmp_path / "f.parquet"
+    pq.write_table(pa.table({"v": vec}), p, row_group_size=10)
+    import pyarrow.fs as pafs
+    fs = pafs.LocalFileSystem()
+    local = np.array([0, 9, 10, 33, 34, 69], np.int64)
+    C.ROWGROUP_READ = True
+    got = C._needed_rows(str(p), fs, "v", local).to_pylist()
+    C.ROWGROUP_READ = False
+    try:
+        ref = C._needed_rows(str(p), fs, "v", local).to_pylist()
+    finally:
+        C.ROWGROUP_READ = True
+    assert got == ref == [[float(i), float(-i)] for i in local]
+    with pytest.raises(SystemExit, match="beyond"):
+        C._needed_rows(str(p), fs, "v", np.array([70], np.int64))
+
+
+def test_the_score_cache_computes_each_pair_once_and_returns_the_old_order(tmp_path, monkeypatch):
+    """with C.SCORE_CACHE, a second call computes only the pairs it has no score for, and
+    every call returns exactly its own pairs in the order computing them all would give."""
+    import pyarrow.fs as pafs
+    vec = pa.array([[float(i % 7), 1.0 + i] for i in range(40)], pa.list_(pa.float32()))
+    for f in range(2):
+        pq.write_table(pa.table({"v": vec.slice(20 * f, 20)}), tmp_path / f"p{f}.parquet", row_group_size=5)
+    paths = [str(tmp_path / f"p{f}.parquet") for f in range(2)]
+    offsets = np.array([0, 20, 40])
+    xq = np.array([[1.0, 2.0], [3.0, -1.0], [0.5, 0.5]])
+    need1 = [{1, 25}, {3}, set()]
+    need2 = [{1, 30}, {3, 21}, {39}]
+    fs = pafs.LocalFileSystem()
+    ref1 = C.exact_scores(need1, None, "v", offsets, paths, fs, xq, "cosine")
+    ref2 = C.exact_scores(need2, None, "v", offsets, paths, fs, xq, "cosine")
+    calls = []
+    real = C._exact_scores
+    monkeypatch.setattr(C, "_exact_scores", lambda need, *a: calls.append(sum(len(s) for s in need)) or real(need, *a))
+    C.SCORE_CACHE = {}
+    try:
+        got1 = C.exact_scores(need1, None, "v", offsets, paths, fs, xq, "cosine", cache_key="k")
+        got2 = C.exact_scores(need2, None, "v", offsets, paths, fs, xq, "cosine", cache_key="k")
+    finally:
+        C.SCORE_CACHE = None
+    assert list(got1.items()) == list(ref1.items()) and list(got2.items()) == list(ref2.items())
+    assert calls == [3, 3]          # the second call scores only (0,30), (1,21), (2,39)
+
+
+def test_a_flat_listing_takes_only_the_roots_own_files_as_the_harness_does(tmp_path):
+    """a corpus with files at the root and in a sub-folder: the flat listing (corpus.recursive
+    false) equals the harness's list_parquet without recursion, the recursive one with it, and
+    corpus_paths agrees with corpus_index either way."""
+    from bench.data import sources
+    for rel in ("a.parquet", "c.parquet", "sub/b.parquet", "sub/deeper/d.parquet"):
+        p = tmp_path / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        pq.write_table(pa.table({"id": pa.array([rel], pa.string())}), p)
+    (tmp_path / "notes.txt").write_text("x")
+    for recursive in (False, True):
+        keys, rows, _, _ = C.corpus_index(str(tmp_path), need_ids=False, recursive=recursive)
+        _, infos = sources.list_parquet(str(tmp_path), recursive=recursive)
+        harness = [i.path for i in infos]
+        assert keys == harness, (recursive, keys, harness)
+        _, paths = C.corpus_paths(str(tmp_path), len(keys), recursive=recursive)
+        assert paths == keys
+    assert len(C.corpus_index(str(tmp_path), need_ids=False, recursive=False)[0]) == 2
+
+
+def test_the_memory_estimate_counts_only_the_row_groups_read(tmp_path):
+    """with row-group sizes the estimate's decoded column is the row groups holding a needed
+    row (what _needed_rows reads), never more than the whole-file estimate; without them, with
+    ROWGROUP_READ off, or a footer that disagrees with the index, it is the whole file."""
+    import pyarrow.fs as pafs
+    for f in range(2):
+        vec = pa.array([[float(i), 1.0] for i in range(100)], pa.list_(pa.float32()))
+        pq.write_table(pa.table({"v": vec}), tmp_path / f"f{f}.parquet", row_group_size=10)
+    paths = [str(tmp_path / f"f{f}.parquet") for f in range(2)]
+    fs = pafs.LocalFileSystem()
+    offsets = np.array([0, 100, 200])
+    need = [{3, 5, 150}, {7}]                       # file 0: group 0; file 1: group 5
+    files = C.needed_files(need, offsets)
+    assert files == [0, 1]
+    groups = C.row_group_rows(paths, fs, files)
+    assert groups == {0: [10] * 10, 1: [10] * 10}
+    assert C.rescore_bytes(need, offsets, 2, 4, 8, {0: None, 1: [10] * 10})[0] \
+        == C.rescore_bytes(need, offsets, 2, 4, 8, {0: [100], 1: [10] * 10})[0]   # unreadable
+    assert C.rescore_bytes(need, offsets, 2, 4, 8, groups, held_pairs=10)[0] \
+        == C.rescore_bytes(need, offsets, 2, 4, 8, groups)[0] + 10 * C.PAIR_BYTES
+    whole, _, _ = C.rescore_bytes(need, offsets, 2, 4, 8)
+    part, n_g, n_f = C.rescore_bytes(need, offsets, 2, 4, 8, groups)
+    assert (n_g, n_f) == (4, 2)
+    col = (2 * 4 + 8) * C.COLUMN_COPIES            # one decoded row's bytes, every copy
+    assert whole - part == (200 - 20) * col         # 180 fewer decoded rows
+    assert C.rescore_bytes(need, offsets, 2, 4, 8, {0: [50, 50], 1: [10] * 10})[0] \
+        == whole - (200 - 50 - 10) * col            # file 0: its first group of 50; file 1: 10
+    assert C.rescore_bytes(need, offsets, 2, 4, 8, {0: [10] * 9, 1: [10] * 10})[0] \
+        == whole - 90 * col                         # file 0's footer sums 90, not 100: whole
+    C.ROWGROUP_READ = False
+    try:
+        assert C.row_group_rows(paths, fs, files) is None
+        assert C.rescore_bytes(need, offsets, 2, 4, 8, groups)[0] == whole
+    finally:
+        C.ROWGROUP_READ = True
+
+
+def test_a_flat_corpus_with_nested_files_is_refused_when_novabf_reads_it(tmp_path):
+    """nova-bf lists every level: a flat experiment whose corpus has *.parquet files in
+    sub-folders would have nova-bf read files the harness legs and the checks do not."""
+    for rel in ("a.parquet", "sub/b.parquet"):
+        p = tmp_path / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        pq.write_table(pa.table({"id": pa.array([rel], pa.string())}), p)
+    with pytest.raises(SystemExit, match="1 \\*.parquet files sit in sub-folders"):
+        C.refuse_flat_with_nested(str(tmp_path))
+    (tmp_path / "sub" / "b.parquet").unlink()
+    C.refuse_flat_with_nested(str(tmp_path))   # flat now: nothing to refuse
+
+
+def test_unreadable_footers_fall_back_and_footers_are_read_once(tmp_path, monkeypatch):
+    """row_group_rows reads each path's footer once per process; a footer that cannot be read
+    maps to None (the estimate counts that file whole) instead of failing the check."""
+    import pyarrow.fs as pafs
+    p = tmp_path / "f.parquet"
+    pq.write_table(pa.table({"v": pa.array([[1.0]] * 30, pa.list_(pa.float32()))}), p,
+                   row_group_size=10)
+    bad = tmp_path / "bad.parquet"
+    bad.write_bytes(b"not parquet")
+    monkeypatch.setattr(C, "_ROW_GROUPS", {})
+    calls = []
+    real = pq.ParquetFile
+    monkeypatch.setattr(pq, "ParquetFile", lambda *a, **k: calls.append(a[0]) or real(*a, **k))
+    paths, fs = [str(p), str(bad)], pafs.LocalFileSystem()
+    assert C.row_group_rows(paths, fs, [0, 1]) == {0: [10, 10, 10], 1: None}
+    assert C.row_group_rows(paths, fs, [0]) == {0: [10, 10, 10]}
+    assert calls.count(str(p)) == 1
+
+
+def test_the_rescoring_reads_fewer_files_at_once_to_fit_the_limit(tmp_path, monkeypatch):
+    """dense_rescore_plan lowers the files read at once until the estimate fits the limit,
+    estimates only the pairs the score cache does not hold (plus the cache and the table it
+    returns), and returns the one-thread estimate when nothing fits (the caller refuses)."""
+    import types
+    import pyarrow.fs as pafs
+    for f in range(4):
+        vec = pa.array([[float(i), 1.0] for i in range(100)],
+                       pa.list_(pa.float32()))
+        pq.write_table(pa.table({"v": vec}), tmp_path / f"f{f}.parquet", row_group_size=100)
+    paths = [str(tmp_path / f"f{f}.parquet") for f in range(4)]
+    fs, offsets = pafs.LocalFileSystem(), np.array([0, 100, 200, 300, 400])
+    need = [{5, 105, 205, 305}]
+    a = types.SimpleNamespace(rescore_threads=4, rescore_max_gib=1.0, vcol="v", corpus="c",
+                              metric="ip", queries="q", qcol="e", query_rows=None, max_files=None)
+    monkeypatch.setattr(C, "SCORE_CACHE", None)
+    est = {t: C.rescore_bytes(need, offsets, 2, 4, t, {f: [100] for f in range(4)})[0]
+           for t in (1, 2, 3, 4)}
+    assert C.dense_rescore_plan(a, need, offsets, paths, fs, 2)[:2] == (4, est[4])
+    a.rescore_max_gib = (est[2] + 1) / 2**30            # 3 and 4 at once do not fit
+    assert C.dense_rescore_plan(a, need, offsets, paths, fs, 2)[:2] == (2, est[2])
+    a.rescore_max_gib = (est[1] - 1) / 2**30            # nothing fits: refused by the caller
+    assert C.dense_rescore_plan(a, need, offsets, paths, fs, 2)[:2] == (1, est[1])
+    a.rescore_max_gib = 1.0
+    store = {(0, 5): 1.0, (0, 105): 1.0, (0, 205): 1.0, (0, 305): 1.0}
+    monkeypatch.setattr(C, "SCORE_CACHE", {C.score_cache_key(a): store})
+    t, e, n_g, n_f = C.dense_rescore_plan(a, need, offsets, paths, fs, 2)
+    assert (n_g, n_f) == (0, 0) and e == (4 + 4) * C.PAIR_BYTES   # nothing left to read
+    assert C.column_copies(2) == C.COLUMN_COPIES_F16 > C.column_copies(4) == C.COLUMN_COPIES
+
+
+def test_the_ragged_estimates_count_the_measured_column_copies_and_fit_the_limit(tmp_path,
+                                                                               monkeypatch):
+    """Sparse / multivector: a decoded column costs ragged_column_copies of its stored bytes
+    (measured up to 5.6, the old estimate assumed 2) and the plan lowers the files read at once
+    until the estimate fits; agree's oracle rescoring refuses above the limit as judge does."""
+    import types
+    stats = {0: (100, 10_000), 1: (100, 10_000)}
+    offsets = np.array([0, 100, 200])
+    need = [{5, 105}]
+    one = C.rescore_bytes_sparse(need, offsets, stats, 4, 4, 0, 1, 1)[0]
+    assert one >= 10_000 * 8 * C.RAGGED_COLUMN_COPIES
+    two = C.rescore_bytes_sparse(need, offsets, stats, 4, 4, 0, 1, 2)[0]
+    assert two - one >= 10_000 * 8 * C.RAGGED_COLUMN_COPIES + C.READ_FIXED_BYTES
+    mv = C.rescore_bytes_mv(need, offsets, stats, 2, 0, 4, 1, 16)[0]
+    assert mv >= 10_000 * 2 * C.RAGGED_COLUMN_COPIES_F16
+    assert C.ragged_column_copies(2) == C.RAGGED_COLUMN_COPIES_F16 > \
+        C.ragged_column_copies(4) == C.RAGGED_COLUMN_COPIES
+    # the plan: a real sparse file pair
+    import pyarrow.fs as pafs
+    for f in range(2):
+        col = pa.array([{"indices": [i, i + 1], "values": [1.0, 2.0]} for i in range(100)],
+                       pa.struct([("indices", pa.list_(pa.uint32())),
+                                  ("values", pa.list_(pa.float32()))]))
+        pq.write_table(pa.table({"sp": col}), tmp_path / f"f{f}.parquet")
+    paths = [str(tmp_path / f"f{f}.parquet") for f in range(2)]
+    fs = pafs.LocalFileSystem()
+    q = types.SimpleNamespace(nnz=2, n_rows=1)
+    a = types.SimpleNamespace(rescore_threads=2, rescore_max_gib=1.0, vcol="sp",
+                              modality="sparse")
+    t, e2, n_g, n_f, _ = C.ragged_rescore_plan(a, need, offsets, paths, fs, q)
+    assert (t, n_g, n_f) == (2, 2, 2)
+    a.rescore_max_gib = (e2 - 1) / 2**30                 # two at once do not fit
+    t, e1, _, _, _ = C.ragged_rescore_plan(a, need, offsets, paths, fs, q)
+    assert t == 1 and e1 < e2
+    t, e1b, _, _, _ = C.ragged_rescore_plan(a, need, offsets, paths, fs, q, live=10)
+    assert e1b == e1 + 10 * C.PAIR_BYTES
+    a.rescore_max_gib = (e1 - 1) / 2**30                 # nothing fits: the caller refuses
+    assert C.ragged_rescore_plan(a, need, offsets, paths, fs, q)[:2] == (1, e1)
+
+
+@pytest.mark.parametrize("modality", ["sparse", "multivector"])
+def test_the_oracles_ragged_rescoring_is_gated_and_reports_a_missing_column(tmp_path, modality):
+    """agree's oracle rescoring of a sparse / multivector round goes through the same plan as
+    judge's: within the limit it scores, above it a CheckError; a --vcol the files lack is a
+    CheckError too (not a KeyError)."""
+    nf, rows = (_sparse_fixture if modality == "sparse" else _mv_fixture)(tmp_path)
+    a = _args(tmp_path, modality, "sp" if modality == "sparse" else "mv")
+    inputs = _inputs(nf, rows)
+    need = [{0, rows}] + [set() for _ in range(4)]
+    assert set(agree._exact_for(a, need, inputs)) == {(0, 0), (0, rows)}
+    a.rescore_max_gib = 1e-6
+    with pytest.raises(agree.CheckError, match="oracle rescoring refused"):
+        agree._exact_for(a, need, inputs)
+    a.rescore_max_gib, a.vcol = 32.0, "nope"
+    with pytest.raises(agree.CheckError, match="no such column"):
+        agree._exact_for(a, need, inputs)
+
+
+def test_the_pool_is_released_only_when_the_estimate_no_longer_fits(monkeypatch):
+    """release_pool: with a budget (limit, estimated peak) the release is skipped while resident
+    memory + the whole estimate fits under the limit, done when it does not; without a budget
+    or a readable RSS it always releases."""
+    calls = []
+
+    class Pool:
+        def release_unused(self):
+            calls.append(1)
+    monkeypatch.setattr(C.pa, "default_memory_pool", lambda: Pool())
+    monkeypatch.setattr(C, "_rss_bytes", lambda: 6 << 30)
+    C.release_pool((10 << 30, 4 << 30))          # 6 + 4 <= 10: room, skipped
+    assert calls == []
+    C.release_pool((10 << 30, (4 << 30) + 1))    # one byte over: released
+    C.release_pool()                              # no budget: always
+    monkeypatch.setattr(C, "_rss_bytes", lambda: None)
+    C.release_pool((10 << 30, 1))                 # RSS unknown: always
+    assert len(calls) == 3
+    monkeypatch.undo()
+    assert C._rss_bytes() > 0

@@ -101,3 +101,48 @@ def test_shared_score_rule_unit():
     assert C.shared_score_bad(1.0, 1.0 + 2 * (1e-5 + 1e-5) * 1.01, 1e-5, 1e-5)
     assert C.shared_score_bad(float("nan"), float("nan"), 1e-5, 1e-5)
     assert C.shared_score_bad(-np.inf, 0.3, 1e-5, 1e-5)
+
+
+@pytest.mark.parametrize("modality", ["sparse", "multivector"])
+def test_shared_score_check_in_the_ragged_modalities(tmp_path, modality):
+    """judge's float64 shared-score check rescores the mismatched shared ids through
+    rescore_ragged (needed_ids' "shared" items): A and B share a wrong score on query 0, C is
+    right; the rule blamed C, the check names A and B."""
+    import contextlib
+    import io
+    from bench import runner
+    nf, rows = (_sparse_fixture if modality == "sparse" else _mv_fixture)(tmp_path)
+    col = "sp" if modality == "sparse" else "mv"
+    a = C.parse_args(["--corpus", str(tmp_path / "c"), "--novabf", "-", "--rescore",
+                      "--modality", modality, "--vcol", col, "--queries",
+                      str(tmp_path / "q.parquet"), "--qcol", col, "--metric", "ip", "--k", "3",
+                      "--rescore-threads", "1"])
+    inputs = _inputs(nf, rows, n=5)
+    off = inputs["offsets"]
+    fs, paths = C.corpus_paths(a.corpus, nf)
+    sparse, mv = C.harness_modules()
+    q, _ = (sparse if modality == "sparse" else mv).load_queries(a.queries, a.qcol)
+    fn = C.exact_scores_sparse if modality == "sparse" else C.exact_scores_mv
+    ex = fn([set(range(off[nf]))] * 5, off, paths, fs, col, q, "ip", threads=1)
+    ids, sc = [], []
+    for qq in range(5):
+        top = sorted((g for g in range(off[nf]) if np.isfinite(ex[(qq, g)])),
+                     key=lambda g: (-ex[(qq, g)], g))[:3]
+        ids.append(np.asarray(top, np.int64))
+        sc.append(np.asarray([ex[(qq, g)] for g in top], np.float64))
+    assert len(ids[0]) == 3
+    bad = [s.copy() for s in sc]
+    bad[0][1] += 0.5
+    inputs.update({"systems": {"A": (ids, bad), "B": (ids, bad), "C": (ids, sc)},
+                   "n_ids": off[nf], "dup": 0, "unmapped": 0, "gt_missing": None,
+                   "mapped": {}})
+    with contextlib.redirect_stdout(io.StringIO()):
+        out, fails = C.judge(a, inputs, 0.0)
+    assert set(out["shared_score_failed_pairs"]) == {"A_vs_C", "B_vs_C"}
+    for pk in ("A_vs_C", "B_vs_C"):
+        r = out["pairs"][pk]
+        assert r["shared_score_checked"] == 1
+        assert r["shared_score_wrong_by_system"] == {pk[0]: 1, "C": 0}
+        assert r["shared_score_unjudged_by_system"] == {pk[0]: 0, "C": 0}
+    blamed = runner.pairs_blame({"ok": False, "fails": fails, "compare": out}, ["A", "B", "C"])
+    assert set(blamed) == {"A", "B"}

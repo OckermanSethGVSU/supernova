@@ -630,6 +630,8 @@ def pairs_blame(pairs: dict, listed: list[str]) -> dict:
     if not isinstance(res, dict):
         return {nm: why_all for nm in listed}
     out: dict = {}
+    new_order = order_blame(res, listed)
+    shared = shared_score_blame(res, listed)
     for nm in listed:
         w = []
         if ((res.get("system_defects") or {}).get(nm) or {}).get("failed"):
@@ -637,11 +639,33 @@ def pairs_blame(pairs: dict, listed: list[str]) -> dict:
         c = (res.get("f64_wrong_total") or {}).get(nm)
         if c:
             w.append(f"{c} float64-checked disagreements")
-        w += order_blame(res, listed).get(nm, [])
-        w += shared_score_blame(res, listed).get(nm, [])
+        w += new_order.get(nm, [])
+        w += shared.get(nm, [])
         if w:
             out[nm] = "; ".join(w)
     return out or {nm: why_all for nm in listed}
+
+
+def _pair_status(res: dict, listed: list[str], failed: dict):
+    """(failed, passed) over every pair of listed systems, from the comparisons that RAN only
+    (compare.judge's `pairs`, every pair in a normal run and in a sweep alike; a pair never
+    compared is neither). failed: {(x, y): actual pair key}."""
+    ran = {}
+    for pk in res.get("pairs") or {}:
+        xy = _pair_of(pk, listed)
+        if xy is not None:
+            ran[frozenset(xy)] = pk
+    bad, passed = {}, []
+    for i, x in enumerate(listed):
+        for y in listed[i + 1:]:
+            pk = ran.get(frozenset((x, y)))
+            if pk is None:
+                continue
+            if pk in failed:
+                bad[(x, y)] = pk
+            else:
+                passed.append((x, y))
+    return bad, passed
 
 
 def _pair_of(pk: str, listed: list[str]):
@@ -657,78 +681,335 @@ def _pair_of(pk: str, listed: list[str]):
 
 def order_blame(res: dict, listed: list[str]) -> dict:
     """{system: [why]} for the pairs that failed the float64 order check. A swap between two
-    lists does not say which list is wrong, so blame is assigned in three steps:
+    lists does not say which list is wrong, so blame is first assigned by the common-system
+    rule (_order_blame_common), then corrected per failed pair with the float64 proofs the
+    judge document holds (compare.order_contradictions / order_full_check):
+    - a side proven wrong in a failed pair (its own list contradicts the exact scores: own-list
+      inversions, f64_order_contradictions_by_system or f64_order_full_contradictions_by_system
+      > 0) is blamed for it, even where the common-system rule spared it;
+    - a side the rule blamed is cleared for that pair only when proven consistent there (the
+      full-rank check ran on every order-failed query of the pair: 0 contradictions, 0
+      unjudged, never short of k on any query), no float64 proof or list defect names it
+      anywhere in the document, and the pair still blames someone; never otherwise (a document
+      without those keys, or a refused rescoring: the rule's blame). A list short of k on any
+      query is never cleared (it may lack rows no system returned): short lists are common
+      under selective filters and in sparse, so those runs mostly keep the rule's blame.
+    So a correct system compared with two systems wrong in different (or the same) ways is no
+    longer blamed, and no system the rule blamed escapes without a proof. Reasons: a pair
+    whose blamed systems are the rule's keeps the rule's reason word for word; a side newly
+    blamed gets "(N of its ranks contradict the float64 scores)"; a side the rule called
+    ambiguous whose partner was cleared gets "(<partner> is consistent with the float64
+    scores)" (or its proof clause); a cleared pair gives no reason. Only comparisons that ran
+    count. A sweep's judge document holds every pair too (compare.GroupedPairs), so its blame
+    is the all-pairs blame."""
+    v = _order_verdict(res, listed)
+    if v is None:
+        return {}
+    failed, old_in, final, proof = v["failed"], v["old_in"], v["final"], v["proof"]
+    out: dict = {}
+
+    def why(nm, pk):
+        c, was, now = failed[pk], old_in.get(pk, {}), final[pk]
+        if nm in was:
+            r = was[nm]
+            if now == set(was) or not r.endswith("(ambiguous: blamed on both)"):
+                return r
+            if nm in proof.get(pk, {}):
+                return (f"{c} order disagreements in {pk} ({proof[pk][nm]} of its ranks "
+                        "contradict the float64 scores)")
+            other = [o for o in was if o != nm and o not in now]
+            return (f"{c} order disagreements in {pk} ({', '.join(other)} is consistent with "
+                    "the float64 scores)")
+        return (f"{c} order disagreements in {pk} ({proof[pk][nm]} of its ranks contradict "
+                "the float64 scores)")
+    seq = [(pk, nm) for pk in old_in for nm in old_in[pk]]   # the rule's order first
+    for pk in failed:
+        seq += [(pk, nm) for nm in sorted(final[pk] - set(old_in.get(pk, {})),
+                                          key=listed.index)]
+    by_nm: dict = {}
+    for pk, nm in seq:
+        if nm in final[pk]:
+            by_nm.setdefault(nm, []).append(pk)
+    old_order = {}
+    for pk, d in old_in.items():
+        for nm in d:
+            old_order.setdefault(nm, []).append(pk)
+    for nm in listed:
+        if nm not in by_nm:
+            continue
+        # the rule's reasons, in the rule's order (one list per system, so rebuild it from
+        # the rule's own per-system list when nothing about nm changed)
+        if old_order.get(nm) == by_nm[nm] and all(final[pk] == set(old_in[pk])
+                                                  for pk in by_nm[nm]):
+            out[nm] = list(v["old"][nm])
+        else:
+            out[nm] = [why(nm, pk) for pk in by_nm[nm]]
+    return out
+
+
+def _order_proven(res: dict) -> set:
+    """Systems with any float64 proof against them anywhere in the judge document (any pair,
+    passed or failed) or a list defect: never cleared."""
+    proven = {nm for nm, df in (res.get("system_defects") or {}).items()
+              if (df or {}).get("failed")}
+    proven |= {nm for nm, c in (res.get("f64_wrong_total") or {}).items() if c}
+    for r in (res.get("pairs") or {}).values():
+        for key in ("f64_order_inversions_by_system", "f64_order_contradictions_by_system",
+                    "f64_order_full_contradictions_by_system", "f64_wrong_by_system"):
+            proven |= {nm for nm, v in ((r or {}).get(key) or {}).items() if v}
+    return proven
+
+
+def _order_verdict(res: dict, listed: list[str]):
+    """order_blame's working: {failed, old (the rule's {system: [why]}), old_in ({pk: {system:
+    the rule's reason}}), final ({pk: systems blamed}), proof ({pk: {system: count}}), clean}
+    or None when no pair failed."""
+    failed = {pk: c for pk, c in (res.get("f64_order_failed_pairs") or {}).items() if c}
+    if not failed:
+        return None
+    old_in: dict = {}
+    old = _order_blame_common(res, listed, failed, old_in)
+    pairs_doc = res.get("pairs") or {}
+    proven = _order_proven(res)
+    final, proofs, cleans = {}, {}, {}
+    for pk, c in failed.items():
+        xy = _pair_of(pk, listed)
+        was = set(old_in.get(pk, {}))
+        if xy is None:
+            final[pk] = was
+            continue
+        doc = pairs_doc.get(pk) or {}
+        proof, clean = {}, set()
+        full_ok = doc.get("f64_order_full_queries") is not None and \
+            doc.get("f64_order_full_queries") == doc.get("f64_order_queries_with_real")
+        for nm in xy:
+            n_ = max((doc.get(key) or {}).get(nm) or 0 for key in (
+                "f64_order_inversions_by_system", "f64_order_contradictions_by_system",
+                "f64_order_full_contradictions_by_system"))
+            if n_ > 0:
+                proof[nm] = n_
+            elif full_ok and nm not in proven and not any(
+                    (doc.get(key) or {}).get(nm, 1) for key in (
+                        "f64_order_full_contradictions_by_system",
+                        "f64_order_full_unjudged_by_system",
+                        "f64_order_short_queries_by_system")):
+                clean.add(nm)
+        final[pk] = ((was - clean) | set(proof)) or was
+        proofs[pk], cleans[pk] = proof, clean
+    return {"failed": failed, "old": old, "old_in": old_in, "final": final, "proof": proofs,
+            "clean": cleans}
+
+
+def _order_blames(res: dict, listed: list[str]):
+    """(order_blame's blame, the common-system rule's)."""
+    v = _order_verdict(res, listed)
+    return (order_blame(res, listed), v["old"]) if v else ({}, {})
+
+
+def order_clearing_candidates(res: dict, listed: list[str], unclearable=()) -> set:
+    """The order-failed pairs (keys) where clearing is in question: some side the common-system
+    rule blames for the pair has no proof against it (no inversion, no contradiction at the
+    mismatched ranks, nothing elsewhere in the document) and is not in ``unclearable`` (sides
+    order_blame can never clear, e.g. short of k on some query). compare.judge runs its
+    full-rank order check (a second rescoring pass) on these only."""
+    failed = {pk: c for pk, c in (res.get("f64_order_failed_pairs") or {}).items() if c}
+    if not failed:
+        return set()
+    old_in: dict = {}
+    _order_blame_common(res, listed, failed, old_in)
+    proven = _order_proven(res)
+    out = set()
+    for pk, d in old_in.items():
+        if _pair_of(pk, listed) is None:
+            continue
+        doc = (res.get("pairs") or {}).get(pk) or {}
+        for nm in d:
+            if nm in proven or nm in unclearable or any(
+                    ((doc.get(key) or {}).get(nm) or 0) > 0 for key in (
+                    "f64_order_inversions_by_system", "f64_order_contradictions_by_system")):
+                continue
+            out.add(pk)
+    return out
+
+
+def _order_blame_common(res: dict, listed: list[str], failed: dict, blamed_in: dict) -> dict:
+    """order_blame's common-system rule, {system: [why]}; ``blamed_in`` gets {pk: {system the
+    rule blames for it: its reason}}. Three steps:
     (1) a side whose own list is provably out of order (f64_order_inversions_by_system > 0: a
         later rank beats an earlier one beyond the window) is blamed, the other side is not;
     (2) for the remaining failed pairs, the one system common to all of them is blamed, if some
         other pair passed (3 variants, only v1 wrong: v1_vs_v2 and v1_vs_v3 fail, v2_vs_v3
         passes, so v1);
-    (3) otherwise (two systems only, or no single common system) both sides are blamed."""
-    failed = {pk: c for pk, c in (res.get("f64_order_failed_pairs") or {}).items() if c}
-    if not failed:
-        return {}
+    (3) otherwise (two systems only, or no single common system) both sides are blamed.
+    Only comparisons that ran count (a pair never compared neither failed nor passed)."""
     pairs_doc = res.get("pairs") or {}
     out: dict = {}
     unresolved = {}
+
+    def put(nm, pk, why):
+        out.setdefault(nm, []).append(why)
+        blamed_in.setdefault(pk, {})[nm] = why
     for pk, c in failed.items():
         xy = _pair_of(pk, listed)
         if xy is None:   # a pair this round does not list: blame everyone, never drop it
             for nm in listed:
-                out.setdefault(nm, []).append(f"{c} order disagreements in {pk} (not a pair of "
-                                              "the listed systems)")
+                put(nm, pk, f"{c} order disagreements in {pk} (not a pair of the listed "
+                    "systems)")
             continue
         inv = (pairs_doc.get(pk) or {}).get("f64_order_inversions_by_system") or {}
         own = [nm for nm in xy if (inv.get(nm) or 0) > 0]
         if own:
             for nm in own:
-                out.setdefault(nm, []).append(f"{c} order disagreements in {pk} ({inv[nm]} "
-                                              "inversions in its own list)")
+                put(nm, pk, f"{c} order disagreements in {pk} ({inv[nm]} inversions in its "
+                    "own list)")
         else:
             unresolved[pk] = (xy, c)
     if unresolved:
-        common = set.intersection(*(set(xy) for xy, _ in unresolved.values()))
-        passed = [(x, y) for i, x in enumerate(listed) for y in listed[i + 1:]
-                  if f"{x}_vs_{y}" not in failed and f"{y}_vs_{x}" not in failed]
-        if len(common) == 1 and passed:
-            (nm,) = common
-            for pk, (xy, c) in unresolved.items():
-                out.setdefault(nm, []).append(
-                    f"{c} order disagreements in {pk} (in every order-failed pair, while "
-                    f"{passed[0][0]}_vs_{passed[0][1]} passed)")
-        else:
-            for pk, (xy, c) in unresolved.items():
-                for nm in xy:
-                    out.setdefault(nm, []).append(
-                        f"{c} order disagreements in {pk} (ambiguous: blamed on both)")
+        def msg(nm, pk, c, common, passed):
+            r = (f"{c} order disagreements in {pk} (in every order-failed pair, while "
+                 f"{passed[0][0]}_vs_{passed[0][1]} passed)" if common
+                 else f"{c} order disagreements in {pk} (ambiguous: blamed on both)")
+            blamed_in.setdefault(pk, {})[nm] = r
+            return r
+        _common_or_both(res, listed, failed, unresolved, out, msg)
     return out
 
 
-def shared_score_blame(res: dict, listed: list[str]) -> dict:
-    """{system: [why]} for the pairs whose shared-id scores disagree (compare.judge
-    `shared_score_failed_pairs`). Two scores of one id do not say which is wrong: the one
-    system common to every failed pair is blamed if some other pair passed (as order_blame's
-    step 2), otherwise both sides of each failed pair."""
-    failed = {pk: c for pk, c in (res.get("shared_score_failed_pairs") or {}).items() if c}
-    if not failed:
-        return {}
+def _common_or_both(res, listed, failed, unresolved, out, msg) -> None:
+    """_order_blame_common's steps 2-3 (and shared_score_blame's) into ``out``: over the comparisons
+    that ran (_pair_status), the one system
+    common to every pair failing in ``unresolved`` {pk: (xy, count)} is blamed if some pair
+    passed; otherwise both sides of each such pair. ``failed``: every failed pair of the check
+    (none of them counts as passed). msg(nm, pk, c, common, passed) -> the reason."""
+    _, passed = _pair_status(res, listed, failed)
+    # the failed pairs in their own (judge's) order and orientation, as before grouping
+    bad = {xy: pk for pk, (xy, _) in unresolved.items()}
+    common = set.intersection(*(set(xy) for xy in bad))
+    seen = set()
+    for xy, pk in bad.items():
+        c = unresolved[pk][1]
+        for nm in (common if len(common) == 1 and passed else xy):
+            if (nm, pk) not in seen:
+                seen.add((nm, pk))
+                out.setdefault(nm, []).append(msg(nm, pk, c, len(common) == 1 and bool(passed),
+                                                  passed))
+
+
+def _shared_score_common(res: dict, listed: list[str], failed: dict, blamed_in: dict) -> dict:
+    """shared_score_blame's common-system rule, {system: [why]}; ``blamed_in`` gets {pk:
+    {system the rule blames for it: its reason}}. Two scores of one id do not say which is
+    wrong: the one system common to every failed pair is blamed if some other pair passed (as
+    order_blame's step 2), otherwise both sides of each failed pair; over the comparisons that
+    ran only (_common_or_both)."""
     out: dict = {}
     pairs = {}
     for pk, c in failed.items():
         xy = _pair_of(pk, listed)
         if xy is None:
             for nm in listed:
-                out.setdefault(nm, []).append(f"{c} shared-id score mismatches in {pk} (not a "
-                                              "pair of the listed systems)")
+                why = f"{c} shared-id score mismatches in {pk} (not a pair of the listed systems)"
+                out.setdefault(nm, []).append(why)
+                blamed_in.setdefault(pk, {})[nm] = why
         else:
             pairs[pk] = (xy, c)
     if pairs:
-        common = set.intersection(*(set(xy) for xy, _ in pairs.values()))
-        passed = [(x, y) for i, x in enumerate(listed) for y in listed[i + 1:]
-                  if f"{x}_vs_{y}" not in failed and f"{y}_vs_{x}" not in failed]
-        for pk, (xy, c) in pairs.items():
-            who = sorted(common) if len(common) == 1 and passed else list(xy)
-            for nm in who:
-                out.setdefault(nm, []).append(f"{c} shared-id score mismatches in {pk}")
+        def msg(nm, pk, c, common, passed):
+            why = f"{c} shared-id score mismatches in {pk}"
+            blamed_in.setdefault(pk, {})[nm] = why
+            return why
+        _common_or_both(res, listed, failed, pairs, out, msg)
+    return out
+
+
+def _shared_score_verdict(res: dict, listed: list[str]):
+    """shared_score_blame's working: {failed, old (the rule's {system: [why]}), old_in ({pk:
+    {system: the rule's reason}}), final ({pk: systems blamed}), proof ({pk: {system: ids off
+    the float64 score}})} or None when no pair failed. Per failed pair with compare.judge's
+    float64 check (shared_score_checked): a side whose own score is off the float64 score on
+    some mismatched id is blamed; a side the rule blamed is cleared when every mismatched id
+    was judged, none is off for it, and nothing anywhere in the document proves it wrong
+    (_order_proven, or its shared-id scores off the float64 scores in another pair); a pair
+    left with nobody keeps the rule's blame."""
+    failed = {pk: c for pk, c in (res.get("shared_score_failed_pairs") or {}).items() if c}
+    if not failed:
+        return None
+    old_in: dict = {}
+    old = _shared_score_common(res, listed, failed, old_in)
+    pairs_doc = res.get("pairs") or {}
+    proven = _order_proven(res)
+    for r in pairs_doc.values():
+        proven |= {nm for nm, v in ((r or {}).get("shared_score_wrong_by_system") or {}).items()
+                   if v}
+    final, proofs = {}, {}
+    for pk in failed:
+        xy = _pair_of(pk, listed)
+        was = set(old_in.get(pk, {}))
+        doc = pairs_doc.get(pk) or {}
+        if xy is None or doc.get("shared_score_checked") is None:
+            final[pk], proofs[pk] = was, {}
+            continue
+        wrong = doc.get("shared_score_wrong_by_system") or {}
+        unj = doc.get("shared_score_unjudged_by_system") or {}
+        proof = {nm: wrong[nm] for nm in xy if (wrong.get(nm) or 0) > 0}
+        clean = set()
+        if doc["shared_score_checked"] == doc.get("shared_score_mismatches"):
+            clean = {nm for nm in xy if nm not in proof and nm not in proven
+                     and wrong.get(nm, 1) == 0 and unj.get(nm, 1) == 0}
+        final[pk] = ((was - clean) | set(proof)) or was
+        proofs[pk] = proof
+    return {"failed": failed, "old": old, "old_in": old_in, "final": final, "proof": proofs}
+
+
+def shared_score_blame(res: dict, listed: list[str]) -> dict:
+    """{system: [why]} for the pairs whose shared-id scores disagree (compare.judge
+    `shared_score_failed_pairs`). Blame is first assigned by the common-system rule
+    (_shared_score_common), then, where compare.judge checked the mismatched ids against the
+    float64 scores (--rescore: shared_score_checked, shared_score_wrong_by_system,
+    shared_score_unjudged_by_system), corrected per failed pair by the proofs
+    (_shared_score_verdict): a side whose score is off the float64 score is blamed, a side
+    that agrees with it on every mismatched id (and is proven wrong nowhere) is cleared, a
+    pair never left with nobody. So a correct system compared with two systems sharing a wrong
+    score is no longer blamed. A system whose blamed pairs and partners are the rule's keeps
+    the rule's reasons word for word (always so without the float64 check); otherwise a side
+    newly blamed states "(its score is off the float64 score on N ids)", a side kept after its
+    partner was cleared "(<partner> agrees with the float64 scores)"."""
+    v = _shared_score_verdict(res, listed)
+    if v is None:
+        return {}
+    failed, old_in, final, proof = v["failed"], v["old_in"], v["final"], v["proof"]
+    if all(final[pk] == set(old_in.get(pk, {})) for pk in failed):
+        return v["old"]   # nothing changed (always so without the float64 check)
+
+    def why(nm, pk):
+        base = f"{failed[pk]} shared-id score mismatches in {pk}"
+        was, now = old_in.get(pk, {}), final[pk]
+        if now == set(was):
+            return was[nm]
+        if nm in proof.get(pk, {}):
+            return f"{base} (its score is off the float64 score on {proof[pk][nm]} ids)"
+        gone = [o for o in was if o not in now]
+        return f"{base} ({', '.join(gone)} agrees with the float64 scores)" if gone else base
+    seq = [(pk, nm) for pk in old_in for nm in old_in[pk]]   # the rule's order first
+    for pk in failed:
+        seq += [(pk, nm) for nm in sorted(final[pk] - set(old_in.get(pk, {})),
+                                          key=listed.index)]
+    by_nm: dict = {}
+    for pk, nm in seq:
+        if nm in final[pk]:
+            by_nm.setdefault(nm, []).append(pk)
+    old_pks: dict = {}
+    for pk, d in old_in.items():
+        for nm in d:
+            old_pks.setdefault(nm, []).append(pk)
+    out = {}
+    for nm in listed:
+        if nm not in by_nm:
+            continue
+        if old_pks.get(nm) == by_nm[nm] and all(final[pk] == set(old_in[pk])
+                                                for pk in by_nm[nm]):
+            out[nm] = list(v["old"][nm])
+        else:
+            out[nm] = [why(nm, pk) for pk in by_nm[nm]]
     return out
 
 

@@ -41,7 +41,7 @@ novabf_output: ${WRITE}
 protocol: {rounds: 3}                       # the reported value is the median of 3 rotated rounds
 checks:
   oracle_queries: 500                       # queries sampled for the float64 oracle
-  rescore_max_gib: 100                      # 2560-d: the float64 rescoring of 500 queries needs ~78 GiB (node: 128 GiB)
+  rescore_max_gib: 100                      # 2560-d (node: 128 GiB): the rescoring reads fewer files at once to fit
   gt: ~/data/gt_22723.npz             # the dataset GT, all 22,723 rows (the `queries` step writes it)
 
 prep:

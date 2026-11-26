@@ -330,11 +330,10 @@ def test_manifest_reads_the_stage_record(tmp_path, monkeypatch):
 
 
 @pytest.mark.slow
-def test_manifest_fields_on_a_cpu_run(tmp_path):
-    p = bench("run", os.path.join(CB, "tests", "fixtures", "experiments", "dense.yaml"), "--dev", "--results",
-              str(tmp_path), timeout=900)
-    assert p.returncode == 0, p.stderr[-2000:]
-    m = json.load(open(glob.glob(str(tmp_path / "*" / "*" / "manifest.json"))[0]))
+def test_manifest_fields_on_a_cpu_run(tmp_path_factory):
+    from helpers import fixture_runs   # the shared, cached `bench run --dev` of dense.yaml
+    d = fixture_runs.ok_runs(tmp_path_factory, "manifest_run", ("dense",))["dense"]
+    m = json.load(open(os.path.join(d, "manifest.json")))
     for k in ("commit", "dirty", "stage", "code_sha", "stack_sha", "paper", "files", "instance",
               "gpu", "gpus", "node", "cuda_libs", "finished_utc"):
         assert k in m, k

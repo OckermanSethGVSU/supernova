@@ -611,19 +611,6 @@ def test_main_unpins_on_signal_exit(monkeypatch, tmp_path, corpus):
     assert pin.registered == {} and any(e[0] == "unregister" for e in cr.log)
 
 
-def test_plot_uses_exposed_h2d():
-    import pandas as pd
-    from bench.report import plots as plot
-    med = pd.DataFrame([dict(source_stall_s=1.0, merge_s=0.1, other_s=0.0,
-                             engine_call_s=3.0, h2d_s=0.8, h2d_exposed_s=0.1, widen_s=0.0,
-                             search_s=2.5, d2h_s=0.1, normalize_s="", widen_where="device",
-                             gpu_events="on")])
-    seg = plot.segments(med)
-    assert seg.loc[0, "h2d"] == pytest.approx(0.1)
-    assert seg.loc[0, "gpu_gap"] == pytest.approx(3.0 - 0.1 - 2.5 - 0.1)
-    assert "h2d_mode" in plot.CONFIG
-
-
 # ------------------------------------------------------------- --d2h pinned
 
 @pytest.mark.parametrize("extra, msg", [

@@ -12,12 +12,12 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
+from helpers import fixture_runs
 from bench.verify import agree
 from bench.verify import compare as C
 
 
 CB = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-FIX = os.path.join(CB, "tests", "fixtures", "experiments")
 SHAPES = ("dense", "sparse", "multivector", "filtered")
 
 
@@ -40,13 +40,8 @@ def _only_run(results, name):
 
 @pytest.fixture(scope="module")
 def runs(tmp_path_factory):
-    res = str(tmp_path_factory.mktemp("s5_results"))
-    out = {}
-    for shape in SHAPES:
-        p = bench("run", os.path.join(FIX, f"{shape}.yaml"), "--dev", "--results", res)
-        assert p.returncode == 0, p.stdout[-3000:] + p.stderr[-3000:]
-        out[shape] = _only_run(res, f"s4_{shape}")
-    return out
+    """{shape: run dir}: this module's own copy of the shared, cached runs (fixture_runs)."""
+    return fixture_runs.ok_runs(tmp_path_factory, "s5_results")
 
 
 def checks(d):

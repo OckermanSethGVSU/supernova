@@ -53,7 +53,7 @@ def _mv_fixture(tmp_path, n_files=3, rows=5, seed=2, d=3):
 def _args(tmp_path, modality, col, metric="ip", k=3):
     return types.SimpleNamespace(k=k, modality=modality, metric=metric, corpus=str(tmp_path / "c"),
                                  vcol=col, queries=str(tmp_path / "q.parquet"), qcol=col,
-                                 query_rows=None)
+                                 query_rows=None, rescore_max_gib=32.0, rescore_threads=8)
 
 
 def _inputs(n_files, rows, n=5):

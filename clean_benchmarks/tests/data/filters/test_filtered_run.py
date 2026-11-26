@@ -537,7 +537,7 @@ def test_compact_union_repacks_exactly():
 
 
 @pytest.mark.slow
-def test_trace_carries_filter_segments_and_plots(tmp_path, data):
+def test_trace_carries_filter_segments(tmp_path, data):
     root, corpus, qpath, *_ = data
     rows, _ = run_cli(tmp_path, data, write_filter(root, "per_query"), "masked", "bitmap",
                       ["--read-mode", "native"])
@@ -546,7 +546,6 @@ def test_trace_carries_filter_segments_and_plots(tmp_path, data):
     assert float(r["w_filter_start_s"]) <= float(r["w_filter_end_s"])
     assert float(r["w_end_s"]) <= float(r["w_filter_start_s"])
     assert float(r["payload_read_s"]) > 0
-
 
 
 @pytest.mark.slow

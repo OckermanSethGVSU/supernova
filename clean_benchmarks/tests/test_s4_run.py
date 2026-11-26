@@ -30,6 +30,7 @@ from bench import experiment as E  # noqa: E402
 from bench import leg as L  # noqa: E402
 from bench import runner  # noqa: E402
 from bench.report import summary as SUM  # noqa: E402
+from helpers import fixture_runs  # noqa: E402
 
 CB = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 FIX = os.path.join(CB, "tests", "fixtures", "experiments")
@@ -55,13 +56,9 @@ def _only_run(results, name):
 
 @pytest.fixture(scope="module")
 def runs(tmp_path_factory):
-    res = str(tmp_path_factory.mktemp("s4_results"))
-    out = {}
-    for shape in ("dense", "sparse", "multivector", "filtered"):
-        p = bench("run", os.path.join(FIX, f"{shape}.yaml"), "--dev", "--results", res)
-        name = f"s4_{shape}"
-        out[shape] = {"proc": p, "dir": _only_run(res, name)}
-    return out
+    """{shape: {"proc", "dir"}}: this module's own copy of the shared, cached `bench run --dev`
+    of every shape (tests/helpers/fixture_runs.py)."""
+    return fixture_runs.runs(tmp_path_factory, "s4_results")
 
 
 @pytest.mark.slow

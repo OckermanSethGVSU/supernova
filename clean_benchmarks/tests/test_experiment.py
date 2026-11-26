@@ -410,3 +410,29 @@ def test_corpus_index_with_max_files_is_the_first_files_by_path(tmp_path):
     assert [os.path.basename(k) for k in keys] == ["a.parquet", "b.parquet"] and rows.tolist() == [3, 2]
     fs, paths = C.corpus_paths(str(tmp_path), 2, max_files=2)
     assert [os.path.basename(p) for p in paths] == ["a.parquet", "b.parquet"]
+
+
+def test_a_sweep_groups_its_variants_by_base_system_for_the_pairs_check():
+    """a sweep sets checks.groups {variant: base system}, which compare_args passes as one
+    --group per system of the search; a run sets none (every pair, no --group)."""
+    from bench.verify import agree
+    e, variants, _ = E.load_sweep(os.path.join(FIX, "sweeps", "dense_coyo_io.yaml"))
+    assert e["checks"]["groups"] == {v["variant"]: v["base_system"] for v in variants}
+    argv = agree.compare_args(e, e["searches"][0], None, "md5")
+    got = [argv[i + 1] for i, x in enumerate(argv) if x == "--group"]
+    assert got == [f"{sy}={e['checks']['groups'][sy]}" for sy in e["searches"][0]["systems"]] and got
+    run = _exp("dense_coyo")
+    assert "groups" not in run["checks"]
+    assert "--group" not in agree.compare_args(run, run["searches"][0], None, "md5")
+    with pytest.raises(E.ExperimentError, match="checks.groups"):
+        _exp("dense_coyo", ["checks.groups=some"])
+
+
+def test_the_checks_list_the_corpus_as_the_harness_legs_do():
+    """corpus.recursive false (Pes2o: flat): the checks list only the root's own files, as the
+    harness legs without --corpus-recursive do; recursive true lists every level."""
+    from bench.verify import agree
+    e = _exp("dense_pes2o")
+    assert "--corpus-flat" in agree.compare_args(e, e["searches"][0], None, "md5")
+    e = _exp("dense_coyo")
+    assert "--corpus-flat" not in agree.compare_args(e, e["searches"][0], None, "md5")

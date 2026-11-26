@@ -146,8 +146,9 @@ def test_rescore_bytes_dense_keeps_no_vector_copies():
     need = [{0, 1, 2}, {1, 150}]
     offs = np.array([0, 100, 200])
     est, ng, nf = cmp.rescore_bytes(need, offs, 1024, 4, 8)
-    want = (200 * 1024 * 4 * 2 + 4 * 1024 * 8 * 2 + 2 * 2 * 5 * 1024 * 8
-            + 5 * cmp.PAIR_BYTES + 2 * 1024 * 8 * 2)
+    want = (200 * (1024 * 4 + 8) * cmp.COLUMN_COPIES + 2 * cmp.READ_FIXED_BYTES
+            + 4 * 1024 * 8 * 2 + 2 * 2 * 5 * 1024 * 8
+            + 5 * (cmp.PAIR_BYTES + cmp.PAIR_WORK_BYTES) + 2 * 1024 * 8 * 2)
     assert (est, ng, nf) == (want, 4, 2)
 
 
@@ -450,3 +451,128 @@ def test_uuid_table_is_uuid_of_for_every_row():
     assert t.to_pylist() == want
     hits = pa.array([want[4], "not-an-id", want[0], want[8]])
     assert cmp.uuid_gids(hits, t).tolist() == [4, -1, 0, 8]
+    assert t.type == pa.large_string()   # 64-bit offsets: past 2 GiB of ids (~59.6M rows)
+
+
+def _random_lists(rng, n, k, rows, p_diff, special=False):
+    base = [rng.choice(rows, k, replace=False).astype(np.int64) for _ in range(n)]
+    sc = [np.sort(rng.random(k))[::-1].astype(np.float64) for _ in range(n)]
+    ids_b, sc_b = [], []
+    for b, s in zip(base, sc):
+        a = b.copy()
+        m = rng.random(k) < p_diff
+        a[m] = rng.integers(0, rows, int(m.sum()))
+        t = s + rng.normal(0, 1e-6, k) * (rng.random(k) < 0.3)
+        if special:
+            t[rng.integers(0, k)] = np.inf
+            if rng.random() < 0.3:
+                t[rng.integers(0, k)] = np.nan
+            if rng.random() < 0.3:
+                a[1] = a[0]                       # a repeated id
+            if rng.random() < 0.2:
+                a[rng.integers(0, k)] = -1        # a padded slot
+        ids_b.append(a)
+        sc_b.append(t)
+    return (base, sc), (ids_b, sc_b)
+
+
+@pytest.mark.parametrize("special", [False, True])
+def test_the_numpy_shared_scores_give_the_python_loops_result(special):
+    """compare() with VECTOR_SHARED gives byte-for-byte the document of the Python loop it
+    replaced: max shared delta, shared-score failures and their examples."""
+    import json
+    rng = np.random.default_rng(7 if special else 3)
+    A, B = _random_lists(rng, 60, 200, 5000, 0.02, special)
+    out = {}
+    for v in (False, True):
+        cmp.VECTOR_SHARED = v
+        try:
+            for tol in (None, (1e-5, 1e-5), (0.0, 0.0), (1e-9, 0.0)):
+                out[(v, tol)] = json.dumps(cmp.compare(A, B, 60, 1e-5, 200, names=("x", "y"),
+                                                       score_tol=tol), sort_keys=True, default=str)
+        finally:
+            cmp.VECTOR_SHARED = True
+    for tol in (None, (1e-5, 1e-5), (0.0, 0.0), (1e-9, 0.0)):
+        assert out[(False, tol)] == out[(True, tol)], tol
+
+
+def test_system_pairs_and_needed_ids_of_given_pairs():
+    assert cmp.system_pairs(["a", "b", "c"]) == [("a", "b"), ("a", "c"), ("b", "c")]
+    sys_ = {"a": ([np.array([1, 2])], None), "b": ([np.array([1, 3])], None), "c": ([np.array([4, 5])], None)}
+    assert cmp.needed_ids(sys_, 1, 2) == [{1, 2, 3, 4, 5}]
+    assert cmp.needed_ids(sys_, 1, 2, pairs=[("a", "b")]) == [{2, 3}]   # row 1 is in both
+    assert cmp._without([{2, 3}], {(0, 3): 0.5}) == [{2}]
+
+
+# ---- the set check: a stray of P is weighed against what Q kept and what P dropped ----------
+def _set_check(a_ids, b_ids, exact, k=3):
+    sa = [np.array([exact[(0, int(g))] for g in a_ids], np.float32)]
+    sb = [np.array([exact[(0, int(g))] for g in b_ids], np.float32)]
+    return cmp.compare(([a64(*a_ids)], sa), ([a64(*b_ids)], sb), 1, 1e-3, k, exact=exact,
+                       names=("p", "q"))
+
+
+def test_a_correct_list_is_not_blamed_when_the_other_is_out_of_order():
+    """Q holds a worse id AND lists its best id last: P's stray (row 2) is below Q's LAST entry
+    (its top score), which proves nothing against P; it beats Q's own stray (row 3), so Q is
+    wrong, as in the other direction."""
+    exact = {(0, 0): 0.9, (0, 1): 0.8, (0, 2): 0.7, (0, 3): 0.1}
+    r = _set_check([0, 1, 2], [3, 1, 0], exact)
+    assert r["f64_wrong_by_system"] == {"p": 0, "q": 2}
+    assert r["f64_real_disagreements"] == 2 and r["f64_tie_zone_differences"] == 0
+
+
+def test_a_stray_tied_with_what_it_replaced_is_a_tie_even_below_the_last_entry():
+    """Q holds the right set but out of order (best last); P swapped Q's stray for an exact tie
+    of it: neither list holds a worse id, so a tie, not P's fault (the old k-th rule blamed P:
+    the stray is far below Q's last entry)."""
+    exact = {(0, 0): 0.9, (0, 1): 0.8, (0, 2): 0.5, (0, 3): 0.5}
+    r = _set_check([0, 1, 2], [3, 1, 0], exact)
+    assert r["f64_wrong_by_system"] == {"p": 0, "q": 0}
+    assert r["f64_tie_zone_differences"] == 2 and r["f64_real_disagreements"] == 0
+
+
+def test_in_order_lists_keep_the_kth_rule():
+    """Both lists in order: a stray beyond the window above Q's k-th is Q's fault, below it
+    P's; within it a tie (the rule unchanged)."""
+    exact = {(0, 0): 0.9, (0, 1): 0.8, (0, 2): 0.7, (0, 3): 0.1}
+    assert _set_check([0, 1, 2], [0, 1, 3], exact)["f64_wrong_by_system"] == {"p": 0, "q": 2}
+    assert _set_check([0, 1, 3], [0, 1, 2], exact)["f64_wrong_by_system"] == {"p": 2, "q": 0}
+    near = {(0, 0): 0.9, (0, 1): 0.8, (0, 2): 0.7, (0, 3): 0.7 + 3 * ulp(0.7)}
+    r = _set_check([0, 1, 2], [0, 1, 3], near)
+    assert r["f64_wrong_by_system"] == {"p": 0, "q": 0} and r["f64_tie_zone_differences"] == 2
+
+
+def test_both_lists_wrong_on_one_stray_blames_both():
+    """P kept row 4 (0.3) over Q's stray row 2 (0.7): P wrong; Q kept row 5 (0.1) below P's
+    row 4: Q wrong too. One real disagreement per stray, each wrong side counted."""
+    exact = {(0, 0): 0.9, (0, 2): 0.7, (0, 4): 0.3, (0, 5): 0.1}
+    r = _set_check([0, 4], [0, 2, 5], exact)   # P short of k=3: its stray judged as usual
+    assert r["f64_wrong_by_system"]["p"] >= 1 and r["f64_wrong_by_system"]["q"] >= 1
+    pw, qw = cmp.stray_verdicts([0.3], 0.1, [0.7, 0.1], 128)
+    assert pw.tolist() == [True] and qw.tolist() == [True]
+
+
+def test_stray_verdicts_windows_and_non_finite():
+    """Each comparison has its own window; -inf is the worse one, NaN neither."""
+    u = ulp(1.0)
+    pw, qw = cmp.stray_verdicts([1.0, 1.0, 1.0], 1.0 - 200 * u, [1.0 + 100 * u, -np.inf, np.nan],
+                                128)
+    assert qw.tolist() == [True] * 3          # every stray beats Q's k-th (200 ULPs) and -inf
+    assert pw.tolist() == [False] * 3         # 100 ULPs above: within the window
+    assert cmp._beats(1.0, -np.inf, 128) and not cmp._beats(-np.inf, 1.0, 128)
+    assert not cmp._beats(np.nan, 0.0, 128) and not cmp._beats(0.0, np.nan, 128)
+
+
+def test_a_stray_blamed_on_both_renames_like_any_other_example():
+    """A sweep's pair documents are compare() under placeholder names, renamed after: an
+    example blaming both sides must come out as the all-pairs one does."""
+    import json
+    exact = {(0, 0): 0.9, (0, 1): 0.8, (0, 2): 0.7, (0, 4): 0.3, (0, 5): 0.1}
+    A = ([a64(0, 1, 4)], [np.array([.9, .8, .3], np.float32)])
+    B = ([a64(0, 2, 5)], [np.array([.9, .7, .1], np.float32)])
+    kw = dict(tol=1e-3, kmax=3, exact=exact)
+    named = cmp.compare(A, B, 1, names=("x", "y"), **kw)
+    assert ["x", "y"] in [e["wrong"] for e in named["f64_examples"]]
+    renamed = cmp.rename_sides(cmp.compare(A, B, 1, names=cmp.SIDES, **kw), "x", "y")
+    assert json.dumps(renamed, default=str) == json.dumps(named, default=str)

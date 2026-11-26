@@ -1079,38 +1079,6 @@ def test_cli_pylate_needs_multivector_and_query_file(mv_corpus, tmp_path, capsys
         assert a.pylate_rerank_results == "device"  # the default
 
 
-@pytest.mark.slow
-def test_plot_refuses_csvs_from_before_pylate_rerank_results(mv_corpus, monkeypatch, tmp_path):
-    """A CSV from before --pylate-rerank-results is refused; a host row is its own
-    config (plot.CONFIG)."""
-    import pandas as pd
-    from bench.report import plots as plot
-    cdir, qp, _, _ = mv_corpus
-    monkeypatch.setattr(run, "make_backend", pylate_backend())
-    paths = []
-    for name, extra in (("r", ["--backend", "pylate", "--pylate-mode", "rerank-released"]),
-                        ("b", ["--backend", "pylate", "--pylate-mode", "scores-batched"]),
-                        ("c", ["--backend", "cpu"])):
-        out = tmp_path / f"{name}.csv"
-        if name == "c":
-            monkeypatch.undo()
-        run.main(base_args(cdir, qp, out, "--regime", "stream", "--warmup", "0", *extra))
-        old = tmp_path / f"{name}_old.csv"
-        pd.read_csv(out, keep_default_na=False).drop(columns=["pylate_rerank_results"]) \
-            .to_csv(old, index=False)
-        paths.append(str(old))
-    monkeypatch.setattr(run, "make_backend", pylate_backend())
-    run.main(base_args(cdir, qp, tmp_path / "h.csv", "--regime", "stream", "--warmup", "0",
-                       "--backend", "pylate", "--pylate-mode", "rerank-released",
-                       "--pylate-rerank-results", "host"))
-    for old in paths:
-        with pytest.raises(SystemExit, match="missing columns"):
-            plot.read_csvs([old])
-    df = plot.read_csvs([str(tmp_path / f"{n}.csv") for n in ("r", "b", "c", "h")])
-    assert df["pylate_rerank_results"].tolist() == ["device", "n/a", "n/a", "host"]
-    assert "pylate_rerank_results" in plot.CONFIG
-
-
 def test_cli_refuses_non_multivector_column(mv_corpus, tmp_path):
     _, qp, _, _ = mv_corpus
     p = make_dummy.write_vectors(str(tmp_path / "d.parquet"), np.ones((3, 4), np.float32),

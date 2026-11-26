@@ -753,8 +753,7 @@ def _cuvs_factory(monkeypatch):
 def test_main_cuvs_end_to_end(fake_cuvs, monkeypatch, tmp_path, capsys):
     """run.main --backend cuvs on torch's CPU device: CSV and trace record
     the engine, the stock-allocator config and build_s; --verify passes
-    against the CPU faiss.knn oracle; events-off rows keep build_s; the plot
-    keeps the engines in separate bars."""
+    against the CPU faiss.knn oracle; events-off rows keep build_s."""
     from test_run import _fp16_pair
     f16, _, _ = _fp16_pair(tmp_path, payload_bytes=300)
     _cuvs_factory(monkeypatch)
@@ -784,16 +783,6 @@ def test_main_cuvs_end_to_end(fake_cuvs, monkeypatch, tmp_path, capsys):
     for p in rows:
         mine = [t for t in trows if t["t_start_unix"] == p["t_start_unix"]]
         assert sum(float(t["build_s"]) for t in mine) == pytest.approx(float(p["build_s"]))
-    # a FAISS (cpu) run of the same config next to it: never one bar
-    run.main(["--regime", "stream", "--prefetch", "0", "--corpus", f16, "--nq", "16",
-              "--warmup", "0", "--repeats", "1", "--csv", str(out), "--backend", "cpu"])
-    from bench.report import plots as plot
-    med = plot.median_rows(plot.read_csvs([str(out)]))
-    assert sorted(set(med["engine"])) == ["cuvs", "faiss"]
-    assert len(med) == 4  # cuvs prefetch 0 / 2 / no-events + faiss
-    png = tmp_path / "a.png"
-    assert plot.attribution([str(out)], str(png)) == 0
-    assert png.stat().st_size > 10_000 and "cuvs" in capsys.readouterr().out
 
 
 # -------------------------------------------- old CSVs
@@ -816,7 +805,7 @@ OLD_FIELDS = [
 ]
 
 
-def test_old_csv_refused_by_run_and_plot(corpus, tmp_path):
+def test_old_csv_refused_by_run(corpus, tmp_path):
     old = tmp_path / "old.csv"
     with open(old, "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=OLD_FIELDS)
@@ -825,13 +814,6 @@ def test_old_csv_refused_by_run_and_plot(corpus, tmp_path):
     with pytest.raises(SystemExit, match="existing header differs"):
         run.main(["--regime", "stream", "--corpus", corpus[0], "--backend", "cpu",
                   "--nq", "8", "--warmup", "0", "--repeats", "1", "--csv", str(old)])
-    new = tmp_path / "new.csv"
-    run.main(["--regime", "stream", "--corpus", corpus[0], "--backend", "cpu",
-              "--nq", "8", "--warmup", "0", "--repeats", "1", "--csv", str(new)])
-    from bench.report import plots
-    with pytest.raises(SystemExit) as e:
-        plots.attribution([str(new), str(old)], str(tmp_path / "a.png"))
-    assert "old.csv: missing columns" in str(e.value.code) and "engine_call_s" in str(e.value.code)
 
 
 def test_d2h_cuvs_distance_merge_identical(fake_cuvs, corpus, queries):

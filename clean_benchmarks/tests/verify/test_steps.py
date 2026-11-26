@@ -1,4 +1,4 @@
-"""bench check-copies / check-verify (bench/verify/steps.py) and bench plot.
+"""bench check-copies / check-verify (bench/verify/steps.py).
 
 The planned steps (which runs, which mode-only knobs, files / repeats precedence, the check
 json), the refusals, and the real commands on the fixture experiments (CPU).
@@ -187,19 +187,3 @@ def test_check_copies_plan_command(tmp_path):
     assert all("--max-files 16" in ln and "--warmup 1 --repeats 2 --warmup-files 1" in ln
                for ln in p.stdout.strip().splitlines())
     assert "--files 16 --warmup 1" in bench("check-copies", "--help").stdout
-
-
-@pytest.mark.slow
-def test_bench_plot_draws_every_search_from_saved_results(tmp_path):
-    pytest.importorskip("matplotlib")
-    pytest.importorskip("torch")
-    res = tmp_path / "res"
-    p = bench("run", os.path.join(FIX, "filtered.yaml"), "--dev", "--rounds", "1", "--results", str(res))
-    assert p.returncode == 0, p.stdout[-2000:]
-    d = os.path.join(res, "s4_filtered", os.listdir(os.path.join(res, "s4_filtered"))[0])
-    p = bench("plot", d)
-    assert p.returncode == 0, p.stdout + p.stderr
-    for s in ("filtered_text", "static_struct"):
-        assert os.path.getsize(os.path.join(d, "figures", f"{s}_attribution.png")) > 0
-        assert "masked" in open(os.path.join(d, "figures", f"{s}.txt")).read()
-    assert bench("plot", str(tmp_path)).returncode == 2

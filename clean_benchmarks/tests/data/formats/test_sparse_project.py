@@ -17,12 +17,10 @@ results equal the projected run's. The GPU run is owed."""
 import pickle
 
 import numpy as np
-import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
-from bench.report import plots as plot
 from bench.systems import harness_cli as run
 from bench.systems import loop
 from bench.record import results_io
@@ -316,29 +314,3 @@ def test_dense_row_columns(corpus, tmp_path):
               "--k", "3", "--csv", str(out), "--warmup", "0", "--repeats", "1"])
     r = read_rows(out)[0]
     assert (r["sparse_project"], r["project_s"], r["nnz"], r["nnz_kept"]) == ("n/a", "", "", "")
-
-
-@pytest.mark.slow
-def test_plot_refuses_older_csvs(sparse_corpus, corpus, tmp_path):
-    """A CSV from before --sparse-project is refused; a projected row is its own config."""
-    cdir, qp, _, _ = sparse_corpus
-    paths = []
-    for name, argv in (("s", cli(cdir, qp, tmp_path / "s.csv", "--regime", "stream")),
-                       ("d", ["--backend", "cpu", "--regime", "stream", "--corpus",
-                              corpus[0], "--nq", "5", "--k", "3", "--csv",
-                              str(tmp_path / "d.csv"), "--warmup", "0", "--repeats", "1"])):
-        run.main(argv)
-        df = pd.read_csv(tmp_path / f"{name}.csv", keep_default_na=False)
-        old = tmp_path / f"{name}_old.csv"
-        df.drop(columns=["sparse_project", "project_s", "nnz_kept"]).to_csv(old, index=False)
-        paths.append(str(old))
-    run.main(cli(cdir, qp, tmp_path / "p.csv", "--regime", "stream", "--sparse-project",
-                 "query-vocab"))
-    for old in paths:
-        with pytest.raises(SystemExit, match="missing columns"):
-            plot.read_csvs([old])
-    news = [str(tmp_path / f"{n}.csv") for n in ("s", "d", "p")]
-    df = plot.read_csvs(news)
-    assert df["sparse_project"].tolist() == ["off", "n/a", "query-vocab"]
-    assert "sparse_project" in plot.CONFIG
-    assert len(plot.median_rows(df)) == 3

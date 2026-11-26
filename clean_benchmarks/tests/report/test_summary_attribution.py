@@ -8,7 +8,7 @@ import pytest
 from bench import leg as L
 from bench.report import summary as SUM
 
-from helpers.attribution_rows import _row, CLOCK, P_ATTR_ROW, ROW
+from helpers.attribution_rows import CLOCK, P_ATTR_ROW, ROW
 
 
 def test_summary_has_the_attribution_and_the_footer_column():
@@ -18,21 +18,10 @@ def test_summary_has_the_attribution_and_the_footer_column():
     assert any("nova-bf" in n and "schema" in n for n in SUM.COL_NOTES)   # the footer-read doc note
 
 
-def test_summary_columns_are_the_views_and_the_plot_skips_novabf(tmp_path):
+def test_summary_columns_are_the_views():
     for c in SUM.HOST_COLS + SUM.GPU_COLS + SUM.INFO_COLS:
         assert c in SUM.COLS
     assert not any("pct" in c for c in SUM.COLS) and "harness_s" not in SUM.COLS
-    from bench.report import plots as AP
-    d = tmp_path / "run"
-    (d / "legs").mkdir(parents=True)
-    for sy, kind, att in (("faiss", "harness", L.attribution_harness(_row(), 100.0, 0, "faiss", "on")),
-                          ("novabf", "novabf", L.attribution_novabf(90.0))):
-        json.dump({"search": "s", "system": sy, "ok": True, "timed_seconds": 1.0, "kind": kind,
-                   "attribution": att}, open(d / "legs" / f"s__{sy}__r1.json", "w"))
-    assert list(AP.collect([str(d)])["s"]) == ["faiss"]
-    assert AP.time_parts(str(tmp_path / "fig"), [str(d)]) == 0          # both panels draw
-    txt = open(tmp_path / "fig" / "s_time_parts.txt").read()
-    assert "engine_call" in txt and "gpu_idle" in txt and "novabf" not in txt.split("\n")[2]
 
 
 CB = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))

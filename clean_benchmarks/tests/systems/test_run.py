@@ -381,9 +381,7 @@ def test_verify_without_passes_refused():
 def test_failed_verify_marks_rows_and_exits(corpus, tmp_path, monkeypatch, regime):
     """A pass whose --verify fails must never sit in the CSV as an ordinary
     row: the rows are held back until the check has run, then written with
-    verified=failed (trace rows too), and the run exits non-zero. The plot
-    drops them."""
-    from bench.report import plots as plot
+    verified=failed (trace rows too), and the run exits non-zero."""
     monkeypatch.setattr(verify, "compare_results", lambda *a, **kw: ["I mismatch on query 3"])
     out = tmp_path / "r.csv"
     with pytest.raises(SystemExit, match="VERIFY FAILED: I mismatch on query 3"):
@@ -397,7 +395,6 @@ def test_failed_verify_marks_rows_and_exits(corpus, tmp_path, monkeypatch, regim
     run.main(["--regime", regime, "--corpus", corpus[0], "--backend", "cpu",
               "--nq", "8", "--warmup", "0", "--repeats", "1", "--csv", str(out)])
     assert list(csv.DictReader(open(out)))[-1]["verified"] == "not_run"
-    assert plot.read_csvs([str(out)])["verified"].tolist() == ["not_run"]
 
 
 def test_verify_holds_rows_until_checked(corpus, tmp_path, monkeypatch):

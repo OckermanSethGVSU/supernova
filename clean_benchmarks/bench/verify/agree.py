@@ -48,10 +48,11 @@ class CheckError(Exception):
 _CACHE: dict = {}
 
 
-def _corpus_index(uri, need_ids, max_files=None):
-    key = ("index", uri, need_ids, max_files)
+def _corpus_index(uri, need_ids, max_files=None, recursive=True):
+    key = ("index", uri, need_ids, max_files, recursive)
     if key not in _CACHE:
-        _CACHE[key] = C.corpus_index(uri, need_ids=need_ids, max_files=max_files)
+        _CACHE[key] = C.corpus_index(uri, need_ids=need_ids, max_files=max_files,
+                                     recursive=recursive)
     return _CACHE[key]
 
 
@@ -153,11 +154,17 @@ def compare_args(exp: dict, search: dict, novabf_path: str | None, id_mode: str)
             "--rescore", "--vcol", exp["corpus"]["column"], "--queries", _abs(exp["queries"]["path"]),
             "--qcol", exp["queries"]["column"], "--metric", METRICS[exp["search"]["metric"]]]
     gt = (exp.get("checks") or {}).get("gt")
+    if not exp["corpus"].get("recursive"):   # the harness lists only the root's own level
+        argv += ["--corpus-flat"]
     sub = (exp.get("subset") or {}).get("files")
     if sub:   # the legs read the first N files: index, map and rescore those only
         argv += ["--max-files", str(int(sub))]
     elif gt:  # the dataset GT is over the full corpus: a subset run is never compared with it
         argv += ["--gt", _abs(gt)]
+    groups = (exp.get("checks") or {}).get("groups") or {}
+    for sy in search["systems"]:   # a sweep: each variant's base system (grouped pairs)
+        if sy in groups:
+            argv += ["--group", f"{sy}={groups[sy]}"]
     rmg = (exp.get("checks") or {}).get("rescore_max_gib")
     if rmg is not None:   # the rescoring's memory cap (the pairs' and the oracle's)
         argv += ["--rescore-max-gib", f"{float(rmg):g}"]
@@ -199,8 +206,14 @@ def load_round(a, legs: list[tuple[str, dict, str]], t0: float) -> dict:
     gt_npz = bool(a.gt) and a.gt.endswith(".npz")
     corpus_ids = a.novabf_ids == "corpus"
     has_nb = any(k == "novabf" for _, _, k in legs)
+    if has_nb and getattr(a, "corpus_flat", False):
+        try:
+            C.refuse_flat_with_nested(a.corpus)
+        except SystemExit as e:
+            raise CheckError(str(e)) from None
     keys, rows, offsets, id_col = _corpus_index(
-        a.corpus, (bool(a.gt) and not gt_npz) or (corpus_ids and has_nb), getattr(a, "max_files", None))
+        a.corpus, (bool(a.gt) and not gt_npz) or (corpus_ids and has_nb), getattr(a, "max_files", None),
+                              not getattr(a, "corpus_flat", False))
     n_ids = int(offsets[-1])
     dup = 0 if id_col is None else n_ids - len(pc.unique(id_col))
     print(f"corpus: {len(keys)} files, {n_ids} rows, duplicate ids {dup} "
@@ -277,23 +290,63 @@ def _exact_for(a, need, inputs):
     import pyarrow.compute as pc
     import pyarrow.parquet as pq
     offsets, n_keys, n, qn = inputs["offsets"], len(inputs["keys"]), inputs["n"], inputs["qn"]
-    fs, paths = C.corpus_paths(a.corpus, n_keys, getattr(a, "max_files", None))
+    fs, paths = C.corpus_paths(a.corpus, n_keys, getattr(a, "max_files", None),
+                              not getattr(a, "corpus_flat", False))
     if a.modality != "dense":
         sparse, multivec = C.harness_modules()
         mod = sparse if a.modality == "sparse" else multivec
         q, _ = mod.load_queries(a.queries, a.qcol)
         if q.n_rows != n:
             raise CheckError(f"--queries has {q.n_rows} rows, the results {n}")
+        try:
+            thr, est, _, _, _ = C.ragged_rescore_plan(a, need, offsets, paths, fs, q)
+        except SystemExit as exc:   # a --vcol of the wrong type
+            raise CheckError(str(exc)) from None
+        if est > a.rescore_max_gib * 2**30:
+            raise CheckError(f"oracle rescoring refused: estimated {est / 2**30:.2f} GiB > "
+                             f"{a.rescore_max_gib:g} GiB")
         fn = C.exact_scores_sparse if a.modality == "sparse" else C.exact_scores_mv
-        return fn(need, offsets, paths, fs, a.vcol, q, a.metric, threads=a.rescore_threads)
+        return fn(need, offsets, paths, fs, a.vcol, q, a.metric, threads=thr,
+                  budget=(a.rescore_max_gib * 2**30, est))
     xq = _dense_queries(a, n, qn)
-    est, _, _ = C.rescore_bytes(need, offsets, xq.shape[1],
-                                C.vector_itemsize(paths[0], fs, a.vcol), a.rescore_threads)
+    thr, est, _, _ = C.dense_rescore_plan(a, need, offsets, paths, fs, xq.shape[1])
     if est > a.rescore_max_gib * 2**30:
         raise CheckError(f"oracle rescoring refused: estimated {est / 2**30:.2f} GiB > "
                          f"{a.rescore_max_gib:g} GiB")
     return C.exact_scores(need, a.corpus, a.vcol, offsets, paths, fs, xq, a.metric,
-                          threads=a.rescore_threads)
+                          threads=thr, cache_key=C.score_cache_key(a),
+                          budget=(a.rescore_max_gib * 2**30, est))
+
+
+def prefetch_scores(a, inputs, n_random: int) -> int:
+    """One rescoring pass for a dense round: the pairs' disputed rows and the oracle sample's
+    candidates scored together into the run's score cache (C.SCORE_CACHE), so judge and
+    oracle_check then find their scores there instead of each reading the corpus. Returns the
+    pairs scored; 0 (nothing done) when the cache is off, the round is not dense / --rescore,
+    or the union would exceed the memory limit (each check then reads on its own)."""
+    if C.SCORE_CACHE is None or a.modality != "dense" or not a.rescore:
+        return 0
+    systems, n, k = inputs["systems"], inputs["n"], a.k
+    # judge's pairs (a sweep's: per query, compare.grouped_plan), so judge finds every score
+    need = C.needed_ids(systems, n, k, order=a.order_check, pairs=C.pair_plan(a, systems, n))
+    sample, _ = oracle_sample(systems, n, k, n_random)
+    for q in sample:
+        for nm in (x for x in systems if x != "gt"):
+            A = np.asarray(systems[nm][0][q][:k])
+            need[q].update(int(i) for i in A[A >= 0])
+    if not any(need):
+        return 0
+    offsets, n_keys, qn = inputs["offsets"], len(inputs["keys"]), inputs["qn"]
+    fs, paths = C.corpus_paths(a.corpus, n_keys, getattr(a, "max_files", None),
+                              not getattr(a, "corpus_flat", False))
+    xq = _dense_queries(a, n, qn)
+    thr, est, _, _ = C.dense_rescore_plan(a, need, offsets, paths, fs, xq.shape[1])
+    if est > a.rescore_max_gib * 2**30:
+        return 0
+    C.exact_scores(need, a.corpus, a.vcol, offsets, paths, fs, xq, a.metric,
+                   threads=thr, cache_key=C.score_cache_key(a),
+                   budget=(a.rescore_max_gib * 2**30, est))
+    return sum(len(s) for s in need)
 
 
 def _dense_queries(a, n, qn):
@@ -441,7 +494,8 @@ def exact_scan_candidates(a, inputs, sample, scan_files, filtered=False, mask_fn
     if filtered and mask_fn is None:
         raise CheckError("exact_scan: a filtered search needs its filter mask (mask_fn)")
     import pyarrow.parquet as pq
-    fs, paths = C.corpus_paths(a.corpus, len(inputs["keys"]), getattr(a, "max_files", None))
+    fs, paths = C.corpus_paths(a.corpus, len(inputs["keys"]), getattr(a, "max_files", None),
+                              not getattr(a, "corpus_flat", False))
     nf = len(paths) if scan_files is None else min(int(scan_files), len(paths))
     off = np.asarray(inputs["offsets"], np.int64)
     D = np.full((len(sample), a.k), -np.inf, np.float64)
@@ -520,7 +574,8 @@ def filter_scan_mask(exp: dict, search: dict, a, inputs):
     import pyarrow.parquet as pq
     from bench.data.filters import duckdb_filter as dfm
     job, flt = _filter_setup(exp, search, a, inputs)
-    fs, paths = C.corpus_paths(a.corpus, len(inputs["keys"]), getattr(a, "max_files", None))
+    fs, paths = C.corpus_paths(a.corpus, len(inputs["keys"]), getattr(a, "max_files", None),
+                              not getattr(a, "corpus_flat", False))
 
     def mask_fn(f, sample):
         res = flt.evaluate(pq.read_table(paths[f], columns=job.fields, filesystem=fs))
@@ -538,7 +593,8 @@ def filter_allowed(exp: dict, search: dict, a, inputs, need) -> dict:
     from bench.data.filters import duckdb_filter as dfm
     job, flt = _filter_setup(exp, search, a, inputs)
     offsets = np.asarray(inputs["offsets"], np.int64)
-    fs, paths = C.corpus_paths(a.corpus, len(inputs["keys"]), getattr(a, "max_files", None))
+    fs, paths = C.corpus_paths(a.corpus, len(inputs["keys"]), getattr(a, "max_files", None),
+                              not getattr(a, "corpus_flat", False))
     by_file: dict = {}
     for q, gs in enumerate(need):
         for g in gs:
@@ -724,7 +780,8 @@ def mv_short_queries(a, inputs, systems: dict, under_test: list, n: int, k: int,
     import pyarrow.compute as pc
     import pyarrow.parquet as pq
     from bench.data.formats import multivector as multivec
-    fs, paths = C.corpus_paths(a.corpus, len(inputs["keys"]), getattr(a, "max_files", None))
+    fs, paths = C.corpus_paths(a.corpus, len(inputs["keys"]), getattr(a, "max_files", None),
+                              not getattr(a, "corpus_flat", False))
     nf = len(paths) if scan_files is None else min(int(scan_files), len(paths))
     docs = 0
     for p in paths[:nf]:
@@ -927,7 +984,8 @@ def sparse_weight_problems(a, inputs) -> list[str]:
     if q.values.size and float(np.min(q.values)) < 0:
         out.append(f"{int((q.values < 0).sum())} negative query weight(s) (min {float(np.min(q.values))!r}) "
                    f"in {a.queries}: the candidate rule assumes non-negative weights")
-    fs, paths = C.corpus_paths(a.corpus, len(inputs["keys"]), getattr(a, "max_files", None))
+    fs, paths = C.corpus_paths(a.corpus, len(inputs["keys"]), getattr(a, "max_files", None),
+                              not getattr(a, "corpus_flat", False))
     if paths:
         t = pq.read_table(paths[0], columns=[a.vcol], filesystem=fs)
         v = pc.list_flatten(pc.struct_field(t.column(a.vcol).combine_chunks(), "values"))
@@ -964,6 +1022,15 @@ def check_round(exp, run_dir, recs, search, r, skipped, log_dir) -> dict:
     with contextlib.redirect_stdout(buf):
         try:
             inputs = load_round(a, legs, t0)
+            try:   # an optimisation only: on any problem each check scores on its own
+                n_pre = prefetch_scores(a, inputs, int((exp.get("checks") or {}).get("oracle_queries")
+                                                       or ORACLE_QUERIES_DEFAULT))
+            except Exception as exc:  # noqa: BLE001
+                print(f"float64 rescoring prefetch skipped: {type(exc).__name__}: {exc}", flush=True)
+                n_pre = 0
+            if n_pre:
+                print(f"float64 rescoring, one pass for the pairs and the oracle: {n_pre} "
+                      f"(query, id) pairs ({time.time() - t0:.0f} s)", flush=True)
             hook = None
             if exp["modality"] == "filtered":
                 def hook(exact, _s=search, _a=a, _i=inputs):
@@ -1010,10 +1077,17 @@ def check_round(exp, run_dir, recs, search, r, skipped, log_dir) -> dict:
     return out
 
 
+# share one run's float64 scores across its checks and rounds (C.SCORE_CACHE, prefetch_scores);
+# False scores each check on its own (the reference the tests compare it with)
+SHARE_SCORES = True
+
+
 def check_threads(exp: dict) -> int:
     """The checks' thread count: the experiment's `threads` (0 = every CPU). Not the
     process's OMP_NUM_THREADS, which SkyPilot sets to 1 in every job (the legs set their own)."""
-    return int(exp.get("threads") or 0) or (os.cpu_count() or 1)
+    from bench.timing import omp_threads
+    # threads, or for 0 / unset (an older experiment record) the CPUs the process may use
+    return omp_threads({"threads": int(exp.get("threads") or 0)})
 
 
 @contextlib.contextmanager
@@ -1022,8 +1096,6 @@ def _threads(n: int):
     after (set at run time: the process's environment, which the legs inherit, is unchanged)."""
     import pyarrow as pa
     cpu, io_ = pa.cpu_count(), pa.io_thread_count()
-    pa.set_cpu_count(n)
-    pa.set_io_thread_count(max(n, io_))
     # threadpoolctl sets KMP_DUPLICATE_LIB_OK in os.environ when imported; legs started later
     # from this process would inherit it, so the environment is put back as it was
     kmp = os.environ.get("KMP_DUPLICATE_LIB_OK")
@@ -1038,6 +1110,8 @@ def _threads(n: int):
         else:
             os.environ["KMP_DUPLICATE_LIB_OK"] = kmp
     try:
+        pa.set_cpu_count(n)
+        pa.set_io_thread_count(max(n, io_))
         with limits:
             yield
     finally:
@@ -1049,6 +1123,7 @@ def run_checks(run_dir: str, exp: dict) -> dict:
     """-> the checks.json document; `ok` false fails the run."""
     from bench import timing
     _CACHE.clear()
+    C.SCORE_CACHE = {} if SHARE_SCORES else None   # this run's float64 scores, shared by its rounds and checks
     n = check_threads(exp)
     try:
         with _threads(n):
@@ -1057,6 +1132,7 @@ def run_checks(run_dir: str, exp: dict) -> dict:
         return doc
     finally:
         _CACHE.clear()
+        C.SCORE_CACHE = None
 
 
 def _run_checks(run_dir: str, exp: dict, timing) -> dict:
@@ -1074,12 +1150,18 @@ def _run_checks(run_dir: str, exp: dict, timing) -> dict:
                         "oracle_sample_rule": f"numpy default_rng({ORACLE_SEED}).choice "
                         f"+ the first {ORACLE_MAX_DIFF} differing queries",
                         "oracle_score_tolerance": f"{SCORE_ATOL:g} + {SCORE_RTOL:g} x |exact|",
-                        "gt": (exp.get("checks") or {}).get("gt"),
+                        # a subset run is never compared with the dataset GT (it covers the
+                        # whole corpus): recorded as not used, with the reason
+                        "gt": None if (exp.get("subset") or {}).get("files") else (exp.get("checks") or {}).get("gt"),
+                        **({"gt_not_used": "subset run: the GT covers the whole corpus"}
+                           if (exp.get("subset") or {}).get("files") and (exp.get("checks") or {}).get("gt") else {}),
                         "max_score_ulps": (exp.get("checks") or {}).get("max_score_ulps")},
            "score_error": {}, "inputs": inputs}
     max_ulps = (exp.get("checks") or {}).get("max_score_ulps")
     tie_ulps = doc["settings"]["tie_ulps"]
     for s in exp["searches"]:
+        if C.SCORE_CACHE is not None:   # shared across a search's rounds, not across searches
+            C.SCORE_CACHE.clear()        # (bounds its memory to one search)
         per = doc["searches"].setdefault(s["name"], {})
         for r in range(1, R + 1):
             try:

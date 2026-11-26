@@ -24,7 +24,6 @@ import pyarrow.parquet as pq
 import pytest
 
 import make_dummy
-from bench.report import plots as plot
 from bench.systems import harness_cli as run
 from bench.systems import guards, loop
 from bench.record import results_io, schema
@@ -32,7 +31,6 @@ from bench.verify import oracle as verify
 from bench.systems import streaming as base, cpu_reference, cuvs_engine, faiss_engine
 from bench.data.sources import InMemorySource, ParquetSource
 from test_cuvs_backend import _cuvs_factory, cosine_distance_knn, fake_cuvs  # noqa: F401
-from test_plot_segments import med_of, row
 from test_timing_detail import Clock, Out, fake_alloc_counters, fake_event_cls
 
 torch = pytest.importorskip("torch")
@@ -655,69 +653,4 @@ def test_gt_guards(nonunit, gt_queries, tmp_path):
     with pytest.raises(SystemExit):
         run.parse_args(["--regime", "stream", "--corpus", path, "--csv", "x",
                         "--metric", "l2"])
-
-
-# ---------------------------------------------------------------- plot
-
-def _cos_rows():
-    split = row(prefetch=2, search=0.55) | {"metric": "cosine", "normalize_s": "0.04"}
-    split["engine_gap_s"] = str(0.80 - (0.10 + 0.05 + 0.04 + 0.55 + 0.02))
-    unsplit = row(backend="cpu", gpu_events="n/a", h2d=0, widen=0, search=0, d2h=0,
-                  prefetch=3) | {"metric": "cosine", "normalize_s": "0.1"}
-    off = row(gpu_events="off", prefetch=4) | {"metric": "cosine"}  # normalize unmeasured
-    return [split, unsplit, off]
-
-
-def test_plot_normalize_segment(tmp_path):
-    med = med_of(_cos_rows(), tmp_path)
-    seg = plot.segments(med).set_index(med["prefetch"].astype(int))
-    tot = pd_series(med["total_s"], seg.index)
-    assert (seg[plot.SEG_KEYS].sum(axis=1) - tot).abs().max() < 1e-12
-    assert list(seg["split"]) == [True, False, False]
-    # split: one more event part, the parts still add up to engine_call
-    assert seg.loc[2, "normalize"] == pytest.approx(0.04)
-    assert seg.loc[2, "search"] == pytest.approx(0.55)
-    assert seg.loc[2, "gpu_gap"] == pytest.approx(0.04)  # = engine_gap_s
-    assert seg.loc[2, plot.SPLIT + ["normalize"]].sum() == pytest.approx(0.80)
-    # unsplit with a host-timed normalize: its own segment, the rest is "call"
-    assert seg.loc[3, "normalize"] == pytest.approx(0.1)
-    assert seg.loc[3, "call"] == pytest.approx(0.70)
-    # events off: nothing measured, all in "call"
-    assert seg.loc[4, "normalize"] == 0 and seg.loc[4, "call"] == pytest.approx(0.80)
-    keys = plot.SEG_KEYS
-    assert keys.index("widen") < keys.index("normalize") < keys.index("search")
-
-
-def pd_series(col, index):
-    import pandas as pd
-    return pd.Series(col.to_numpy(float), index=index)
-
-
-def _legend_and_title(med, tmp_path, monkeypatch):
-    figs = []
-    monkeypatch.setattr(plot.plt, "close", figs.append)
-    plot.plot(med, str(tmp_path / "a.png"))
-    fig = figs[0]
-    return [t.get_text() for t in fig.legends[0].texts], fig._suptitle.get_text()
-
-
-def test_plot_legend_and_title(tmp_path, monkeypatch):
-    med = med_of(_cos_rows(), tmp_path)
-    legend, title = _legend_and_title(med, tmp_path, monkeypatch)
-    assert "normalize (FAISS cosine)" in legend and title.endswith(", cosine")
-    ip = med_of([row()], tmp_path)
-    ip["metric"] = "ip"
-    legend, title = _legend_and_title(ip, tmp_path, monkeypatch)
-    assert "normalize (FAISS cosine)" not in legend and title.endswith(", ip")
-
-
-def test_plot_metric_separates_bars(tmp_path, capsys):
-    rows = [row() | {"metric": "ip"}, row() | {"metric": "cosine"}]
-    med = med_of(rows, tmp_path)
-    assert len(med) == 2 and "metric" in plot.label_extras(med)
-    p = tmp_path / "r.csv"
-    import pandas as pd
-    pd.DataFrame(rows).to_csv(p, index=False)
-    assert plot.attribution([str(p)], str(tmp_path / "a.png")) == 0
-    assert "metric" in capsys.readouterr().out
 

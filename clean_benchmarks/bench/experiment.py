@@ -34,6 +34,10 @@ Top-level fields:
   checks      {oracle_queries: 500, gt: null, exact_scan: false, max_score_ulps, rescore_max_gib}
               gt is reference-only; exact_scan uses a full float64 scan.
               max_score_ulps enables failure on excessive score error.
+              groups: {system: group}, set by a sweep (each variant's base system): the pairs
+              check still judges every pair (the same verdicts), but compares a variant for
+              real only on the queries where its lists are not its group's first system's
+              exactly (compare.py --group). Unset (a run): every pair, every query.
               rescore_max_gib: the float64 rescoring's memory cap (compare.py's default 32 GiB);
               a wide corpus on a big node raises it rather than checking fewer queries.
               copies_files / verify_files / check_repeats: bench check-copies /
@@ -84,7 +88,7 @@ SECTIONS = {
     "copies": (set(), {"h2d", "h2d_overlap", "d2h", "d2h_overlap"}),
     "filter": ({"config"}, {"config"}),
     "protocol": (set(), {"rounds"}),
-    "checks": (set(), {"oracle_queries", "gt", "exact_scan", "max_score_ulps", "rescore_max_gib",
+    "checks": (set(), {"oracle_queries", "gt", "exact_scan", "max_score_ulps", "rescore_max_gib", "groups",
                        "copies_files", "verify_files", "check_repeats"}),
     "e2e": ({"system"}, {"system", "keep_cache", "tiebreak"}),
     "subset": ({"files"}, {"files"}),
@@ -202,6 +206,10 @@ def validate(doc: dict, where: str = "") -> dict:
     msu = e["checks"].get("max_score_ulps")
     if msu is not None and (isinstance(msu, bool) or not isinstance(msu, (int, float)) or not msu >= 0):
         raise ExperimentError(f"{where}checks.max_score_ulps: a number >= 0 (or unset)")
+    grp = e["checks"].get("groups")
+    if grp is not None and not (isinstance(grp, dict) and all(
+            isinstance(k, str) and isinstance(v, str) for k, v in grp.items())):
+        raise ExperimentError(f"{where}checks.groups: a mapping system -> group name (or unset)")
     rmg = e["checks"].get("rescore_max_gib")
     if rmg is not None and (isinstance(rmg, bool) or not isinstance(rmg, (int, float)) or not rmg > 0):
         raise ExperimentError(f"{where}checks.rescore_max_gib: a number > 0 (or unset)")
@@ -553,9 +561,14 @@ def sweep_variants(raw: dict, path: str, keep_rounds: bool = False) -> tuple[dic
     elif raw.get("search_name"):
         exp["search_name"] = raw["search_name"]
     exp.pop("e2e", None)
+    # the pairs check groups a sweep's variants by their base system (all pairs grow
+    # quadratically: 435 for a 30-variant grid): a variant whose lists equal its group's first
+    # system's on a query takes that system's outcomes there (compare.py --group)
+    exp["checks"] = {**(exp.get("checks") or {}),
+                     "groups": {v["variant"]: v["base_system"] for v in variants}}
+    own = _read_yaml(os.path.abspath(path)) if os.path.isfile(path) else {}
     # a sweep is one warm run per variant, unless the sweep file itself sets protocol.rounds
     # (the base's rounds are the paper run's, so they do not count) or keep_rounds is set
-    own = _read_yaml(os.path.abspath(path)) if os.path.isfile(path) else {}
     if not keep_rounds and "rounds" not in ((own.get("protocol") or {}) if isinstance(own, dict) else {}):
         exp["protocol"] = {**(exp.get("protocol") or {}), "rounds": SWEEP_ROUNDS_DEFAULT}
     return exp, variants

@@ -284,9 +284,7 @@ def test_engine_gap_stored_raw_when_negative(monkeypatch, corpus, queries):
 
 
 @pytest.mark.slow
-def test_no_gpu_events_blanks_round_trip_csv_and_plot(monkeypatch, corpus, tmp_path, capsys):
-    import pandas as pd
-    from bench.report import plots as plot
+def test_no_gpu_events_blanks_round_trip_csv(monkeypatch, corpus, tmp_path):
     torch = pytest.importorskip("torch")
     knn_gpu = _torch_knn(torch)
     monkeypatch.setattr(faiss, "StandardGpuResources", lambda: object(), raising=False)
@@ -308,21 +306,6 @@ def test_no_gpu_events_blanks_round_trip_csv_and_plot(monkeypatch, corpus, tmp_p
     trows = list(csv.DictReader(open(tr)))
     assert {(r["sync_wait_s"], r["sync_waited"]) for r in trows[:6 * len(ROWS)]} == {("", "")}
     assert {r["sync_waited"] for r in trows[6 * len(ROWS):]} == {"0"}
-    med = plot.median_rows(pd.read_csv(out, keep_default_na=False))
-    assert sorted(med["gpu_events"]) == ["off", "on"]  # never one bar
-    png = tmp_path / "a.png"
-    assert plot.attribution([str(out)], str(png)) == 0
-    printed = capsys.readouterr().out
-    assert png.stat().st_size > 10_000
-    num = plot.numeric_annotations(med).set_index("gpu_events")
-    ev = [c for c in plot.ANNOTATIONS if c in schema.EVENT_FIELDS and c != "widen_s"]
-    assert num.loc["off", ev].isna().all() and num.loc["on", ev].notna().all()
-    assert "off" in printed and "on" in printed
-    # sync_waits is a count: printed as an integer, blank when not measured
-    lines = plot.table(num.reset_index(), ["gpu_events", "sync_waits", "search_s"]).splitlines()
-    cells = {ln.split()[0]: ln.split()[1:] for ln in lines[1:]}
-    assert cells["on"][0] == "0" and len(cells["on"]) == 2
-    assert cells["off"] == []  # both blank
 
 
 # ------------------------------------------------------------ decode split
@@ -458,13 +441,8 @@ def test_trace_always_written_next_to_csv(corpus, tmp_path):
 
 
 def test_trace_carries_the_run_config(corpus, tmp_path):
-    """Trace rows carry every config column the plot separates runs by (all
-    but the total rows), so plot_trace can filter on them (--where corpus=,
-    max_files=, dtype=, ...) and titles each panel with the ones that vary
-    between the passes drawn."""
+    """Trace rows carry the run's config columns (backend, corpus, max_files, dtype, ...)."""
     import pandas as pd
-    from bench.report import plots as plot
-    assert set(schema.TRACE_CONFIG) == set(plot.CONFIG) - {"rows"}
     out = tmp_path / "r.csv"
     tr = _main("stream", corpus[0], out)
     _main("stream", corpus[0], out, ["--max-files", "2"])

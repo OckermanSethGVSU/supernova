@@ -115,5 +115,7 @@ EXPERIMENT_FIXTURES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "
 
 def pytest_configure(config):
     from bench import experiment as _E
+    # the shared `bench run --dev` cache snapshots the environment now, before any test changes it
+    from helpers import fixture_runs  # noqa: F401
     _E.EXPERIMENTS_DIR = EXPERIMENT_FIXTURES
     ensure_fixture_data()

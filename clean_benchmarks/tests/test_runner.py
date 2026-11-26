@@ -498,7 +498,9 @@ def test_a_variant_named_inside_a_leg_tag_is_matched(tmp_path):
 
 
 def _order_round(names, failed, inv=None):
-    pairs = {pk: {"f64_order_inversions_by_system": v} for pk, v in (inv or {}).items()}
+    # every pair ran (a normal run's judge document lists each one)
+    pairs = {f"{x}_vs_{y}": {} for i, x in enumerate(names) for y in names[i + 1:]}
+    pairs.update({pk: {"f64_order_inversions_by_system": v} for pk, v in (inv or {}).items()})
     return {"systems": names,
             "pairs": {"ok": False, "fails": ["float64 order disagreements"], "compare": {
                 "system_defects": {}, "f64_wrong_total": {}, "f64_order_failed_pairs": failed,
@@ -532,6 +534,155 @@ def test_ambiguous_order_failures_blame_both():
     # three systems, one failed pair, the others passed: both of that pair
     res = _order_round(["a", "b", "c"], {"a_vs_b": 1})["pairs"]["compare"]
     assert set(runner.order_blame(res, ["a", "b", "c"])) == {"a", "b"}
+
+
+def _con_doc(failed, con, ran=None, clean=()):
+    """a judge document whose order-failed pairs record per-side contradictions ``con``
+    {pk: {system: count}} (one order-failed query each); ``clean``: the pairs whose full-rank
+    order check ran (a side with count 0 then provably consistent there); ``ran``: the pairs
+    that ran (default: failed + con's)."""
+    pairs = {pk: {} for pk in (ran or [*failed, *con])}
+    for pk, v in con.items():
+        pairs[pk] = {"f64_order_inversions_by_system": {nm: 0 for nm in v},
+                     "f64_order_contradictions_by_system": v,
+                     "f64_order_queries_with_real": 1}
+        if pk in clean:
+            pairs[pk].update({"f64_order_full_queries": 1,
+                              "f64_order_full_contradictions_by_system": dict(v),
+                              "f64_order_full_unjudged_by_system": {nm: 0 for nm in v},
+                              "f64_order_short_queries_by_system": {nm: 0 for nm in v}})
+    return {"f64_order_failed_pairs": failed, "pairs": pairs}
+
+
+def _old_blame(res, listed):
+    from bench import runner
+    failed = {pk: c for pk, c in (res.get("f64_order_failed_pairs") or {}).items() if c}
+    return runner._order_blame_common(res, listed, failed, {}) if failed else {}
+
+
+def test_order_blame_one_wrong_system_keeps_the_old_text():
+    """(reviewer finding 4) one wrong system with contradictions but no inversion: blamed as
+    by the common-system rule, with its reasons word for word."""
+    from bench import runner
+    ran = ["a_vs_b", "a_vs_c", "b_vs_c"]
+    res = _con_doc({"a_vs_c": 2, "b_vs_c": 2},
+                   {"a_vs_c": {"a": 0, "c": 1}, "b_vs_c": {"b": 0, "c": 1}}, ran,
+                   clean=("a_vs_c", "b_vs_c"))
+    out = runner.order_blame(res, ["a", "b", "c"])
+    assert out == _old_blame(res, ["a", "b", "c"]) == {"c": [
+        "2 order disagreements in a_vs_c (in every order-failed pair, while a_vs_b passed)",
+        "2 order disagreements in b_vs_c (in every order-failed pair, while a_vs_b passed)"]}
+
+
+def test_order_blame_a_pair_resolved_by_counts_keeps_the_common_system():
+    """(reviewer finding 1) v1 wrong: v1_vs_v2 fails with v1's count, v1_vs_v3 fails with no
+    count, v2_vs_v3 passed: v1 alone (the common system over EVERY failed pair), v3 not."""
+    from bench import runner
+    listed = ["v1", "v2", "v3"]
+    res = _con_doc({"v1_vs_v2": 3, "v1_vs_v3": 1},
+                   {"v1_vs_v2": {"v1": 1, "v2": 0}, "v1_vs_v3": {"v1": 0, "v3": 0}},
+                   ["v1_vs_v2", "v1_vs_v3", "v2_vs_v3"])
+    assert runner.order_blame(res, listed) == _old_blame(res, listed)
+    assert set(runner.order_blame(res, listed)) == {"v1"}
+
+
+def test_order_blame_two_wrong_systems_spare_the_correct_one():
+    from bench import runner
+    listed = ["x", "y", "z"]
+    failed = {"x_vs_y": 1, "x_vs_z": 1, "y_vs_z": 2}
+    con = {"x_vs_y": {"x": 0, "y": 1}, "x_vs_z": {"x": 0, "z": 1}, "y_vs_z": {"y": 1, "z": 1}}
+    # y and z wrong in different ways: every pair fails, no common system: the rule blames
+    # all three; x proven consistent in its pairs -> y, z (their old text: still blamed)
+    res = _con_doc(failed, con, clean=tuple(con))
+    assert set(_old_blame(res, listed)) == {"x", "y", "z"}
+    out = runner.order_blame(res, listed)
+    # x_vs_y lost its partner x: y's clause there states its proof; y_vs_z is unchanged
+    assert out == {
+        "y": ["1 order disagreements in x_vs_y (1 of its ranks contradict the float64 scores)",
+              "2 order disagreements in y_vs_z (ambiguous: blamed on both)"],
+        "z": ["1 order disagreements in x_vs_z (1 of its ranks contradict the float64 scores)",
+              "2 order disagreements in y_vs_z (ambiguous: blamed on both)"]}
+    # without the full-rank check (an older document, or a refused rescoring): never cleared
+    res = _con_doc(failed, con)
+    assert set(runner.order_blame(res, listed)) == {"x", "y", "z"}
+    # x proven wrong elsewhere (a float64 set disagreement in a passed pair): not cleared
+    res = _con_doc(failed, con, clean=tuple(con))
+    res["pairs"]["x_vs_w"] = {"f64_wrong_by_system": {"x": 1, "w": 0}}
+    assert set(runner.order_blame(res, listed)) == {"x", "y", "z"}
+    # y and z wrong the same way: y_vs_z passes, x is common to both failed pairs. The rule:
+    # x alone (the correct system blamed, the two wrong ones spared); now y, z (new text)
+    failed = {"x_vs_y": 1, "x_vs_z": 1}
+    con = {"x_vs_y": {"x": 0, "y": 1}, "x_vs_z": {"x": 0, "z": 1}}
+    res = _con_doc(failed, con, ["x_vs_y", "x_vs_z", "y_vs_z"], clean=tuple(con))
+    assert set(_old_blame(res, listed)) == {"x"}
+    assert runner.order_blame(res, listed) == {
+        "y": ["1 order disagreements in x_vs_y (1 of its ranks contradict the float64 scores)"],
+        "z": ["1 order disagreements in x_vs_z (1 of its ranks contradict the float64 scores)"]}
+    # the same without the full-rank check: x stays, y and z are added (proven wrong)
+    res = _con_doc(failed, con, ["x_vs_y", "x_vs_z", "y_vs_z"])
+    assert set(runner.order_blame(res, listed)) == {"x", "y", "z"}
+
+
+def test_order_blame_ties_only_and_the_fallback():
+    from bench import runner
+    listed = ["x", "y", "z"]
+    # tie-only differences: no order-failed pair, nobody blamed
+    assert runner.order_blame(_con_doc({"x_vs_y": 0}, {"x_vs_y": {"x": 0, "y": 0}}), listed) == {}
+    # a real disagreement neither side contradicts, both proven consistent (a tie-window
+    # chain): clearing both would blame nobody, so the rule's blame stays, word for word
+    res = _con_doc({"x_vs_y": 1}, {"x_vs_y": {"x": 0, "y": 0}}, clean=("x_vs_y",))
+    assert runner.order_blame(res, listed) == _old_blame(res, listed) == {
+        "x": ["1 order disagreements in x_vs_y (ambiguous: blamed on both)"],
+        "y": ["1 order disagreements in x_vs_y (ambiguous: blamed on both)"]}
+    # an unjudged or short side is not proven consistent
+    for key in ("f64_order_full_unjudged_by_system", "f64_order_short_queries_by_system"):
+        res = _con_doc({"x_vs_y": 1}, {"x_vs_y": {"x": 0, "y": 1}}, clean=("x_vs_y",))
+        res["pairs"]["x_vs_y"][key]["x"] = 1
+        assert set(runner.order_blame(res, listed)) == {"x", "y"}
+    # the full-rank check covered fewer queries than failed: not proven
+    res = _con_doc({"x_vs_y": 1}, {"x_vs_y": {"x": 0, "y": 1}}, clean=("x_vs_y",))
+    res["pairs"]["x_vs_y"]["f64_order_queries_with_real"] = 2
+    assert set(runner.order_blame(res, listed)) == {"x", "y"}
+    # an inversion keeps its old reason
+    res = _con_doc({"x_vs_y": 1}, {"x_vs_y": {"x": 0, "y": 3}})
+    res["pairs"]["x_vs_y"]["f64_order_inversions_by_system"]["y"] = 2
+    assert runner.order_blame(res, listed) == {
+        "y": ["1 order disagreements in x_vs_y (2 inversions in its own list)"]}
+
+
+def test_pairs_blame_order_text_follows_the_order_verdict():
+    """the old order text only where a system's order blame and partners are unchanged:
+    a newly proven side states its proof, a side cleared of its order blame has no order
+    clause even when blamed for something else, a side kept after its partner was cleared
+    names the partner instead of "ambiguous"."""
+    from bench import runner
+    res = _con_doc({"x_vs_y": 1}, {"x_vs_y": {"x": 0, "y": 0}})
+    res["pairs"]["x_vs_y"].update({"f64_order_full_queries": 1,
+                                   "f64_order_full_contradictions_by_system": {"x": 0, "y": 2},
+                                   "f64_order_full_unjudged_by_system": {"x": 0, "y": 0},
+                                   "f64_order_short_queries_by_system": {"x": 0, "y": 0}})
+    res["f64_wrong_total"] = {"x": 0, "y": 0}
+    assert set(runner.order_blame(res, ["x", "y"])) == {"y"}
+    out = runner.pairs_blame({"ok": False, "fails": ["f"], "compare": res}, ["x", "y"])
+    assert out == {"y": "1 order disagreements in x_vs_y (2 of its ranks contradict the "
+                        "float64 scores)"}
+    # x blamed for shared-id scores too (not a float64 proof): cleared of its order blame,
+    # so no order clause
+    res2 = {**res, "shared_score_failed_pairs": {"x_vs_y": 1}}
+    out = runner.pairs_blame({"ok": False, "fails": ["f"], "compare": res2}, ["x", "y"])
+    assert out["x"] == "1 shared-id score mismatches in x_vs_y"
+    assert out["y"] == ("1 order disagreements in x_vs_y (2 of its ranks contradict the "
+                        "float64 scores); 1 shared-id score mismatches in x_vs_y")
+    # y kept with no proof of its own after x was cleared: names x
+    res3 = _con_doc({"x_vs_y": 1}, {"x_vs_y": {"x": 0, "y": 0}}, clean=("x_vs_y",))
+    res3["pairs"]["x_vs_y"]["f64_order_full_unjudged_by_system"]["y"] = 1
+    assert runner.order_blame(res3, ["x", "y"]) == {
+        "y": ["1 order disagreements in x_vs_y (x is consistent with the float64 scores)"]}
+    # x proven wrong elsewhere (a float64 set disagreement): never cleared, the old text
+    res["f64_wrong_total"] = {"x": 2, "y": 0}
+    out = runner.pairs_blame({"ok": False, "fails": ["f"], "compare": res}, ["x", "y"])
+    assert out["x"] == ("2 float64-checked disagreements; 1 order disagreements in x_vs_y "
+                        "(ambiguous: blamed on both)")
 
 
 BF_GPU = os.path.join(CB, "tests", "fixtures", "experiments", "novabf", "fineweb_filtered_k1000.yaml")
@@ -585,9 +736,109 @@ def test_sweep_blame_for_shared_score_mismatches():
     pair (and some pair passed); with two systems, both."""
     from bench import runner
     listed = ["a", "b", "c"]
-    res = {"shared_score_failed_pairs": {"a_vs_b": 2, "a_vs_c": 1}}
+    res = {"shared_score_failed_pairs": {"a_vs_b": 2, "a_vs_c": 1},
+           "pairs": {"a_vs_b": {}, "a_vs_c": {}, "b_vs_c": {}}}   # every pair ran
     out = runner.pairs_blame({"ok": False, "fails": ["x"], "compare": res}, listed)
     assert set(out) == {"a"} and "shared-id score" in out["a"]
     out = runner.pairs_blame({"ok": False, "fails": ["x"],
                               "compare": {"shared_score_failed_pairs": {"a_vs_b": 1}}}, ["a", "b"])
     assert set(out) == {"a", "b"}
+
+
+def test_blame_ignores_pairs_that_did_not_run():
+    """a pair never compared counts neither as passed nor as failed: a_vs_b and a_vs_c failed,
+    b_vs_c never ran, so nothing shows that b and c agree and the failures stay ambiguous
+    (before, the missing b_vs_c counted as passed and a alone was blamed)."""
+    from bench import runner
+    listed = ["a", "b", "c"]
+    ran = {"a_vs_b": {}, "a_vs_c": {}}
+    res = {"f64_order_failed_pairs": {"a_vs_b": 1, "a_vs_c": 1}, "pairs": ran}
+    assert set(runner.order_blame(res, listed)) == {"a", "b", "c"}
+    res = {"shared_score_failed_pairs": {"a_vs_b": 1, "a_vs_c": 1}, "pairs": ran}
+    assert set(runner.shared_score_blame(res, listed)) == {"a", "b", "c"}
+    # once b_vs_c ran (and passed), a alone
+    ran3 = {**ran, "b_vs_c": {}}
+    assert set(runner.order_blame({**res, "f64_order_failed_pairs": res["shared_score_failed_pairs"],
+                                   "pairs": ran3}, listed)) == {"a"}
+    assert set(runner.shared_score_blame({**res, "pairs": ran3}, listed)) == {"a"}
+
+
+def _shared_doc(failed, checks=None, ran=None):
+    """a judge document whose shared-score-failed pairs ``failed`` {pk: count}; ``checks``
+    {pk: (wrong {system: n}, unjudged {system: n})}: the pairs judge's float64 shared-score
+    check ran on (every mismatched id checked); ``ran``: the pairs that ran (default failed)."""
+    pairs = {pk: {"shared_score_mismatches": failed.get(pk, 0)} for pk in (ran or failed)}
+    for pk, (wrong, unj) in (checks or {}).items():
+        pairs[pk].update({"shared_score_checked": failed[pk],
+                          "shared_score_wrong_by_system": wrong,
+                          "shared_score_unjudged_by_system": unj})
+    return {"shared_score_failed_pairs": failed, "pairs": pairs}
+
+
+def _shared_old(res, listed):
+    failed = {pk: c for pk, c in (res.get("shared_score_failed_pairs") or {}).items() if c}
+    return runner._shared_score_common(res, listed, failed, {}) if failed else {}
+
+
+def test_shared_score_blame_float64_proofs():
+    """the toy: id 7 really scores 0.80, A and B both say 0.75, C says 0.80. A_vs_C and B_vs_C
+    fail, A_vs_B agrees: the common-system rule blamed C (the only correct one); the float64
+    check names A and B, clears C."""
+    L = ["A", "B", "C"]
+    ran = ["A_vs_B", "A_vs_C", "B_vs_C"]
+    z = {"A": 0, "B": 0, "C": 0}
+    f = {"A_vs_C": 1, "B_vs_C": 1}
+    chk = {"A_vs_C": ({"A": 1, "C": 0}, {"A": 0, "C": 0}),
+           "B_vs_C": ({"B": 1, "C": 0}, {"B": 0, "C": 0})}
+    res = _shared_doc(f, chk, ran)
+    assert set(_shared_old(res, L)) == {"C"}
+    assert runner.shared_score_blame(res, L) == {
+        "A": ["1 shared-id score mismatches in A_vs_C (its score is off the float64 score on 1 ids)"],
+        "B": ["1 shared-id score mismatches in B_vs_C (its score is off the float64 score on 1 ids)"]}
+    # without the check (no --rescore, or refused): the rule's blame, the same object content
+    res0 = _shared_doc(f, None, ran)
+    assert runner.shared_score_blame(res0, L) == _shared_old(res0, L) == {
+        "C": ["1 shared-id score mismatches in A_vs_C", "1 shared-id score mismatches in B_vs_C"]}
+    # an unjudged id, or fewer ids checked than mismatched: C is not proven right, stays
+    for mod in ("unjudged", "short"):
+        res = _shared_doc(f, chk, ran)
+        if mod == "unjudged":
+            res["pairs"]["A_vs_C"]["shared_score_unjudged_by_system"] = {"A": 1, "C": 1}
+        else:
+            res["pairs"]["A_vs_C"]["shared_score_checked"] = 0
+        out = runner.shared_score_blame(res, L)
+        assert set(out) == {"A", "B", "C"}
+        assert out["C"] == ["1 shared-id score mismatches in A_vs_C"]
+    # C proven wrong elsewhere (a float64 set disagreement, or its shared score off in another
+    # pair): never cleared
+    res = _shared_doc(f, chk, ran)
+    res["pairs"]["C_vs_D"] = {"f64_wrong_by_system": {"C": 1, "D": 0}}
+    assert set(runner.shared_score_blame(res, L)) == {"A", "B", "C"}
+    res = _shared_doc(f, chk, ran)
+    res["pairs"]["C_vs_D"] = {"shared_score_wrong_by_system": {"C": 2, "D": 0}}
+    assert set(runner.shared_score_blame(res, L)) == {"A", "B", "C"}
+
+
+def test_shared_score_blame_partner_and_fallback_texts():
+    L = ["x", "y"]
+    # two systems, x wrong: x alone, its proof clause
+    res = _shared_doc({"x_vs_y": 2}, {"x_vs_y": ({"x": 2, "y": 0}, {"x": 0, "y": 0})})
+    assert runner.shared_score_blame(res, L) == {
+        "x": ["2 shared-id score mismatches in x_vs_y (its score is off the float64 score on 2 ids)"]}
+    # neither off (a mismatch within each side's own tolerance): clearing both would blame
+    # nobody, so the rule's blame stays word for word
+    res = _shared_doc({"x_vs_y": 1}, {"x_vs_y": ({"x": 0, "y": 0}, {"x": 0, "y": 0})})
+    assert runner.shared_score_blame(res, L) == _shared_old(res, L)
+    # y not off but unjudged once, x cleared: y names x
+    res = _shared_doc({"x_vs_y": 1}, {"x_vs_y": ({"x": 0, "y": 0}, {"x": 0, "y": 1})})
+    assert runner.shared_score_blame(res, L) == {
+        "y": ["1 shared-id score mismatches in x_vs_y (x agrees with the float64 scores)"]}
+    # a pair not of the listed systems: every listed system, the rule's text
+    res = _shared_doc({"x_vs_w": 1}, {"x_vs_w": ({"x": 0, "w": 1}, {"x": 0, "w": 0})})
+    assert runner.shared_score_blame(res, L) == _shared_old(res, L) == {
+        "x": ["1 shared-id score mismatches in x_vs_w (not a pair of the listed systems)"],
+        "y": ["1 shared-id score mismatches in x_vs_w (not a pair of the listed systems)"]}
+    # pairs_blame joins the clauses as before
+    res = _shared_doc({"x_vs_y": 2}, {"x_vs_y": ({"x": 2, "y": 0}, {"x": 0, "y": 0})})
+    assert runner.pairs_blame({"ok": False, "fails": ["f"], "compare": res}, L) == {
+        "x": "2 shared-id score mismatches in x_vs_y (its score is off the float64 score on 2 ids)"}
