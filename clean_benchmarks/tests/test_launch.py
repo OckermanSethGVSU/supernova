@@ -300,7 +300,7 @@ def test_a_change_in_a_code_root_changes_the_stage_hash(scratch_repo, tmp_path, 
 def test_the_staged_hash_is_what_paper_run_recomputes_on_the_node(tmp_path):
     """env/paper_run.sh's stage branch over a real `bench launch` stage == STAGED's hash."""
     d = dry("dense_coyo", tmp_path / "res")
-    stage = json.load(open(os.path.join(d, "launch.json")))["stage"]
+    stage = os.path.expanduser(json.load(open(os.path.join(d, "launch.json")))["stage"])   # recorded with ~ for a home path
     act, chk = tmp_path / "act.sh", tmp_path / "chk.py"
     act.write_text(f"export CONDA_PREFIX={os.path.dirname(os.path.dirname(sys.executable))}\n"
                    f"export PATH={os.path.dirname(sys.executable)}:$PATH\n")

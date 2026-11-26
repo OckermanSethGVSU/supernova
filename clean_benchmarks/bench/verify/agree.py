@@ -44,21 +44,21 @@ class CheckError(Exception):
     pass
 
 
-# corpus_index / uuid_to_gid results, cached for one run_checks call (every round reads the same corpus)
+# corpus_index / uuid_table results, cached for one run_checks call (every round reads the same corpus)
 _CACHE: dict = {}
 
 
-def _corpus_index(uri, need_ids):
-    key = ("index", uri, need_ids)
+def _corpus_index(uri, need_ids, max_files=None):
+    key = ("index", uri, need_ids, max_files)
     if key not in _CACHE:
-        _CACHE[key] = C.corpus_index(uri, need_ids=need_ids)
+        _CACHE[key] = C.corpus_index(uri, need_ids=need_ids, max_files=max_files)
     return _CACHE[key]
 
 
-def _uuid_to_gid(uri, keys, rows, offsets):
-    key = ("u2g", uri)
+def _uuid_table(uri, keys, rows, offsets):
+    key = ("u2g", uri, len(keys))
     if key not in _CACHE:
-        _CACHE[key] = C.uuid_to_gid(keys, rows, offsets)
+        _CACHE[key] = C.uuid_table(keys, rows, offsets)
     return _CACHE[key]
 
 
@@ -153,7 +153,10 @@ def compare_args(exp: dict, search: dict, novabf_path: str | None, id_mode: str)
             "--rescore", "--vcol", exp["corpus"]["column"], "--queries", _abs(exp["queries"]["path"]),
             "--qcol", exp["queries"]["column"], "--metric", METRICS[exp["search"]["metric"]]]
     gt = (exp.get("checks") or {}).get("gt")
-    if gt:
+    sub = (exp.get("subset") or {}).get("files")
+    if sub:   # the legs read the first N files: index, map and rescore those only
+        argv += ["--max-files", str(int(sub))]
+    elif gt:  # the dataset GT is over the full corpus: a subset run is never compared with it
         argv += ["--gt", _abs(gt)]
     rmg = (exp.get("checks") or {}).get("rescore_max_gib")
     if rmg is not None:   # the rescoring's memory cap (the pairs' and the oracle's)
@@ -197,7 +200,7 @@ def load_round(a, legs: list[tuple[str, dict, str]], t0: float) -> dict:
     corpus_ids = a.novabf_ids == "corpus"
     has_nb = any(k == "novabf" for _, _, k in legs)
     keys, rows, offsets, id_col = _corpus_index(
-        a.corpus, (bool(a.gt) and not gt_npz) or (corpus_ids and has_nb))
+        a.corpus, (bool(a.gt) and not gt_npz) or (corpus_ids and has_nb), getattr(a, "max_files", None))
     n_ids = int(offsets[-1])
     dup = 0 if id_col is None else n_ids - len(pc.unique(id_col))
     print(f"corpus: {len(keys)} files, {n_ids} rows, duplicate ids {dup} "
@@ -214,7 +217,7 @@ def load_round(a, legs: list[tuple[str, dict, str]], t0: float) -> dict:
             q_, ids, sc = C.load_gt(path, id_col)
         else:
             if u2g is None:
-                u2g = _uuid_to_gid(a.corpus, keys, rows, offsets)
+                u2g = _uuid_table(a.corpus, keys, rows, offsets)
                 print(f"uuid map built ({time.time() - t0:.0f} s)", flush=True)
             q_, ids, sc = C.load_novabf(path, u2g)
         if qn is None:
@@ -274,7 +277,7 @@ def _exact_for(a, need, inputs):
     import pyarrow.compute as pc
     import pyarrow.parquet as pq
     offsets, n_keys, n, qn = inputs["offsets"], len(inputs["keys"]), inputs["n"], inputs["qn"]
-    fs, paths = C.corpus_paths(a.corpus, n_keys)
+    fs, paths = C.corpus_paths(a.corpus, n_keys, getattr(a, "max_files", None))
     if a.modality != "dense":
         sparse, multivec = C.harness_modules()
         mod = sparse if a.modality == "sparse" else multivec
@@ -438,7 +441,7 @@ def exact_scan_candidates(a, inputs, sample, scan_files, filtered=False, mask_fn
     if filtered and mask_fn is None:
         raise CheckError("exact_scan: a filtered search needs its filter mask (mask_fn)")
     import pyarrow.parquet as pq
-    fs, paths = C.corpus_paths(a.corpus, len(inputs["keys"]))
+    fs, paths = C.corpus_paths(a.corpus, len(inputs["keys"]), getattr(a, "max_files", None))
     nf = len(paths) if scan_files is None else min(int(scan_files), len(paths))
     off = np.asarray(inputs["offsets"], np.int64)
     D = np.full((len(sample), a.k), -np.inf, np.float64)
@@ -517,7 +520,7 @@ def filter_scan_mask(exp: dict, search: dict, a, inputs):
     import pyarrow.parquet as pq
     from bench.data.filters import duckdb_filter as dfm
     job, flt = _filter_setup(exp, search, a, inputs)
-    fs, paths = C.corpus_paths(a.corpus, len(inputs["keys"]))
+    fs, paths = C.corpus_paths(a.corpus, len(inputs["keys"]), getattr(a, "max_files", None))
 
     def mask_fn(f, sample):
         res = flt.evaluate(pq.read_table(paths[f], columns=job.fields, filesystem=fs))
@@ -535,7 +538,7 @@ def filter_allowed(exp: dict, search: dict, a, inputs, need) -> dict:
     from bench.data.filters import duckdb_filter as dfm
     job, flt = _filter_setup(exp, search, a, inputs)
     offsets = np.asarray(inputs["offsets"], np.int64)
-    fs, paths = C.corpus_paths(a.corpus, len(inputs["keys"]))
+    fs, paths = C.corpus_paths(a.corpus, len(inputs["keys"]), getattr(a, "max_files", None))
     by_file: dict = {}
     for q, gs in enumerate(need):
         for g in gs:
@@ -721,7 +724,7 @@ def mv_short_queries(a, inputs, systems: dict, under_test: list, n: int, k: int,
     import pyarrow.compute as pc
     import pyarrow.parquet as pq
     from bench.data.formats import multivector as multivec
-    fs, paths = C.corpus_paths(a.corpus, len(inputs["keys"]))
+    fs, paths = C.corpus_paths(a.corpus, len(inputs["keys"]), getattr(a, "max_files", None))
     nf = len(paths) if scan_files is None else min(int(scan_files), len(paths))
     docs = 0
     for p in paths[:nf]:
@@ -924,7 +927,7 @@ def sparse_weight_problems(a, inputs) -> list[str]:
     if q.values.size and float(np.min(q.values)) < 0:
         out.append(f"{int((q.values < 0).sum())} negative query weight(s) (min {float(np.min(q.values))!r}) "
                    f"in {a.queries}: the candidate rule assumes non-negative weights")
-    fs, paths = C.corpus_paths(a.corpus, len(inputs["keys"]))
+    fs, paths = C.corpus_paths(a.corpus, len(inputs["keys"]), getattr(a, "max_files", None))
     if paths:
         t = pq.read_table(paths[0], columns=[a.vcol], filesystem=fs)
         v = pc.list_flatten(pc.struct_field(t.column(a.vcol).combine_chunks(), "values"))
@@ -1007,12 +1010,43 @@ def check_round(exp, run_dir, recs, search, r, skipped, log_dir) -> dict:
     return out
 
 
+def check_threads(exp: dict) -> int:
+    """The checks' thread count: the experiment's `threads` (0 = every CPU). Not the
+    process's OMP_NUM_THREADS, which SkyPilot sets to 1 in every job (the legs set their own)."""
+    return int(exp.get("threads") or 0) or (os.cpu_count() or 1)
+
+
+@contextlib.contextmanager
+def _threads(n: int):
+    """Arrow's CPU / IO pools and the BLAS / OpenMP pools at ``n`` for the checks only, put back
+    after (set at run time: the process's environment, which the legs inherit, is unchanged)."""
+    import pyarrow as pa
+    cpu, io_ = pa.cpu_count(), pa.io_thread_count()
+    pa.set_cpu_count(n)
+    pa.set_io_thread_count(max(n, io_))
+    try:
+        from threadpoolctl import threadpool_limits
+        limits = threadpool_limits(n)
+    except ImportError:   # no threadpoolctl: BLAS keeps its own count
+        limits = contextlib.nullcontext()
+    try:
+        with limits:
+            yield
+    finally:
+        pa.set_cpu_count(cpu)
+        pa.set_io_thread_count(io_)
+
+
 def run_checks(run_dir: str, exp: dict) -> dict:
     """-> the checks.json document; `ok` false fails the run."""
     from bench import timing
     _CACHE.clear()
+    n = check_threads(exp)
     try:
-        return _run_checks(run_dir, exp, timing)
+        with _threads(n):
+            doc = _run_checks(run_dir, exp, timing)
+        doc["threads"] = n
+        return doc
     finally:
         _CACHE.clear()
 

@@ -386,3 +386,27 @@ def test_checks_rescore_max_gib_reaches_compare():
     for bad in ("0", "true", "x"):
         with pytest.raises(E.ExperimentError, match="rescore_max_gib"):
             _exp("dense_coyo", [f"checks.rescore_max_gib={bad}"])
+
+
+def test_a_subset_runs_checks_cover_its_files_and_skip_the_full_corpus_gt():
+    """the legs of a subset run read the first N files: the checks index, map and rescore those
+    only, and never compare with the dataset GT (it is over the whole corpus)."""
+    from bench.verify import agree
+    e = _exp("dense_pes2o", ["subset.files=32"])
+    argv = agree.compare_args(e, e["searches"][0], None, "md5")
+    assert argv[argv.index("--max-files") + 1] == "32" and "--gt" not in argv
+    e = _exp("dense_pes2o")
+    argv = agree.compare_args(e, e["searches"][0], None, "md5")
+    assert "--max-files" not in argv and "--gt" in argv
+
+
+def test_corpus_index_with_max_files_is_the_first_files_by_path(tmp_path):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    from bench.verify import compare as C
+    for name, n in (("b.parquet", 2), ("a.parquet", 3), ("c.parquet", 4)):
+        pq.write_table(pa.table({"v": list(range(n))}), tmp_path / name)
+    keys, rows, offsets, _ = C.corpus_index(str(tmp_path), need_ids=False, max_files=2)
+    assert [os.path.basename(k) for k in keys] == ["a.parquet", "b.parquet"] and rows.tolist() == [3, 2]
+    fs, paths = C.corpus_paths(str(tmp_path), 2, max_files=2)
+    assert [os.path.basename(p) for p in paths] == ["a.parquet", "b.parquet"]

@@ -156,9 +156,10 @@ def test_novabf_tie_at_the_cutoff_broken_the_other_way_passes(runs, tmp_path):
     nb = pq.read_table(_nb_results(d0, "dense")[0])
     exp = json.load(open(os.path.join(d0, "experiment.json")))
     keys, rows, offsets, _ = C.corpus_index(agree._abs(exp["corpus"]["path"]), need_ids=False)
-    u2g = C.uuid_to_gid(keys, rows, offsets)
+    tab = C.uuid_table(keys, rows, offsets)
+    u2g = {u: g for g, u in enumerate(tab.to_pylist())}   # uuid -> global row (test lookups)
     g2u = {g: u for u, g in u2g.items()}
-    _, nb_ids, _ = C.load_novabf(_nb_results(d0, "dense")[0], u2g)
+    _, nb_ids, _ = C.load_novabf(_nb_results(d0, "dense")[0], tab)
     q = next(i for i in range(len(nb_ids)) if set(nb_ids[i]) != set(z["I"][i]))
     a = (set(nb_ids[q].tolist()) - set(z["I"][q].tolist())).pop()
     b = (set(z["I"][q].tolist()) - set(nb_ids[q].tolist())).pop()
@@ -196,7 +197,8 @@ def test_a_wrong_novabf_id_mapping_is_caught(runs, tmp_path, how):
     d0 = runs["dense"]
     exp = json.load(open(os.path.join(d0, "experiment.json")))
     keys, rows, offsets, _ = C.corpus_index(agree._abs(exp["corpus"]["path"]), need_ids=False)
-    u2g = C.uuid_to_gid(keys, rows, offsets)
+    tab = C.uuid_table(keys, rows, offsets)
+    u2g = {u: g for g, u in enumerate(tab.to_pylist())}   # uuid -> global row (test lookups)
     f_of = {g: (keys[f], g - int(offsets[f])) for f in range(len(keys)) for g in range(offsets[f], offsets[f + 1])}
 
     def fn(ids, sc):
@@ -706,3 +708,18 @@ def test_the_oracle_check_turns_the_guard_on_for_multivector():
     src = inspect.getsource(agree.oracle_check) + inspect.getsource(agree.check_round)
     assert 'a.modality in ("dense", "multivector")' in src
     assert 'exp["modality"] in ("dense", "multivector")' in src
+
+
+def test_the_checks_use_the_experiments_threads_not_omp_num_threads(monkeypatch):
+    """SkyPilot sets OMP_NUM_THREADS=1 in every job: the checks take the experiment's `threads`
+    (0 = every CPU) for Arrow and BLAS, for their own duration only."""
+    import pyarrow as pa
+    monkeypatch.setenv("OMP_NUM_THREADS", "1")
+    assert agree.check_threads({"threads": 7}) == 7
+    assert agree.check_threads({"threads": 0}) == (os.cpu_count() or 1)
+    before = pa.cpu_count()
+    with agree._threads(3):
+        assert pa.cpu_count() == 3 and pa.io_thread_count() >= 3
+        from threadpoolctl import threadpool_info
+        assert all(p["num_threads"] == 3 for p in threadpool_info())
+    assert pa.cpu_count() == before

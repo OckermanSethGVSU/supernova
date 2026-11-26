@@ -44,14 +44,17 @@ def uuid_of(key, row):
     return f"{h[:8]}-{h[8:12]}-{h[12:16]}-{h[16:20]}-{h[20:32]}"
 
 
-def corpus_index(uri, threads=32, need_ids=True):
+def corpus_index(uri, threads=32, need_ids=True, max_files=None):
     """(keys, rows, offsets, id column as one arrow array or None). Without
-    ``need_ids`` only the footers are read (row counts)."""
+    ``need_ids`` only the footers are read (row counts). ``max_files``: only the first N files
+    by sorted path (a subset run's files: the legs' --max-files)."""
     fs, root = pafs.FileSystem.from_uri(uri)
     root = root.rstrip("/")
     infos = [i for i in fs.get_file_info(pafs.FileSelector(root, recursive=True))
              if i.type == pafs.FileType.File and i.path.endswith(".parquet")]
     infos.sort(key=lambda i: i.path)
+    if max_files:
+        infos = infos[:int(max_files)]
     s3 = fs.type_name == "s3"
     keys = [i.path.split("/", 1)[1] if s3 else i.path for i in infos]
 
@@ -73,23 +76,46 @@ def corpus_index(uri, threads=32, need_ids=True):
     return keys, rows, offsets, id_col
 
 
-def uuid_to_gid(keys, rows, offsets, threads=32):
-    """dict UUID -> global row id over the whole corpus (nova-bf's id space)."""
-    def part(f):
-        return [(uuid_of(keys[f], r), int(offsets[f]) + r) for r in range(rows[f])]
-    out = {}
-    with ThreadPoolExecutor(threads) as ex:
-        for chunk in ex.map(part, range(len(keys))):
-            out.update(chunk)
-    return out
+def uuid_table(keys, rows, offsets) -> pa.Array:
+    """nova-bf's point id (uuid_of) of every indexed corpus row, one string array whose
+    position is the global row id. DuckDB's md5 (multi-threaded, the same hex digest of the
+    same UTF-8 bytes as hashlib's) computes them in bulk: uuid_of per row in Python took most
+    of a check's time on a large corpus."""
+    import duckdb
+    files = pa.table({"k": pa.array([str(k) for k in keys], pa.string()),
+                      "n": pa.array(np.asarray(rows, np.int64)),
+                      "o": pa.array(np.asarray(offsets[:-1], np.int64))})
+    h = "md5(k || ':' || CAST(r AS VARCHAR))"
+    u = (f"substr({h}, 1, 8) || '-' || substr({h}, 9, 4) || '-' || substr({h}, 13, 4) || '-' "
+         f"|| substr({h}, 17, 4) || '-' || substr({h}, 21, 12)")
+    con = duckdb.connect()
+    try:
+        con.register("files", files)
+        t = con.execute(f"SELECT o + r AS gid, {u} AS u FROM "
+                        "(SELECT k, o, unnest(range(n)) AS r FROM files) ORDER BY gid").arrow()
+    finally:
+        con.close()
+    if hasattr(t, "read_all"):   # a RecordBatchReader (newer duckdb)
+        t = t.read_all()
+    gid = t.column("gid").to_numpy()
+    if not np.array_equal(gid, np.arange(int(offsets[-1]), dtype=gid.dtype)):
+        raise SystemExit("uuid_table: the generated row ids are not 0..rows-1")
+    return t.column("u").combine_chunks().cast(pa.string())
+
+
+def uuid_gids(uuids, table: pa.Array) -> np.ndarray:
+    """Global row ids of nova-bf hit ids (an arrow string array): their position in
+    uuid_table's array; -1 for an id no indexed row has."""
+    idx = pc.index_in(uuids.cast(pa.string()), value_set=table)
+    return pc.fill_null(idx, -1).to_numpy(zero_copy_only=False).astype(np.int64)
 
 
 def load_novabf(path, u2g):
+    """nova-bf's result with its hit ids as global row ids. ``u2g``: uuid_table's array."""
     t = pq.read_table(path, columns=["query_id", "hit_ids", "hit_scores"])
     h = t.column("hit_ids").combine_chunks()
     s = t.column("hit_scores").combine_chunks()
-    flat = pc.list_flatten(h).to_pylist()
-    g = np.fromiter((u2g.get(u, -1) for u in flat), dtype=np.int64, count=len(flat))
+    g = uuid_gids(pc.list_flatten(h), u2g)
     oh, os_ = h.offsets.to_numpy(), s.offsets.to_numpy()
     sf = pc.list_flatten(s).to_numpy(zero_copy_only=False)
     return (t.column("query_id").to_pylist(),
@@ -802,14 +828,17 @@ def compare(a, b, n, tol, kmax, exact=None, names=("a", "b"), tie_ulps=128, moda
     return res
 
 
-def corpus_paths(corpus, n_keys):
-    """(fs, the corpus's *.parquet paths, sorted as corpus_index lists them)."""
+def corpus_paths(corpus, n_keys, max_files=None):
+    """(fs, the corpus's *.parquet paths, sorted as corpus_index lists them; the first
+    ``max_files`` of them for a subset run)."""
     fs, root = pafs.FileSystem.from_uri(corpus)
     infos = sorted((i for i in fs.get_file_info(pafs.FileSelector(root.rstrip("/"),
                                                                     recursive=True))
                     if i.type == pafs.FileType.File and i.path.endswith(".parquet")),
                    key=lambda i: i.path)
     paths = [i.path for i in infos]
+    if max_files:
+        paths = paths[:int(max_files)]
     if len(paths) != n_keys:
         raise SystemExit(f"--rescore: {len(paths)} corpus files now, {n_keys} indexed")
     return fs, paths
@@ -829,7 +858,7 @@ def rescore_ragged(a, systems, n, qn, offsets, n_keys):
         print(w, flush=True)
     if q.n_rows != n:
         raise SystemExit(f"--queries has {q.n_rows} rows, nova-bf {n}")
-    fs, paths = corpus_paths(a.corpus, n_keys)
+    fs, paths = corpus_paths(a.corpus, n_keys, getattr(a, "max_files", None))
     need = needed_ids(systems, n, a.k, order=a.order_check)
     _, fu, _, _ = _need_files(need, offsets)
     if len(fu):
@@ -894,6 +923,9 @@ def parser():
                          "`rows: {column, isin}` selects them")
     ap.add_argument("--harness", action="append", default=[], help="NAME=path.npz")
     ap.add_argument("--k", type=int, default=1000)
+    ap.add_argument("--max-files", type=int, default=None,
+                    help="the run read only the first N corpus files (sorted by path; a subset "
+                         "run's --max-files): index, map and rescore those files only")
     ap.add_argument("--tol", type=float, default=1e-4,
                     help="cosine-score tolerance for the cutoff-tie rule on each system's "
                          "OWN scores (the legacy non_boundary count; see --rescore)")
@@ -950,7 +982,7 @@ def load_inputs(a, t0):
     # (--novabf-ids corpus)
     corpus_ids = a.novabf_ids == "corpus"
     keys, rows, offsets, id_col = corpus_index(
-        a.corpus, need_ids=(bool(a.gt) and not gt_npz) or corpus_ids)
+        a.corpus, need_ids=(bool(a.gt) and not gt_npz) or corpus_ids, max_files=getattr(a, "max_files", None))
     n_ids = int(offsets[-1])
     dup = 0 if id_col is None else n_ids - len(pc.unique(id_col))
     print(f"corpus: {len(keys)} files, {n_ids} rows, duplicate ids {dup} "
@@ -961,7 +993,7 @@ def load_inputs(a, t0):
                              "ids, so a nova-bf hit id does not name one row")
         qn, ids, sc = load_gt(a.novabf, id_col)   # same layout: query_id, hit_ids, hit_scores
     else:
-        u2g = uuid_to_gid(keys, rows, offsets)
+        u2g = uuid_table(keys, rows, offsets)
         print(f"uuid map built ({time.time() - t0:.0f} s)", flush=True)
         qn, ids, sc = load_novabf(a.novabf, u2g)
 
@@ -1034,7 +1066,7 @@ def judge(a, inputs, t0, exact_hook=None):
         xq = pc.list_flatten(qa).to_numpy(zero_copy_only=False).reshape(len(qa), -1)
         if len(xq) != n:
             raise SystemExit(f"--queries has {len(xq)} rows, nova-bf {n}")
-        fs, paths = corpus_paths(a.corpus, len(keys))
+        fs, paths = corpus_paths(a.corpus, len(keys), getattr(a, "max_files", None))
         need = needed_ids(systems, n, a.k, order=a.order_check)
         est, n_g, n_f = rescore_bytes(need, offsets, xq.shape[1],
                                       vector_itemsize(paths[0], fs, a.vcol), a.rescore_threads)

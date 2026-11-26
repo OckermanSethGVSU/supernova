@@ -436,3 +436,17 @@ def test_corpus_ids_and_query_subset(tmp_path):
     write_npz(f"{tmp}/h.npz", lists, K)
     p, _ = run_compare(tmp, extra, *sub)
     assert p.returncode != 0 and "duplicate ids" in p.stderr
+
+
+def test_uuid_table_is_uuid_of_for_every_row():
+    """DuckDB's bulk md5 gives nova-bf's point id (uuid_of) for every row, keys with spaces,
+    unicode and slashes included; uuid_gids maps hit ids back to global rows (-1: unknown)."""
+    import pyarrow as pa
+    keys = ["b/x 1.parquet", "a/ünï/ç.parquet", "c.parquet", "empty.parquet"]
+    rows = np.array([3, 5, 1, 0], np.int64)
+    offsets = np.concatenate([[0], np.cumsum(rows)])
+    t = cmp.uuid_table(keys, rows, offsets)
+    want = [cmp.uuid_of(k, r) for k, n in zip(keys, rows) for r in range(n)]
+    assert t.to_pylist() == want
+    hits = pa.array([want[4], "not-an-id", want[0], want[8]])
+    assert cmp.uuid_gids(hits, t).tolist() == [4, -1, 0, 8]

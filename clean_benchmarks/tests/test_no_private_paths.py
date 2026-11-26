@@ -82,3 +82,23 @@ def test_no_committed_file_names_a_private_path():
 def test_the_values_file_is_ignored():
     p = subprocess.run(["git", "-C", REPO, "check-ignore", "-q", "clean_benchmarks/experiments/local_paths.env"])
     assert p.returncode == 0
+
+
+def test_mask_also_hides_the_schemeless_s3_form(tmp_path):
+    """pyarrow / nova-bf name an S3 object `bucket/key`: a record holding that form is masked
+    like the s3:// URI (the bucket name never reaches a recorded file)."""
+    from bench import paths
+    f = tmp_path / "local_paths.env"
+    f.write_text("[x]\nREAD = s3://bkt-r/data\nWRITE = s3://bkt-w/out\n")
+    old = paths._SECTIONS[:] if hasattr(paths, "_SECTIONS") else None
+    try:
+        paths.use({"name": "x"})
+        rec = {"a": "s3://bkt-w/out/run/f.parquet", "b": "bkt-w/out/run/_bf_manifest.json",
+               "c": "Cannot list 'bkt-r/data/part-0.parquet'"}
+        got = paths.mask(rec, path=str(f))
+        assert got == {"a": "${WRITE}/run/f.parquet", "b": "${WRITE}/run/_bf_manifest.json",
+                       "c": "Cannot list '${READ}/part-0.parquet'"}
+        assert "bkt" not in str(got)
+    finally:
+        if old is not None:
+            paths._SECTIONS[:] = old

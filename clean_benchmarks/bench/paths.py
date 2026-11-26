@@ -169,7 +169,11 @@ def mask(obj, path: str = FILE):
         have = values(path)
     except PathsError:
         have = {}
-    pairs = sorted(((v, "${" + k + "}") for k, v in have.items()), key=lambda p: -len(p[0]))
+    pairs = [(v, "${" + k + "}") for k, v in have.items()]
+    # pyarrow and nova-bf name an S3 object `bucket/key` (no scheme): that form is the same
+    # private value, masked to the same placeholder (expanded, it reads back as the s3:// URI)
+    pairs += [(v[len("s3://"):], ph) for v, ph in pairs if v.startswith("s3://") and len(v) > 5]
+    pairs = sorted(pairs, key=lambda p: -len(p[0]))
     if not pairs:
         return obj
 
