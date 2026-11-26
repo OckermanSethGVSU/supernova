@@ -121,7 +121,9 @@ _add(_harness("cuvs", "cuvs", ("dense", "sparse", "filtered"), {
                                 "sparse batch_size_index x batch_size_query (e.g. 8192x32768)"),
     # device = cuVS's own recipe (calc_truth: GPU merge, one copy back; every preset's default);
     # host = each file's results merged on the host (per_file_host)
-    "cuvs_merge": Knob("--cuvs-merge", str, False, "top-k merge: device (cuVS's own recipe) | "
+    # sweepable: the dense cuVS sweep compares the recipe's device merge (with and without its
+    # per-file sync) against the per-file host merge, and keeps the fastest
+    "cuvs_merge": Knob("--cuvs-merge", str, True, "top-k merge: device (cuVS's own recipe) | "
                        "host (per-file + host ResultHeap)", ("device", "host")),
     # per-file = calc_truth's resources.sync() after each file (the default); none = no
     # per-file host wait, ordered by the stream alone (device merge only; ours, disclosed)
