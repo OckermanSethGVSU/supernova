@@ -1024,11 +1024,19 @@ def _threads(n: int):
     cpu, io_ = pa.cpu_count(), pa.io_thread_count()
     pa.set_cpu_count(n)
     pa.set_io_thread_count(max(n, io_))
+    # threadpoolctl sets KMP_DUPLICATE_LIB_OK in os.environ when imported; legs started later
+    # from this process would inherit it, so the environment is put back as it was
+    kmp = os.environ.get("KMP_DUPLICATE_LIB_OK")
     try:
         from threadpoolctl import threadpool_limits
         limits = threadpool_limits(n)
     except ImportError:   # no threadpoolctl: BLAS keeps its own count
         limits = contextlib.nullcontext()
+    finally:
+        if kmp is None:
+            os.environ.pop("KMP_DUPLICATE_LIB_OK", None)
+        else:
+            os.environ["KMP_DUPLICATE_LIB_OK"] = kmp
     try:
         with limits:
             yield

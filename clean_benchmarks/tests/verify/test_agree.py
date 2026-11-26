@@ -723,3 +723,15 @@ def test_the_checks_use_the_experiments_threads_not_omp_num_threads(monkeypatch)
         from threadpoolctl import threadpool_info
         assert all(p["num_threads"] == 3 for p in threadpool_info())
     assert pa.cpu_count() == before
+
+
+def test_the_checks_leave_the_process_environment_as_it_was(monkeypatch):
+    """threadpoolctl sets KMP_DUPLICATE_LIB_OK on import: legs started after the checks from the
+    same process must not inherit it."""
+    import sys
+    monkeypatch.delenv("KMP_DUPLICATE_LIB_OK", raising=False)
+    monkeypatch.delitem(sys.modules, "threadpoolctl", raising=False)
+    before = dict(os.environ)
+    with agree._threads(2):
+        pass
+    assert dict(os.environ) == before
