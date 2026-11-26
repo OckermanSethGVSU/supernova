@@ -54,6 +54,11 @@ SKYIGNORE = "# written by bench launch: upload the whole stage (SkyPilot reads t
 DATA_CODE_DIRS = ("bench/data", "tests/data", "tests/fixtures")
 # reads the private path values bench launch ships beside the code (unexported: the legs
 # never see them; the prep lines' ${READ} / ${WRITE} are filled in by this shell)
+# --move-strays (off by default): the upload never deletes, so a node's ~/sky_workdir can hold
+# code files from before it; with the flag they are moved aside first (env/stray_files.py), so
+# the node runs and hashes only the stage
+STRAY_LINE = ('( . $W/env/activate.sh && python $W/env/stray_files.py $W $W/STAGED_files.txt '
+              '~/sky_workdir_stray_$(date -u +%Y%m%dT%H%M%SZ) ) 2>&1 | tee -a ~/res/progress.log')
 PATHS_LINE = '. $W/experiments/local_paths.env || { log "FAIL no $W/experiments/local_paths.env (bench launch ships it)"; exit 1; }'
 RUN_BEGIN = "# --- run: env/paper_run.sh around bench (begin) ---"
 RUN_END = "# --- run (end) ---"
@@ -142,12 +147,14 @@ def run_line(exp_rel: str, job: str, sets: list[str], launch_id: str | None = No
             f"python -m bench {cmd} {exp_rel}{lid} --results {RES}{setargs} 2>&1 | tee ~/run.log")
 
 
-def run_block(exp: dict, exp_rel: str, job: str, sets: list[str], launch_id: str | None = None) -> str:
+def run_block(exp: dict, exp_rel: str, job: str, sets: list[str], launch_id: str | None = None,
+              move_strays: bool = False) -> str:
     """The task's `run:` script: setup, build, node prep, then the job command between markers."""
     L = ["set -uo pipefail",
          f"W={WORKDIR}; mkdir -p {RES} ~/data; cd $W",
          f'log() {{ echo "[$(date -u +%FT%TZ)] $*" | tee -a {RES}/progress.log; }}',
          PATHS_LINE,
+         *([STRAY_LINE] if move_strays else []),
          *build_lines(exp),
          *prep.node_prep(exp),
          RUN_BEGIN,
@@ -165,7 +172,8 @@ def extract_run_line(task_yaml_text: str) -> str:
     return "\n".join(lines[i + 1:j])
 
 
-def task(exp: dict, exp_rel: str, job: str, sets: list[str], launch_id: str | None = None) -> dict:
+def task(exp: dict, exp_rel: str, job: str, sets: list[str], launch_id: str | None = None,
+         move_strays: bool = False) -> dict:
     """The SkyPilot task: env/node.yaml's keys plus the name and the generated run block."""
     node = load_node()
     t = {"name": cluster_name(exp), "resources": copy.deepcopy(node["resources"])}
@@ -174,7 +182,7 @@ def task(exp: dict, exp_rel: str, job: str, sets: list[str], launch_id: str | No
     for k in ("file_mounts", "envs", "num_nodes", "setup"):
         if node.get(k) is not None:
             t[k] = copy.deepcopy(node[k])
-    t["run"] = run_block(exp, exp_rel, job, sets, launch_id)
+    t["run"] = run_block(exp, exp_rel, job, sets, launch_id, move_strays)
     return t
 
 
@@ -572,6 +580,9 @@ def main(argv=None) -> int:
     ap.add_argument("--results", default=RESULTS)
     ap.add_argument("--dry-run", action="store_true", help="write the task + file list, launch nothing")
     ap.add_argument("--no-wait", action="store_true", help="launch detached and return (sync later)")
+    ap.add_argument("--move-strays", action="store_true",
+                    help="first move code files in the node's workdir that the stage does not list "
+                         "to ~/sky_workdir_stray_<UTC>/ (env/stray_files.py; nothing is deleted)")
     a = ap.parse_args(argv)
     if a.sync:
         return sync(a.sync)
@@ -664,11 +675,15 @@ def launch(a) -> int:
     with open(os.path.join(stage, "STAGED"), "w") as f:
         f.write(_home_masked("\n".join(staged) + "\n"))
     shutil.copy2(os.path.join(stage, "STAGED"), os.path.join(launch_dir, "STAGED"))
-    t = task(exp, exp_rel, a.job, a.set, launch_id)
+    t = task(exp, exp_rel, a.job, a.set, launch_id, a.move_strays)
     task_path = os.path.join(launch_dir, "task.yaml")
     with open(task_path, "w") as f:
         f.write(dump_task(t))
-    files = staged_files(stage)
+    # the stage's own file list, shipped with it: env/stray_files.py on the node moves aside any
+    # code file in the workdir that it does not name (not code itself: .txt)
+    files = sorted(staged_files(stage) + ["STAGED_files.txt"])
+    with open(os.path.join(stage, "STAGED_files.txt"), "w") as f:
+        f.write("\n".join(files) + "\n")
     with open(os.path.join(launch_dir, "staged_files.txt"), "w") as f:
         f.write("\n".join(files + [f"{d['path']}  (data: {d['how']} of {d['source']})" for d in plan]
                           if a.dry_run else files) + "\n")
@@ -679,7 +694,8 @@ def launch(a) -> int:
     rec = {"schema": 1, "experiment": exp["name"], "experiment_file": exp_rel,
            "experiment_text": open(path).read(), "sets": a.set, "job": a.job, "results_dir": rel,
            "commit": st["commit"], "rev": a.rev, "dirty": st["dirty"], "dirty_paths": st["dirty_paths"],
-           "allow_dirty": a.allow_dirty, "stage_source": st["source"], "stage": stage,
+           "allow_dirty": a.allow_dirty, "move_strays": a.move_strays,
+           "stage_source": st["source"], "stage": stage,
            "code_sha": csha, "stack_sha": stack_sha(os.path.join(stage, "env", "versions.env")),
            "node": node, "cluster": cluster, "sky_command": cmd, "run_line": run_line(exp_rel, a.job, a.set, launch_id),
            "data": plan, "prep": exp["prep"], "results_root": os.path.abspath(a.results), "dry_run": a.dry_run,

@@ -474,3 +474,44 @@ def test_warnings_alone_are_not_a_failed_run(tmp_path):
     (tmp_path / "checks.json").write_text(json.dumps({"ok": True}))
     (tmp_path / "summary.md").write_text("run: ...\n\nWarnings (1, not failures):\n- w\n")
     assert launch.run_verdict(str(tmp_path)) == []
+
+
+def test_stray_code_files_in_the_workdir_are_moved_not_deleted(tmp_path):
+    """the node's workdir keeps files from before the upload: every code file the stage does not
+    list moves to DEST (relative path kept); staged files, data and build trees stay."""
+    import subprocess
+    w = tmp_path / "w"
+    for rel in ("bench/a.py", "python/nova-bf/src/x.py", "benchmarks/run.sh", "data/q.parquet",
+                "nova-bf/rust_io/target/t.rs", "notes.txt"):
+        p = w / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text("x\n")
+    (w / "STAGED_files.txt").write_text("bench/a.py\nSTAGED_files.txt\n")
+    dest = tmp_path / "stray"
+    r = subprocess.run([sys.executable, os.path.join(CB, "env", "stray_files.py"), str(w),
+                        str(w / "STAGED_files.txt"), str(dest)], capture_output=True, text=True)
+    assert r.returncode == 0 and "2 not in the stage" in r.stdout, r.stdout + r.stderr
+    assert sorted(str(p.relative_to(dest)) for p in dest.rglob("*") if p.is_file()) == \
+        ["benchmarks/run.sh", "python/nova-bf/src/x.py"]
+    for kept in ("bench/a.py", "data/q.parquet", "nova-bf/rust_io/target/t.rs", "notes.txt"):
+        assert (w / kept).is_file(), kept
+    r = subprocess.run([sys.executable, os.path.join(CB, "env", "stray_files.py"), str(w),
+                        str(w / "STAGED_files.txt"), str(dest)], capture_output=True, text=True)
+    assert "stray code files: none" in r.stdout
+
+
+def test_the_stage_lists_its_own_files_and_move_strays_is_opt_in(tmp_path, fake_cloud):
+    """the stage always carries STAGED_files.txt; the job moves strays only with --move-strays,
+    right after reading the paths file and before the build."""
+    env, _ = fake_cloud
+    d = dry("dense_coyo", tmp_path / "res", env=env)
+    st = os.path.join(d, "stage")
+    listed = open(os.path.join(st, "STAGED_files.txt")).read().split()
+    assert "STAGED_files.txt" in listed and "bench/launch.py" in listed and "env/stray_files.py" in listed
+    run = yaml.safe_load(open(os.path.join(d, "task.yaml")))["run"].splitlines()
+    assert L.STRAY_LINE not in run
+    assert json.load(open(os.path.join(d, "launch.json")))["move_strays"] is False
+    e = E.load(os.path.join(CB, E.path_of("dense_coyo")))
+    run = L.run_block(e, "experiments/dense/coyo.yaml", "run", [], move_strays=True).splitlines()
+    i = run.index(L.STRAY_LINE)
+    assert run[i - 1] == L.PATHS_LINE and "STEP build" in " ".join(run[i + 1:i + 3])
