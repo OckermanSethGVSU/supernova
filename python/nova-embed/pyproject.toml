@@ -60,6 +60,28 @@ vllm = [
     "pillow",
 ]
 
+# Separate extras (not part of `embed`): each library pins its own range of
+# sentence-transformers / transformers, and `embed` deliberately leaves
+# transformers unpinned. Install alongside `embed`, e.g. `[embed,pylate]`.
+# pylate pins sentence-transformers exactly and caps transformers, so adding
+# it moves the whole `embed` stack to those versions; colpali-engine needs a
+# transformers floor, so `[pylate,colpali]` together only resolves where the
+# two ranges meet.
+# The pylate backend (ColBERT-family multivector text models).
+pylate = [
+    "pylate",
+]
+# The colpali backend (ColPali / ColQwen / ColSmol page-image multivector).
+colpali = [
+    "colpali-engine",
+    "pillow",
+]
+# The open_clip backend (OpenCLIP / LAION CLIP and SigLIP checkpoints).
+open_clip = [
+    "open_clip_torch",
+    "pillow",
+]
+
 # Exposes `nova-embed` on PATH, so `nova embed ...` dispatches here just like a
 # Rust `nova-<cmd>` binary would.
 [project.scripts]

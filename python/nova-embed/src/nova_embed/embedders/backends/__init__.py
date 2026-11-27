@@ -24,6 +24,9 @@ _BACKEND_MODULES = [
     "fastembed",
     "bge_m3",
     "vllm",
+    "pylate",
+    "colpali",
+    "open_clip",
 ]
 
 for _mod in _BACKEND_MODULES:

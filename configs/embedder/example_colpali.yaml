@@ -1,0 +1,49 @@
+# Page-image retrieval example: embed document page images and their text
+# queries into one ColPali multivector space.
+#
+# Install: pip install 'nova-embed[embed,colpali]'
+#
+# Both entries name identical backend settings (every key other than name,
+# input_column, modality and output_column, batch_size included), so they
+# share one loaded model; a differing key loads a second copy. The `image`
+# entry runs the page side of the model, the `text` entry the query side.
+source:
+  type: huggingface_parquet
+  dataset_name: vidore/docvqa_test_subsampled
+  split: test
+
+embedders:
+  - name: page
+    kind: multivector
+    type: colpali
+    model: vidore/colqwen2.5-v0.2
+    # The model family is read from the model id. Set it explicitly for a
+    # checkpoint whose name doesn't include it:
+    # variant: colqwen2_5        # colpali | colqwen2 | colqwen2_5 | colidefics3
+    input_column: image
+    modality: image
+    batch_size: 4
+    # dtype defaults to bfloat16 on CUDA, float32 elsewhere
+    # → column "page_embedding": list<list<float32>>, ~1k vectors × 128 per page
+
+  - name: query
+    kind: multivector
+    type: colpali
+    model: vidore/colqwen2.5-v0.2
+    input_column: query
+    modality: text
+    batch_size: 4
+
+  # Smallest model, for a quick CPU check:
+  #   model: vidore/colSmol-256M
+
+storage:
+  type: local
+  output_dir: /tmp/docvqa_colqwen
+
+pipeline:
+  chunk_size: 100
+  # A page row is far larger than a text row (about 0.5 MB of float32), so
+  # flush often to bound the writer's buffer.
+  flush_threshold: 500
+  drop_columns: [image]

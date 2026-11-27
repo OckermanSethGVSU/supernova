@@ -1,0 +1,34 @@
+# ColBERT multivector example through PyLate.
+#
+# Install: pip install 'nova-embed[embed,pylate]'
+source:
+  type: huggingface_parquet
+  dataset_name: mteb/tweet_sentiment_extraction
+  split: train
+
+embedders:
+  - name: colbert
+    kind: multivector
+    type: pylate
+    model: lightonai/GTE-ModernColBERT-v1
+    input_column: text
+    modality: text
+    batch_size: 32
+    # Queries are encoded differently from documents (padded with [MASK] to
+    # a fixed length). Set this on an entry over a query column; a query
+    # entry next to this one reuses the same loaded model:
+    # query: true
+    # Token caps; unset keeps the model's own configured lengths:
+    # document_length: 300
+    # query_length: 32
+    # → column "colbert_embedding": list<list<float32>>, one vector per token
+    # A dense column can be derived from the token vectors:
+    # pooling: {type: mean}
+
+storage:
+  type: local
+  output_dir: /tmp/tweets_colbert
+
+pipeline:
+  chunk_size: 2000
+  flush_threshold: 20000

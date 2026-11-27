@@ -57,6 +57,9 @@ you set `output_column`. Keys the pipeline doesn't know (`batch_size`, `dtype`,
 | `openai` | dense | text | OpenAI API, or any OpenAI-compatible server via `base_url` (`api_key: none` for local servers). |
 | `bge_m3` | dense, sparse, multivector | text | `BAAI/bge-m3`. |
 | `vllm` | dense | text, image, multimodal | vLLM pooling runner. The only backend that takes `modality: multimodal`. |
+| `open_clip` | dense | text, image | OpenCLIP checkpoints (CLIP, SigLIP, EVA, MetaCLIP). `model` is the architecture (`ViT-B-32`, or `hf-hub:...`), `pretrained` the weight tag (`laion2b_s34b_b79k`). Vectors are L2-normalized unless `normalize: false`. Install the `open_clip` extra. |
+| `pylate` | multivector | text | ColBERT-family models through PyLate (`lightonai/GTE-ModernColBERT-v1`, `answerdotai/answerai-colbert-small-v1`, ...). Set `query: true` when the column holds queries. Install the `pylate` extra. |
+| `colpali` | multivector | image, text | Page-image retrieval models through colpali-engine (ColPali, ColQwen2/2.5, ColSmol). Images are embedded as pages, text as queries, in one space. The family is read from the model id, or set `variant:`. Page rows hold about a thousand vectors each, so lower `pipeline.flush_threshold`. Install the `colpali` extra. |
 
 Entries on the same model and input column are fused into one forward pass
 when the backend supports it (e.g. `bge_m3` dense, sparse, and multivector
