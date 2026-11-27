@@ -1,11 +1,10 @@
-"""`bench run --dev` of the fixture experiments and the run-dir helpers the checks tests share."""
+"""The finished `bench run --dev` runs the checks tests read (every shape, shared and cached:
+helpers.fixture_runs) and the run-dir helpers that plant a mistake in a copy of one."""
 
 import hashlib
 import json
 import os
 import shutil
-import subprocess
-import sys
 
 import numpy as np
 import pyarrow as pa
@@ -13,40 +12,14 @@ import pyarrow.parquet as pq
 import pytest
 
 from helpers import fixture_runs
-from bench.verify import agree
-from bench.verify import compare as C
 
-
-CB = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-SHAPES = ("dense", "sparse", "multivector", "filtered")
-
-
-def _env():
-    env = {k: v for k, v in os.environ.items() if not k.startswith(("NOVA_BF_", "NOVABF_", "PAPER_"))}
-    env.update(HARNESS_NO_IMDS="1", PYTHONDONTWRITEBYTECODE="1", OMP_NUM_THREADS="2")
-    return env
-
-
-def bench(*args, env=None):
-    return subprocess.run([sys.executable, "-m", "bench", *args], cwd=CB, env=env or _env(),
-                          capture_output=True, text=True)
-
-
-def _only_run(results, name):
-    runs = sorted(os.listdir(os.path.join(results, name)))
-    assert len(runs) == 1, runs
-    return os.path.join(results, name, runs[0])
+SHAPES = ("dense", "filtered", "sparse", "multivector")
 
 
 @pytest.fixture(scope="module")
 def runs(tmp_path_factory):
     """{shape: run dir}: this module's own copy of the shared, cached runs (fixture_runs)."""
-    return fixture_runs.ok_runs(tmp_path_factory, "s5_results")
-
-
-def checks(d):
-    exp = json.load(open(os.path.join(d, "experiment.json")))
-    return agree.run_checks(d, exp)
+    return fixture_runs.ok_runs(tmp_path_factory, "check_results", SHAPES)
 
 
 def copy_run(src, dst):
@@ -93,29 +66,7 @@ def _nb_rewrite(d, search, fn):
         pq.write_table(t2.replace_schema_metadata(t.schema.metadata), p)
 
 
-def _exact_ties(d, search, system, k):
-    """(query, rank) pairs of `system`'s list whose two ids have EQUAL float64 scores, from the
-    run's own oracle rescoring (compare's exact_scores via agree)."""
-    exp = json.load(open(os.path.join(d, "experiment.json")))
-    s = next(x for x in exp["searches"] if x["name"] == search)
-    a = C.parse_args(agree.compare_args(exp, s, None, "uuid"))
-    z = np.load(os.path.join(d, "legs", f"{search}__{system}__r1.topk.npz"))
-    I = z["I"]
-    need = [set(int(g) for g in row[:k] if g >= 0) for row in I]
-    keys, rows, offsets, _ = C.corpus_index(a.corpus, need_ids=False)
-    inputs = {"offsets": offsets, "keys": keys, "n": len(I), "qn": agree._queries_qn(a)}
-    ex = agree._exact_for(a, need, inputs)
-    return [(q, r) for q in range(len(I)) for r in range(k - 1)
-            if I[q, r] >= 0 and I[q, r + 1] >= 0 and ex[(q, int(I[q, r]))] == ex[(q, int(I[q, r + 1]))]], ex
-
-
 def _uuid(key, row):
+    """nova-bf's point id of a corpus row, written out here (an independent copy of load.uuid_of)."""
     h = hashlib.md5(f"{key}:{row}".encode()).hexdigest()
     return f"{h[:8]}-{h[8:12]}-{h[12:16]}-{h[16:20]}-{h[20:32]}"
-
-
-def _filtered_rows(exp, search):
-    import yaml
-    cfg = yaml.safe_load(open(exp["filter"]["config"]))
-    s = next(x for x in cfg["searches"] if x["name"] == search)
-    return s["rows"]

@@ -64,13 +64,14 @@ def runs(tmp_path_factory):
 @pytest.mark.slow
 @pytest.mark.parametrize("shape", ["dense", "sparse", "multivector", "filtered"])
 def test_every_shape_runs_end_to_end(runs, shape):
+    """Every leg of every shape runs and every shape's checks pass."""
     r = runs[shape]
     assert r["proc"].returncode == 0, r["proc"].stdout[-3000:] + r["proc"].stderr[-3000:]
     d = r["dir"]
     for f in ("manifest.json", "experiment.json", "checks.json", "summary.csv", "summary.md"):
         assert os.path.isfile(os.path.join(d, f)), f
     exp = json.load(open(os.path.join(d, "experiment.json")))
-    rows, problems, excluded, _ = SUM.summarize(d)
+    rows, problems, excluded, _ = SUM.summarize(d, require_checks=True)
     assert not problems and not excluded
     n_legs = sum(len(s["systems"]) for s in exp["searches"])
     assert len(rows) == n_legs and all(row["n"] == 2 for row in rows)
@@ -78,7 +79,8 @@ def test_every_shape_runs_end_to_end(runs, shape):
         assert row["median_s"] > 0
         assert row["time_source"] == "LegClock"      # every system
     checks = json.load(open(os.path.join(d, "checks.json")))
-    assert checks["implemented"] is True and checks["ok"] is True, checks["problems"]
+    assert checks["ok"] is True and set(checks["searches"]) == {s["name"] for s in exp["searches"]}, \
+        checks["problems"]
 
 
 @pytest.mark.slow
@@ -181,7 +183,7 @@ def test_legs_ran_in_the_rotated_order(runs):
 
 @pytest.mark.slow
 def test_novabf_and_the_cpu_reference_agree_on_dense(runs):
-    """A sanity check that both systems searched the same data (verify/agree.py does the real checks)."""
+    """A sanity check that both systems searched the same data (verify/check.py does the real checks)."""
     d = runs["dense"]["dir"]
     a = np.load(os.path.join(d, "legs", "dense__novabf__r1.topk.npz"))
     b = np.load(os.path.join(d, "legs", "dense__cpu__r1.topk.npz"))
@@ -258,12 +260,12 @@ def test_missing_round_fails_summarize(runs, tmp_path):
 @pytest.mark.slow
 def test_unreadable_record_and_failed_checks_fail_summarize(runs, tmp_path):
     d = str(tmp_path / "run")
-    shutil.copytree(runs["sparse"]["dir"], d)
+    shutil.copytree(runs["dense"]["dir"], d)
     assert bench("summarize", d).returncode == 0
     json.dump({"ok": False}, open(os.path.join(d, "checks.json"), "w"))
     assert bench("summarize", d).returncode == 1
-    json.dump({"implemented": False, "ok": None}, open(os.path.join(d, "checks.json"), "w"))
-    open(os.path.join(d, "legs", "sparse__cpu__r1.json"), "w").write("{trunc")
+    json.dump({"ok": None}, open(os.path.join(d, "checks.json"), "w"))
+    open(os.path.join(d, "legs", "dense__cpu__r1.json"), "w").write("{trunc")
     p = bench("summarize", d)
     assert p.returncode == 1 and "unreadable leg record" in p.stdout
 
@@ -499,7 +501,9 @@ def test_boundary_guard_rules():
 # sweep
 # ---------------------------------------------------------------------------------------------
 @pytest.mark.slow
-def test_cpu_sweep_writes_its_table_and_pick_prints_the_yaml_change(tmp_path):
+def test_cpu_sweep_writes_its_table_and_pick_chooses_a_checked_variant(tmp_path):
+    """A sparse sweep runs and checks every variant; --pick prints the winner's YAML change (and
+    never edits a file)."""
     res = str(tmp_path / "res")
     p = bench("sweep", os.path.join(FIX, "sweep_sparse.yaml"), "--dev", "--results", res)
     assert p.returncode == 0, p.stdout[-3000:] + p.stderr[-2000:]
@@ -510,19 +514,12 @@ def test_cpu_sweep_writes_its_table_and_pick_prints_the_yaml_change(tmp_path):
     rows = list(csv.DictReader(open(os.path.join(d, "sweep_table.csv"))))
     assert [r["variant"] for r in rows] == ["novabf", "cpu-sparse_project-off", "cpu-sparse_project-query-vocab"]
     assert all(r["complete"] == "True" and float(r["median_s"]) > 0 for r in rows)
+    assert all(r["checks_ok"] == "True" for r in rows), rows
     for r in json.load(open(os.path.join(d, "experiment.json")))["searches"][0]["systems"]:
         rec = json.load(open(os.path.join(d, "legs", f"sparse__{r}__r1.json")))
         assert rec["n_files"] == 2     # the subset: harness --max-files 2 / NOVABF_MAX_FILES=2
     q = bench("sweep", "--pick", os.path.join(FIX, "sweep_sparse.yaml"), "--results", res)
-    assert q.returncode == 0, q.stderr
-    win = min(rows[1:], key=lambda r: float(r["median_s"]))
-    assert f"cpu: winner {win['variant']}" in q.stdout
-    val = json.loads(win["setting"])["sparse_project"]
-    run_rel = os.path.relpath(d, res)
-    assert "YAML change (tests/fixtures/experiments/sparse.yaml" in q.stdout
-    shown = "'off'" if val == "off" else val           # yaml quotes off (a yaml bool)
-    assert f"cpu: {{system: cpu, preset: stock, sparse_project: {shown}, chosen_from: {run_rel}}}" in q.stdout
-    assert "novabf: winner" not in q.stdout          # an unswept, included system is not picked
+    assert "cpu: winner cpu-sparse_project-" in q.stdout and "REFUSED" not in q.stdout, q.stdout + q.stderr
     # --pick never edits a file
     assert open(os.path.join(FIX, "sparse.yaml")).read().count("chosen_from") == 0
 

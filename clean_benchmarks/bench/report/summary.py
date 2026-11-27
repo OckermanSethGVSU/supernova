@@ -230,8 +230,8 @@ def summarize(run_dir: str, exp: dict | None = None, rounds: int | None = None,
         else:
             if c.get("ok") is not True:
                 problems.append(f"checks failed (ok={c.get('ok')!r}, {checks})")
-            from bench.verify import agree
-            stale = agree.input_problems(run_dir, c if isinstance(c, dict) else {})
+            from bench.verify import check
+            stale = check.input_problems(run_dir, c if isinstance(c, dict) else {})
             if stale:
                 problems.append(f"stale checks.json ({len(stale)} input(s) differ from what the "
                                 f"checks read; re-run the checks): " + "; ".join(stale[:5]))
@@ -255,19 +255,28 @@ def expected_files(run_dir: str, exp: dict, expect_files: int | None = None) -> 
 
 
 def score_error_lines(run_dir: str) -> list[str]:
-    """summary.md: one line per search with each system's largest own-score error against
-    float64 (checks.json score_error), the evidence behind "fp32-exact outputs"."""
+    """summary.md: one line per search with each system's float64 numbers from checks.json
+    (searches.<s>.systems): the largest compared gap in float32 ULPs (ulp_gaps max), and with
+    the exhaustive check the largest |reported - float64| score (max_score_error) and the
+    largest gap over its float32 bound (max_gap_over_bound), the evidence behind "fp32-exact
+    outputs"."""
     try:
-        se = json.load(open(os.path.join(run_dir, "checks.json"))).get("score_error") or {}
-    except (OSError, ValueError, AttributeError):
+        doc = json.load(open(os.path.join(run_dir, "checks.json")))
+    except (OSError, ValueError):
         return []
     out = []
-    for s, by in sorted(se.items()):
-        if by:
-            out.append(f"- {s}: " + ", ".join(
-                f"{nm} {e.get('max_ulps', 0):.1f} ULPs (abs {e.get('max_abs', 0):.2e}; "
-                f"adjudicated ids {e.get('max_ulps_adjudicated', 0):.1f})"
-                for nm, e in sorted(by.items())))
+    for s, d in sorted((doc.get("searches") or {}).items() if isinstance(doc, dict) else ()):
+        by = (d or {}).get("systems") or {}
+        parts = []
+        for nm, v in sorted(by.items()):
+            p = f"{nm} ulp gaps max {((v.get('ulp_gaps') or {}).get('max') or 0):.1f}"
+            if v.get("max_score_error") is not None:
+                p += f", max score error {v['max_score_error']:.2e}"
+            if v.get("max_gap_over_bound") is not None:
+                p += f", max gap / bound {v['max_gap_over_bound']:.3g}"
+            parts.append(p)
+        if parts:
+            out.append(f"- {s} ({d.get('check')} check): " + "; ".join(parts))
     return out
 
 
@@ -317,6 +326,37 @@ def attribution_warnings(run_dir: str) -> list:
     return out
 
 
+def check_time_lines(run_dir: str) -> list:
+    """Report only: how long the checks took (checks.json `seconds`, the whole check), per
+    search with its phases, the disputed rows rescored (rows some systems returned and others
+    did not) or whether the exhaustive reference came from the cache."""
+    try:
+        doc = json.load(open(os.path.join(run_dir, "checks.json")))
+    except (OSError, ValueError):
+        return []
+    tot = doc.get("seconds") if isinstance(doc, dict) else None
+    if not isinstance(tot, (int, float)) or isinstance(tot, bool):
+        return []
+    out = [f"checks took {tot:.1f} s"]
+    for s, x in sorted((doc.get("searches") or {}).items()):
+        sec = (x or {}).get("seconds") or {}
+        if not sec:
+            continue
+        ph = ", ".join(f"{k} {v:.1f}" for k, v in sec.items())
+        d, ref = x.get("disputed") or {}, x.get("reference") or {}
+        extra = (f"; disputed {d['pairs_rescored']} (query, row) pairs in {d['queries']} queries"
+                 if "pairs_rescored" in d else "")
+        if ref:
+            extra += f"; reference {'from the cache' if ref.get('cached') else 'built'}"
+            if ref.get("device") and not ref.get("cached"):
+                extra += f" on {ref['device']}"
+        smp = x.get("sample") or {}
+        if smp and smp.get("queries") != smp.get("of"):
+            extra += f"; exhaustive rules on {smp['queries']} of {smp['of']} queries (seed {smp['seed']})"
+        out.append(f"- {s}: {sum(sec.values()):.1f} s ({ph}){extra}")
+    return out
+
+
 def write(run_dir: str, rows, problems, excluded, e2e) -> str:
     from bench import paths
     rows, problems, excluded, e2e = paths.mask((rows, problems, excluded, e2e))
@@ -330,6 +370,7 @@ def write(run_dir: str, rows, problems, excluded, e2e) -> str:
     lines = [f"run: commit {meta['run_commit'] or '-'}, dirty {meta['run_dirty']}, "
              f"code_sha {meta['code_sha'] or '-'}, stack_sha {meta['stack_sha'] or '-'}",
              f"experiment.json sha256 {meta['experiment_sha256'] or '-'}; checks ok: {meta['checks_ok']}",
+             *check_time_lines(run_dir),
              "",
              "| search | system | n | median s (timed pass) | median footer read s | per round | "
              "time source | preset (+proj: query-vocab projection; ours: our code) |",
@@ -349,9 +390,10 @@ def write(run_dir: str, rows, problems, excluded, e2e) -> str:
                          + " | ".join(f(r.get(c)) for c in ATTR_COLS) + " |")
     se = score_error_lines(run_dir)
     if se:
-        lines += ["", "Max own-score error vs float64 (float32 ULPs of the exact score, every "
-                  "round's oracle sample + pairs adjudication; abs = absolute; adjudicated ids = "
-                  "the ids the tie window judges; checks.json score_error):"] + se
+        lines += ["", "Float64 checks per system (round 1, every query; ulp gaps = the compared float64 "
+                  "score gaps in float32 ULPs of the query's top score; max score error = "
+                  "|reported - float64| and gap / bound = the largest gap over its float32 bound, "
+                  "exhaustive check only; checks.json searches.<search>.systems):"] + se
     lines += [""] + [f"Note: {n}" for n in COL_NOTES]
     if e2e:
         lines += ["", "e2e (cold: one fresh process, no warmup, Triton + CUDA JIT caches cleared):"]
@@ -369,9 +411,9 @@ def write(run_dir: str, rows, problems, excluded, e2e) -> str:
     if problems:
         lines += ["", f"PROBLEMS ({len(problems)}):"] + [f"- {p}" for p in problems]
     warnings = []
-    try:   # round-to-round differences are listed, never a problem
+    try:   # the checks' warnings (e.g. an expect_inexact system's failures), never a problem
         warnings = json.load(open(os.path.join(run_dir, "checks.json"))).get("warnings") or []
-    except (OSError, ValueError):
+    except (OSError, ValueError, AttributeError):
         pass
     warnings = list(warnings) + attribution_warnings(run_dir)
     if warnings:
@@ -394,6 +436,11 @@ def main(argv=None) -> int:
     a = ap.parse_args(argv)
     if a.rounds is not None and a.rounds < 1:
         ap.error("--rounds: a positive integer")
+    try:   # the experiment's ${READ} / ${WRITE} section, as bench run resolves them
+        from bench import paths
+        paths.use(json.load(open(os.path.join(a.run_dir, "experiment.json"))))
+    except (OSError, ValueError):
+        pass   # summarize reports the missing experiment.json itself
     rows, problems, excluded, e2e = summarize(a.run_dir, rounds=a.rounds, expect_files=a.expect_files,
                                               require_checks=not a.no_checks)
     print(write(a.run_dir, rows, problems, excluded, e2e), end="")

@@ -28,8 +28,7 @@ runs. Tests never read them: they use their own copies in `tests/fixtures/experi
    bench run <file> --set subset.files=4 --set protocol.rounds=1 --set checks.exact_scan=true
    ```
 
-   Additional correctness checks are available through `bench check-copies`
-   and `bench check-verify`.
+   `bench verify RUN_DIR [--exact-scan]` re-runs the checks on a finished run.
 
 2. **Tune configurations.** Sweep configuration parameters on a subset
    of the dataset to identify the fastest correct settings for each system.

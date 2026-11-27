@@ -38,9 +38,6 @@ systems:             # round-1 order
 novabf_output: ${WRITE}
 # no cold e2e leg here: the dense cold-start cost is measured once, on Coyo
 protocol: {rounds: 3}                       # the reported value is the median of 3 rotated rounds
-checks:
-  oracle_queries: 500                       # queries sampled for the float64 oracle
-  gt: ~/data/gt_22723.npz             # the dataset GT, all 22,723 rows (the `queries` step writes it)
 
 prep:
   stage:

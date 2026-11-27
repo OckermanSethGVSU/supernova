@@ -86,4 +86,4 @@ def test_pubmed_prep_writes_the_queries_and_a_gt_keyed_by_snippet_id(tmp_path):
     e = _exp("dense_pubmed")
     lines = "\n".join(PS.node_prep(e))
     assert "prep_queries_pubmed.py" in lines and lines.rstrip().endswith("progress.log")
-    assert e["checks"]["gt"].endswith("gt_pubmed_dense.parquet")
+    assert "gt" not in e["checks"]   # written by prep for the dataset, not read by the checks

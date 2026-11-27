@@ -238,7 +238,6 @@ def test_host_backends_match_the_harness_schema():
 @pytest.mark.parametrize("sets,where", [
     (["systems.cuvs.cuvs_rmm_pool=TODO"], "systems.cuvs.knobs.cuvs_rmm_pool"),
     (["novabf_output=${WRITE}/TODO"], "novabf_output"),
-    (["checks.gt=TODO.parquet"], "checks.gt"),
     (["prep.queries_src=s3://TODO/q.parquet"], "prep.queries_src"),
 ])
 def test_todo_placeholders_anywhere_are_found(sets, where):
@@ -376,63 +375,78 @@ def test_an_unpinned_files_in_flight_sweep_prepares(tmp_path):
     assert len(v) == 3
 
 
-def test_checks_rescore_max_gib_reaches_compare():
-    from bench.verify import agree
-    e = _exp("dense_coyo", ["checks.rescore_max_gib=100"])
-    argv = agree.compare_args(e, e["searches"][0], None, "md5")
-    assert argv[argv.index("--rescore-max-gib") + 1] == "100"
-    e = _exp("dense_coyo")
-    assert "--rescore-max-gib" not in agree.compare_args(e, e["searches"][0], None, "md5")
-    for bad in ("0", "true", "x"):
-        with pytest.raises(E.ExperimentError, match="rescore_max_gib"):
-            _exp("dense_coyo", [f"checks.rescore_max_gib={bad}"])
+@pytest.mark.parametrize("key", ["oracle_queries=500", "gt=x.npz", "max_score_ulps=8",
+                                 "rescore_max_gib=100", "groups={a: b}", "copies_files=4",
+                                 "verify_files=4", "check_repeats=2"])
+def test_the_old_checks_keys_are_refused(key):
+    """the checks before the 2026-11-26 redesign read these; an experiment that still sets one
+    is refused, not silently run without it."""
+    with pytest.raises(E.ExperimentError, match="checks: unknown key"):
+        _exp("dense_coyo", [f"checks.{key}"])
 
 
-def test_a_subset_runs_checks_cover_its_files_and_skip_the_full_corpus_gt():
-    """the legs of a subset run read the first N files: the checks index, map and rescore those
-    only, and never compare with the dataset GT (it is over the whole corpus)."""
-    from bench.verify import agree
+def test_checks_keep_exact_scan_and_expect_inexact():
+    e = _exp("dense_coyo", ["checks.exact_scan=true", "checks.expect_inexact=[cpu]"])
+    assert e["checks"] == {"exact_scan": True, "expect_inexact": ["cpu"]}
+    with pytest.raises(E.ExperimentError, match="checks.exact_scan"):
+        _exp("dense_coyo", ["checks.exact_scan=3"])
+
+
+@pytest.mark.parametrize("v,ok", [("1", True), ("1000", True), ("all", True), ("0", False),
+                                  ("-3", False), ("true", False), ("some", False), ("1.5", False)])
+def test_checks_queries_is_a_positive_integer_or_all(v, ok):
+    if ok:
+        assert _exp("dense_coyo", [f"checks.queries={v}"])["checks"]["queries"] in (1, 1000, "all")
+    else:
+        with pytest.raises(E.ExperimentError, match="checks.queries"):
+            _exp("dense_coyo", [f"checks.queries={v}"])
+
+
+def test_the_pylate_modes_sweep_expects_only_the_zero_padded_variants_inexact():
+    """rerank-released (zero-padded, known inexact) is excused; ownpad fixes the padding (exact)
+    and scores-batched are judged like any system."""
+    from bench.verify import check as V
+    # the fixture copy of experiments/sweeps/mv_pylatemodes.yaml
+    e, variants, _ = E.load_sweep(os.path.join(FIX, "sweeps", "mv_pylatemodes.yaml"))
+    got = {v["variant"]: V.expect_inexact(e, v["variant"]) for v in variants}
+    want = lambda n: "pylate_mode-rerank-released-pylate" in n  # noqa: E731
+    assert got and all(x == want(n) for n, x in got.items()), got
+    assert sum(got.values()) == 2
+
+
+def test_a_subset_runs_checks_read_only_its_files():
+    """the legs of a subset run read the first N files: the checks list, map and rescore those."""
+    from bench.verify import load
     e = _exp("dense_pes2o", ["subset.files=32"])
-    argv = agree.compare_args(e, e["searches"][0], None, "md5")
-    assert argv[argv.index("--max-files") + 1] == "32" and "--gt" not in argv
+    assert load.search_args(e, e["searches"][0]).max_files == 32
     e = _exp("dense_pes2o")
-    argv = agree.compare_args(e, e["searches"][0], None, "md5")
-    assert "--max-files" not in argv and "--gt" in argv
+    assert load.search_args(e, e["searches"][0]).max_files is None
 
 
 def test_corpus_index_with_max_files_is_the_first_files_by_path(tmp_path):
     import pyarrow as pa
     import pyarrow.parquet as pq
-    from bench.verify import compare as C
+    from bench.verify import load
     for name, n in (("b.parquet", 2), ("a.parquet", 3), ("c.parquet", 4)):
         pq.write_table(pa.table({"v": list(range(n))}), tmp_path / name)
-    keys, rows, offsets, _ = C.corpus_index(str(tmp_path), need_ids=False, max_files=2)
+    keys, rows, offsets, _ = load.corpus_index(str(tmp_path), need_ids=False, max_files=2)
     assert [os.path.basename(k) for k in keys] == ["a.parquet", "b.parquet"] and rows.tolist() == [3, 2]
-    fs, paths = C.corpus_paths(str(tmp_path), 2, max_files=2)
+    fs, paths = load.corpus_paths(str(tmp_path), 2, max_files=2)
     assert [os.path.basename(p) for p in paths] == ["a.parquet", "b.parquet"]
 
 
-def test_a_sweep_groups_its_variants_by_base_system_for_the_pairs_check():
-    """a sweep sets checks.groups {variant: base system}, which compare_args passes as one
-    --group per system of the search; a run sets none (every pair, no --group)."""
-    from bench.verify import agree
+def test_a_sweep_adds_no_checks_keys():
+    """the old pairs check grouped a sweep's variants (checks.groups); the checks judge each
+    system on its own, so a sweep's checks are its base's."""
     e, variants, _ = E.load_sweep(os.path.join(FIX, "sweeps", "dense_coyo_io.yaml"))
-    assert e["checks"]["groups"] == {v["variant"]: v["base_system"] for v in variants}
-    argv = agree.compare_args(e, e["searches"][0], None, "md5")
-    got = [argv[i + 1] for i, x in enumerate(argv) if x == "--group"]
-    assert got == [f"{sy}={e['checks']['groups'][sy]}" for sy in e["searches"][0]["systems"]] and got
-    run = _exp("dense_coyo")
-    assert "groups" not in run["checks"]
-    assert "--group" not in agree.compare_args(run, run["searches"][0], None, "md5")
-    with pytest.raises(E.ExperimentError, match="checks.groups"):
-        _exp("dense_coyo", ["checks.groups=some"])
+    assert "groups" not in e["checks"]
 
 
 def test_the_checks_list_the_corpus_as_the_harness_legs_do():
     """corpus.recursive false (Pes2o: flat): the checks list only the root's own files, as the
     harness legs without --corpus-recursive do; recursive true lists every level."""
-    from bench.verify import agree
+    from bench.verify import load
     e = _exp("dense_pes2o")
-    assert "--corpus-flat" in agree.compare_args(e, e["searches"][0], None, "md5")
+    assert load.search_args(e, e["searches"][0]).recursive is False
     e = _exp("dense_coyo")
-    assert "--corpus-flat" not in agree.compare_args(e, e["searches"][0], None, "md5")
+    assert load.search_args(e, e["searches"][0]).recursive is True

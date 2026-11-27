@@ -68,12 +68,26 @@ def read_file(path: str = FILE) -> dict:
     return out
 
 
+def _local(p: str) -> str:
+    """A recorded clean_benchmarks file path as this checkout holds it: a run synced back from a
+    node records the node's path (e.g. /home/ubuntu/sky_workdir/experiments/x.yaml)."""
+    if os.path.exists(p):
+        return p
+    s = str(p).replace(os.sep, "/")
+    for top in ("/experiments/", "/tests/", "/s8/"):
+        i = s.rfind(top)
+        if i >= 0 and os.path.exists(os.path.join(CB, s[i + 1:])):
+            return os.path.join(CB, s[i + 1:])
+    return p
+
+
 def use(exp: dict) -> list[str]:
     """Make `exp` the experiment whose section the placeholders resolve from: its name, then
     each `base:` experiment's name (nearest first). Returns the section names."""
     import yaml
     names = [exp.get("name")] if exp.get("name") else []
     for b in reversed(exp.get("_base") or []):
+        b = _local(b)
         try:
             with open(b) as f:
                 n = (yaml.safe_load(f) or {}).get("name")

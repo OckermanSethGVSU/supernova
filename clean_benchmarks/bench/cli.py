@@ -6,8 +6,7 @@ Commands:
     summarize      Summarize benchmark results.
     sweep          Run parameter sweeps.
     check          Validate the environment.
-    check-copies   Verify GPU copy modes produce identical results.
-    check-verify   Verify results against a float64 reference.
+    verify         Re-run the checks on a finished run dir (checks.json).
     plot           Generate figures from saved results.
     launch         Stage and run benchmarks on a SkyPilot node.
 
@@ -31,8 +30,7 @@ COMMANDS = {
     "launch": "run an experiment on a SkyPilot node (env/node.yaml) and sync results back",
     "plot": "figures from saved results only (one time attribution per search)",
     "check": "check the pinned paper environment (env/check.py); extra ARGS go to it",
-    "check-copies": "serial vs overlapped GPU copies give the identical top-k",
-    "check-verify": "every variant once with the harness --verify (exact float64 reference)",
+    "verify": "the checks again on a finished run dir (CHECKS_REDESIGN.md): rewrites checks.json",
 }
 
 
@@ -82,9 +80,9 @@ def main(argv=None):
     if argv[:1] == ["summarize"]:
         from bench.report import summary
         return summary.main(argv[1:])
-    if argv[:1] in (["check-copies"], ["check-verify"]):
-        from bench.verify import steps
-        return steps.main(argv[0].split("-", 1)[1], argv[1:])
+    if argv[:1] == ["verify"]:
+        from bench.verify import check
+        return check.main(argv[1:])
     if argv[:1] == ["launch"]:
         from bench import launch
         return launch.main(argv[1:])

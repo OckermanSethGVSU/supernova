@@ -21,8 +21,8 @@ CB = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 def _stamp(d, **doc):
     """checks.json as the checks write it: with the recorded inputs (size and sha256 of each file read), here ok."""
-    from bench.verify import agree
-    json.dump({"ok": True, **doc, "inputs": agree.input_hashes(d)}, open(os.path.join(d, "checks.json"), "w"))
+    from bench.verify import check
+    json.dump({"ok": True, **doc, "inputs": check.run_inputs(d)}, open(os.path.join(d, "checks.json"), "w"))
 
 
 @pytest.fixture
@@ -86,7 +86,7 @@ def test_summary_requires_passing_checks(sdir):
     os.remove(os.path.join(sdir, "checks.json"))
     assert any("no readable checks.json" in p for p in SUM.summarize(sdir, _sum_exp())[1])
     assert SUM.summarize(sdir, _sum_exp(), require_checks=False)[1] == []
-    json.dump({"implemented": False, "ok": None}, open(os.path.join(sdir, "checks.json"), "w"))
+    json.dump({"ok": None}, open(os.path.join(sdir, "checks.json"), "w"))
     assert any("checks failed (ok=None" in p for p in SUM.summarize(sdir, _sum_exp())[1])
     json.dump(_sum_exp(), open(os.path.join(sdir, "experiment.json"), "w"))
     p = subprocess.run([sys.executable, "-m", "bench", "summarize", sdir, "--no-checks"], cwd=CB,

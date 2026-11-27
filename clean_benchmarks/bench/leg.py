@@ -809,7 +809,7 @@ def novabf_topk(results: dict, path: str) -> str | None:
     """Convert nova-bf's result parquet(s) to .topk.npz (untimed): per search `D` (hit_scores),
     `ids` (hit_ids: nova-bf's md5 point ids, or corpus ids with id_column) and `query_ids`. Rows
     are padded to the longest hit list (D with -inf, ids with ""). Ids are not mapped to corpus
-    rows here; verify/agree.py does that."""
+    rows here; the checks (verify/load.py) map them from the result parquet."""
     import numpy as np
     import pyarrow.parquet as pq
     arrays = {}

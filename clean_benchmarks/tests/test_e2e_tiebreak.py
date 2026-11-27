@@ -9,7 +9,7 @@ import yaml
 
 from bench import experiment as E
 from bench import leg as L
-from bench.verify import agree
+from bench.verify import load
 
 CB = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 COYO = os.path.join(CB, "tests", "fixtures", "experiments", "dense", "coyo.yaml")
@@ -52,5 +52,5 @@ def test_same_scores_ignores_ids_but_not_scores(tmp_path):
     a = write("a.parquet", ["x", "y"], [0.9, 0.9])
     b = write("b.parquet", ["y", "x"], [0.9, 0.9])
     c = write("c.parquet", ["x", "y"], [0.9, 0.8])
-    assert agree.same_scores(a, b) and not agree.same_table(a, b)
-    assert not agree.same_scores(a, c)
+    assert load.same_scores(a, b) and not load.same_table(a, b)
+    assert not load.same_scores(a, c)

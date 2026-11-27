@@ -18,7 +18,8 @@ the first process that finds no cache takes the exclusive lock, builds into a `.
 beside it and renames it into place (a crashed or interrupted build never looks complete),
 then prunes. xdist workers and parallel pytest sessions build at most once per key.
 
-A failed build (any shape's `bench run` exit != 0) is NOT cached under the key: a failure may be
+Every shape's `bench run` must exit 0 (its checks pass). A failed build (any other exit) is NOT
+cached under the key: a failure may be
 transient (an OOM kill, a busy box) and must not fail later sessions without a retry. Within one
 xdist session the workers share it (`.failed-<key>-<session>`), so they all see the same failure
 without building six times; the next session builds again.
@@ -182,11 +183,11 @@ def _build(dest):
         shapes[shape] = {"args": p.args, "returncode": p.returncode, "stdout": p.stdout,
                          "stderr": p.stderr}
     inputs_ok = {}
-    from bench.verify import agree
+    from bench.verify import check
     for d in glob.glob(os.path.join(res, "*", "*", "checks.json")):
         try:
             inputs_ok[os.path.relpath(os.path.dirname(d), res)] = \
-                not agree.input_problems(os.path.dirname(d), json.load(open(d)))
+                not check.input_problems(os.path.dirname(d), json.load(open(d)))
         except Exception:  # noqa: BLE001 - an unreadable checks.json stays as written
             inputs_ok[os.path.relpath(os.path.dirname(d), res)] = False
     meta = {"build_root": res, "built_unix": time.time(), "session": _session(),
@@ -278,15 +279,15 @@ def _rewrite_tree(top, old, new):
 
 def _rehash_checks(run_dir):
     """checks.json's input record re-taken for the rewritten files, written as bench run does."""
+    from bench.verify import check
+    from bench.verify import load
     from bench import paths
-    from bench.verify import agree
     p = os.path.join(run_dir, "checks.json")
     doc = json.load(open(p))
     if isinstance(doc.get("inputs"), dict):
-        doc["inputs"] = {k: agree._file_id(run_dir, paths.expand(k)) for k in doc["inputs"]}
-        with open(p, "w") as f:
-            json.dump(paths.mask(doc), f, indent=1, sort_keys=True)
-        assert not agree.input_problems(run_dir, doc), agree.input_problems(run_dir, doc)
+        doc["inputs"] = {k: load.file_id(run_dir, paths.expand(k)) for k in doc["inputs"]}
+        check.write(run_dir, doc)
+        assert not check.input_problems(run_dir, doc), check.input_problems(run_dir, doc)
 
 
 def _copy(src, dst):

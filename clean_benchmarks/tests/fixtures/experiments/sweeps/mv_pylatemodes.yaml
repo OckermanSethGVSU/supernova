@@ -1,0 +1,15 @@
+# PyLate's modes on the first 4 files: rerank-released and rerank-released-ownpad (ids
+# globalised on the device and on the host), then scores-batched.
+name: mv_pylatemodes
+base: ../multivector/pubmed.yaml
+sweep:
+  - system: pylate_scores-batched
+    grid: {pylate_mode: [rerank-released, rerank-released-ownpad], pylate_rerank_results: [device, host]}
+  - system: pylate_scores-batched
+    grid: {pylate_mode: [scores-batched]}
+subset: {files: 4}
+# PyLate's zero-padded rerank mode is known inexact (disclosed): its variants are judged and
+# reported, never failing the sweep or refused by --pick
+checks: {expect_inexact: ["*-pylate_mode-rerank-released-pylate_rerank_results-*"]}   # not ownpad (exact)
+# protocol: one warm run per variant by default (`bench sweep --rounds 3` for 3 rounds and a
+# spread)

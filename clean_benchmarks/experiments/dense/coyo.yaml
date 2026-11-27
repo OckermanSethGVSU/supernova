@@ -47,9 +47,6 @@ e2e:
   # are listed or split; only its scores are compared with round 1 (hits are named by id)
   tiebreak: {mode: id, field: id}
 protocol: {rounds: 3}                       # the reported value is the median of 3 rotated rounds
-checks:
-  oracle_queries: 500                       # queries sampled for the float64 oracle
-  gt: ~/data/gt_25k.parquet               # the dataset GT (the `queries` step writes it; `bench launch` stages it)
 # the node's data prep (bench launch runs it before env/paper_run.sh): the `queries` step.
 prep:
   queries:

@@ -16,6 +16,10 @@ for _k in ("PAPER_STACK_SHA", "PAPER_CODE_SHA", "PAPER_ENV_PREFIX", "PAPER_RUN_D
 # ... so the suite's GPU tests (a GPU node, no launcher) are not refused as off the
 # paper stack; test_the harness's refusal tests unset it
 os.environ["HARNESS_ALLOW_UNPINNED_STACK"] = "1"
+# the checks' reference scan on numpy everywhere (a GPU node would pick CUDA: the tests that
+# compare references bit for bit assume numpy); tests/verify/test_checks_sample.py sets the
+# torch / CUDA paths explicitly
+os.environ["BENCH_CHECK_DEVICE"] = "cpu"
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 # the private S3 prefixes (bench/paths.py): a checkout without experiments/local_paths.env gets dummy
 # values, so experiments that name them still plan; a real file or environment value wins.

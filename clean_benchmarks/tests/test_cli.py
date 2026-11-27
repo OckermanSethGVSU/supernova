@@ -10,10 +10,9 @@ def test_help_lists_every_subcommand(capsys):
         cli.main(["--help"])
     assert e.value.code == 0
     out = capsys.readouterr().out
-    for name in ("run", "leg", "summarize", "sweep", "launch", "check", "plot", "check-copies",
-                 "check-verify"):
+    for name in ("run", "leg", "summarize", "sweep", "launch", "check", "plot", "verify"):
         assert name in out
-    assert "tune" not in out
+    assert "tune" not in out and "check-copies" not in out and "check-verify" not in out
 
 
 def test_tune_is_not_a_command(capsys):

@@ -73,11 +73,10 @@ def _sweep_dir(tmp_path, bad=None):
     json.dump({"base": [os.path.join(FIX, "sparse.yaml")], "variants": variants}, open(d / "sweep.json", "w"))
     _leg_rec(str(d), "s", "c-x-1", 1, 1.0)
     _leg_rec(str(d), "s", "c-x-2", 1, 2.0)
-    systems = {v: {"ok": v != bad, "fails": ["3 float64 disagreements"] if v == bad else []}
-               for v in ("c-x-1", "c-x-2")}
-    json.dump({"ok": bad is None, "problems": [f"s r1: oracle {bad}: 3 float64 disagreements"] if bad else [],
-               "searches": {"s": {"r1": {"systems": ["c-x-1", "c-x-2"], "pairs": {"ok": True, "fails": []},
-                                         "oracle": {"systems": systems}}}}},
+    why = "3 queries kept a row clearly worse than one it dropped (beyond the float32 bound)"
+    systems = {v: {"ok": v != bad, "fails": [why] if v == bad else []} for v in ("c-x-1", "c-x-2")}
+    json.dump({"ok": bad is None, "problems": [f"s {bad}: {why}"] if bad else [],
+               "searches": {"s": {"check": "disputed", "systems": systems}}},
               open(d / "checks.json", "w"))
     return str(res), str(d), exp, variants
 
