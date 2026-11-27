@@ -4,15 +4,17 @@
 name: sparse_fineweb
 modality: sparse
 corpus:
-  path: ${READ}/corpus/
+  path: ${READ}/
   column: sparse_embedding
-  recursive: true                             # the files sit in sub-prefixes
+  recursive: true                             # the files sit in shard sub-prefixes 00/ .. 99/
   region: us-east-1                           # the bucket's region
 queries:
   path: ~/data/queries_fineweb.parquet        # the `queries` step's output (run by `bench launch`)
   column: sparse_embedding
-  nq: TODO                                    # placeholder
+  nq: 10000                                   # every query in the file
 search: {k: 1000, metric: ip}                 # nova-bf config: dot
+# FineWeb-100M: the first 101 files of the corpus in path order (all in shard 00/), 100,032,238 rows
+subset: {files: 101}
 io:
   # the default for every system (a system's own `io:` overrides it) (4 files in flight, 512 ranged GETs of 16 MiB parts)
   files_in_flight: 4
