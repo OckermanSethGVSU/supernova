@@ -47,6 +47,12 @@ systems:             # round-1 order: novabf, cuvs, spare, then the +proj lines
   spare_proj: {system: spare, preset: batched_dot, sparse_project: query-vocab}
 novabf_output: ${WRITE}   # legs write <this>/<run id>/<tag>
 protocol: {rounds: 3}                         # the reported value is the median of 3 rotated rounds
-# the `queries` step: copies queries_src to queries.path when set (default: the queries
-# file is used as is). Set with --set prep.queries_src=URI.
-prep: {queries_src: null}
+# the node's data prep: ship the MS MARCO shared queries file, then write its 10,000 sparse
+# queries (query_set dense_sparse, the public release's order) to queries.path
+prep:
+  stage:
+    - {key: FINEWEB_QUERIES, path: data/ms_marco_shared_queries_fp32.parquet,
+       source: fineweb_redo_files/ms_marco_shared_queries_fp32.parquet, how: copy}
+  queries:
+    script: bench/prep/prep_queries_fineweb.py
+    args: [~/sky_workdir/data/ms_marco_shared_queries_fp32.parquet, ~/data]
