@@ -1,0 +1,44 @@
+# Image + caption example with an OpenCLIP checkpoint.
+#
+# Install: pip install 'nova-embed[embed,open_clip]'
+#
+# Both entries name identical backend settings (batch_size included), so they
+# share one loaded model; a differing key loads a second copy of the same
+# weights. Images and captions land in the same vector space either way.
+source:
+  type: huggingface_parquet
+  dataset_name: nlphuji/flickr30k
+  split: test
+
+embedders:
+  - name: clip_image
+    kind: dense
+    type: open_clip
+    # architecture + weight tag; together they name the embedding space
+    model: ViT-B-32
+    pretrained: laion2b_s34b_b79k
+    # or a Hub checkpoint with its weights included (leave pretrained unset):
+    # model: hf-hub:timm/ViT-B-16-SigLIP
+    input_column: image
+    modality: image
+    batch_size: 64
+    # normalize: true            # L2-normalized output (default)
+    # dtype defaults to float16 on CUDA, float32 elsewhere
+
+  - name: clip_caption
+    kind: dense
+    type: open_clip
+    model: ViT-B-32
+    pretrained: laion2b_s34b_b79k
+    input_column: caption
+    modality: text
+    batch_size: 64
+
+storage:
+  type: local
+  output_dir: /tmp/flickr30k_open_clip
+
+pipeline:
+  chunk_size: 1000
+  flush_threshold: 10000
+  drop_columns: [image]
